@@ -2,7 +2,7 @@ import * as imaps from 'imap-simple';
 import * as nodemailer from 'nodemailer';
 export const getImapConfig = (account) => ({
     imap: {
-        user: account.email,
+        user: account.sender,
         password: account.appPass,
         host: 'imap.mail.me.com',
         port: 993,

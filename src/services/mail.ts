@@ -4,7 +4,7 @@ import { AccountConfig } from '../config.js';
 
 export const getImapConfig = (account: AccountConfig): imaps.ImapSimpleOptions => ({
   imap: {
-    user: account.email,
+    user: account.sender,
     password: account.appPass,
     host: 'imap.mail.me.com',
     port: 993,
