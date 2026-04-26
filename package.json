@@ -1,0 +1,33 @@
+{
+  "name": "apple-icloud-mcp",
+  "version": "1.0.0",
+  "description": "Apple iCloud MCP tool for Mail and Calendar",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "build": "tsc",
+    "serve": "node dist/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "imap-simple": "^5.1.0",
+    "nodemailer": "^8.0.6",
+    "tsdav": "^2.1.8",
+    "uuid": "^14.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/imap-simple": "^4.2.9",
+    "@types/node": "^22.0.0",
+    "@types/nodemailer": "^6.4.17",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}
