@@ -46,7 +46,7 @@ async function run() {
                 session_id: sessionId,
                 to: "zzqhmbb@gmail.com",
                 subject: "Test from Apple iCloud MCP",
-                text: "Hello! This is a test message from your newly developed Apple iCloud MCP server."
+                text: "Hello! This is a test message from your newly developed Apple iCloud MCP server. Sender works!"
             }
         });
         console.log("Send Mail Result:", JSON.stringify(sendMailResult));

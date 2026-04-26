@@ -87,7 +87,7 @@ export const sendEmail = async (account, to, subject, text) => {
         throw new Error('Mail write permission denied.');
     const transporter = getSmtpTransporter(account);
     const info = await transporter.sendMail({
-        from: account.email,
+        from: account.sender,
         to,
         subject,
         text,

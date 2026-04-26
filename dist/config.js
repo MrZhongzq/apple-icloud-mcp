@@ -8,6 +8,7 @@ export const getConfig = () => {
         const suffix = i === 1 ? '' : `${i}`;
         const email = process.env[`icloud_account${suffix}`];
         const appPass = process.env[`icloud_app_pass${suffix}`];
+        const sender = process.env[`icloud_sender${suffix}`] || email;
         if (!email || !appPass) {
             if (i === 1) {
                 console.warn(`Warning: icloud_account${suffix} or icloud_app_pass${suffix} not provided.`);
@@ -17,6 +18,7 @@ export const getConfig = () => {
         accounts.push({
             accountId: `account_${i}`,
             email,
+            sender,
             appPass,
             allowCalendarRead: process.env[`allow_calendar${suffix}_read`] !== 'false',
             allowCalendarWrite: process.env[`allow_calendar${suffix}_write`] !== 'false',

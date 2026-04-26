@@ -5,6 +5,7 @@ dotenv.config();
 export interface AccountConfig {
   accountId: string;
   email: string;
+  sender: string;
   appPass: string;
   allowCalendarRead: boolean;
   allowCalendarWrite: boolean;
@@ -24,6 +25,7 @@ export const getConfig = (): AccountConfig[] => {
     const suffix = i === 1 ? '' : `${i}`;
     const email = process.env[`icloud_account${suffix}`];
     const appPass = process.env[`icloud_app_pass${suffix}`];
+    const sender = process.env[`icloud_sender${suffix}`] || email;
 
     if (!email || !appPass) {
       if (i === 1) {
@@ -35,6 +37,7 @@ export const getConfig = (): AccountConfig[] => {
     accounts.push({
       accountId: `account_${i}`,
       email,
+      sender,
       appPass,
       allowCalendarRead: process.env[`allow_calendar${suffix}_read`] !== 'false',
       allowCalendarWrite: process.env[`allow_calendar${suffix}_write`] !== 'false',

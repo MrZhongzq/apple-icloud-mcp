@@ -224,7 +224,7 @@ app.get('/sse', async (req, res) => {
         // Handle cleanup if necessary
     });
 });
-app.post('/message', express.json(), async (req, res) => {
+app.post('/message', async (req, res) => {
     if (transport) {
         await transport.handlePostMessage(req, res);
     }

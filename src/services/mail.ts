@@ -96,7 +96,7 @@ export const sendEmail = async (account: AccountConfig, to: string, subject: str
   const transporter = getSmtpTransporter(account);
   
   const info = await transporter.sendMail({
-    from: account.email,
+    from: account.sender,
     to,
     subject,
     text,
