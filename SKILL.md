@@ -7,7 +7,15 @@ description: Guide for AI agents to interact with the Apple iCloud MCP Server.
 
 This skill documents how to properly use the Apple iCloud MCP tools to access a user's Mail and Calendar.
 
+## Environment Variable Rules
+
+- **`.env` / Environment Loading rules:**
+  - Variables start from the first non-space character after the `=` or `:`.
+  - All spaces, quotes, and hyphens INSIDE the value are strictly preserved as part of the value.
+  - The parser automatically ignores leading spaces after the assignment operator, allowing for alignment. Ensure you provide exact strings without trailing or middle random spaces.
+
 ## Workflow
+
 
 1. **Login First:** You MUST start by calling the `apple_login` tool.
    - You need to know the user's iCloud email address to login. If the user hasn't provided it, ask them, or assume they are using their primary account.
