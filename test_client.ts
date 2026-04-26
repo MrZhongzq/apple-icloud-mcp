@@ -44,7 +44,7 @@ async function run() {
             name: "mail_send",
             arguments: {
                 session_id: sessionId,
-                to: "zzqhmbb@gmail.com",
+                to: "zzqhmbb@icloud.com",
                 subject: "Test from Apple iCloud MCP",
                 text: "Hello! This is a test message from your newly developed Apple iCloud MCP server. Sender works!"
             }

@@ -17,7 +17,7 @@ export const getSmtpTransporter = (account) => {
         secure: false, // true for 465, false for other ports
         requireTLS: true,
         auth: {
-            user: account.email,
+            user: account.sender,
             pass: account.appPass,
         },
     });

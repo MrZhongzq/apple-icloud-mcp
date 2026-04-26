@@ -56,8 +56,8 @@ export const createEvent = async (account: AccountConfig, iCalString: string, fi
   }
 
   // Create on the first calendar or specific one if needed
-  // iCloud often has a 'home' or 'work' calendar. For simplicity, pick the first one
-  const targetCal = calendars[0];
+  // Create on the first calendar that supports VEVENT
+  const targetCal = calendars.find((c: any) => c.components && c.components.includes('VEVENT')) || calendars[0];
 
   const response = await client.createCalendarObject({
     calendar: targetCal,
