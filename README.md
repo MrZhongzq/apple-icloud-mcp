@@ -24,8 +24,8 @@ Create a `.env` file or export these variables in your shell before starting the
 multiple_account_enable=1
 
 # Account 1
-icloud_account=zzqhmbb@gmail.com
-icloud_app_pass=mwve-yzhe-sdol-hfta
+icloud_account=your-name@icloud.com
+icloud_app_pass=abcd-efgh-ijkl-mnop
 allow_calendar_read=true
 allow_calendar_write=true
 allow_mail_read=true
