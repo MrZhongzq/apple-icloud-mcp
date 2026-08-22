@@ -1,0 +1,19 @@
+From: Sender <sender@icloud.com>
+To: me@icloud.com
+Subject: Inline image
+Date: Thu, 20 Aug 2026 09:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="REL42"
+
+--REL42
+Content-Type: text/html; charset=UTF-8
+
+<html><body><p>看图</p><img src="cid:img001"></body></html>
+--REL42
+Content-Type: image/png; name="pixel.png"
+Content-Transfer-Encoding: base64
+Content-ID: <img001>
+Content-Disposition: inline; filename="pixel.png"
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+--REL42--

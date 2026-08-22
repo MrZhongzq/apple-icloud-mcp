@@ -43,6 +43,31 @@ describe('parseEmail', () => {
     const mail = await parseEmail(fixture('chinese-base64.eml'));
     expect(mail.attachments).toEqual([]);
   });
+
+  it('converts an html-only message to readable text with our link format', async () => {
+    const mail = await parseEmail(fixture('html-only.eml'));
+    expect(mail.subject).toBe('只有 HTML 的邮件');
+    expect(mail.text).toBe('第一段\n点击 这里 (https://example.com)');
+  });
+
+  it('still exposes the original html for an html-only message', async () => {
+    const mail = await parseEmail(fixture('html-only.eml'));
+    expect(mail.html).toContain('<p>第一段</p>');
+  });
+
+  it('surfaces an inline image as attachment metadata', async () => {
+    const mail = await parseEmail(fixture('inline-image.eml'));
+    expect(mail.attachments).toHaveLength(1);
+    expect(mail.attachments[0]!.filename).toBe('pixel.png');
+    expect(mail.attachments[0]!.contentType).toBe('image/png');
+    expect(mail.attachments[0]!.size).toBeGreaterThan(0);
+  });
+
+  it('keeps the image payload out of the text body', async () => {
+    const mail = await parseEmail(fixture('inline-image.eml'));
+    expect(mail.text).toContain('看图');
+    expect(mail.text).not.toContain('iVBORw0');
+  });
 });
 
 describe('htmlToText', () => {
@@ -57,6 +82,10 @@ describe('htmlToText', () => {
 
   it('drops script and style content entirely', () => {
     expect(htmlToText('<style>p{color:red}</style><p>正文</p><script>alert(1)</script>')).toBe('正文');
+  });
+
+  it('does not double-decode already-escaped entity sequences', () => {
+    expect(htmlToText('<p>&amp;lt;tag&amp;gt;</p>')).toBe('&lt;tag&gt;');
   });
 });
 

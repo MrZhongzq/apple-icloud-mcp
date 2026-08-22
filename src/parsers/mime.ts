@@ -56,12 +56,18 @@ const ENTITIES: Record<string, string> = {
   '&apos;': "'",
 };
 
+const ENTITY_PATTERN = /&(#\d+|#[xX][0-9a-fA-F]+|[a-zA-Z]+);/g;
+
 function decodeEntities(input: string): string {
-  let out = input.replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)));
-  for (const [entity, char] of Object.entries(ENTITIES)) {
-    out = out.split(entity).join(char);
-  }
-  return out;
+  return input.replace(ENTITY_PATTERN, (match: string, body: string) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X'
+        ? Number.parseInt(body.slice(2), 16)
+        : Number.parseInt(body.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return ENTITIES[`&${body};`] ?? match;
+  });
 }
 
 /** HTML 转可读纯文本：保留段落结构与链接目标，丢弃脚本样式。 */
@@ -87,10 +93,15 @@ export function makeSnippet(text: string, maxLength = 200): string {
 }
 
 export async function parseEmail(source: Buffer | string): Promise<ParsedEmail> {
-  const parsed: ParsedMail = await simpleParser(source);
+  const parsed: ParsedMail = await simpleParser(source, { skipHtmlToText: true });
 
   const from = toAddresses(parsed.from)[0];
-  const text = parsed.text ?? (parsed.html ? htmlToText(parsed.html) : '');
+  const htmlSource = typeof parsed.html === 'string' ? parsed.html : '';
+  const text = parsed.text && parsed.text.trim().length > 0
+    ? parsed.text
+    : htmlSource
+      ? htmlToText(htmlSource)
+      : '';
 
   const result: ParsedEmail = {
     to: toAddresses(parsed.to),
