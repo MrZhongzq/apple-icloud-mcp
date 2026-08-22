@@ -68,6 +68,36 @@ describe('SessionStore', () => {
     expect(() => store.get(session.id)).toThrowError(AppError);
   });
 
+  it('closes the connection when a session expires on access', async () => {
+    let now = 1_000_000;
+    const providers = makeProviders();
+    const store = createSessionStore({
+      ttlMs: 5_000,
+      providerFactory: () => providers,
+      now: () => now,
+    });
+    const session = store.create(account);
+
+    now += 5_001;
+    expect(() => store.get(session.id)).toThrowError(AppError);
+
+    // close 是 void 调用（不阻塞错误路径），因此要等微任务队列排空后再断言
+    await vi.waitFor(() => expect(providers.closed()).toBe(1));
+    expect(store.size()).toBe(0);
+  });
+
+  it('keeps a session alive when idle time exactly equals the ttl', () => {
+    let now = 1_000_000;
+    const store = createSessionStore({
+      ttlMs: 5_000,
+      providerFactory: () => makeProviders(),
+      now: () => now,
+    });
+    const session = store.create(account);
+    now += 5_000;
+    expect(store.get(session.id).id).toBe(session.id);
+  });
+
   it('refreshes lastActiveAt on each get', () => {
     let now = 1_000_000;
     const store = createSessionStore({
