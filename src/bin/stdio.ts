@@ -16,6 +16,7 @@ async function main(): Promise<void> {
   const logger = createLogger(config.logLevel);
 
   for (const notice of config.deprecations) logger.warn(notice);
+  for (const notice of config.notices) logger.warn(notice);
 
   const sessions = createSessionStore({
     ttlMs: config.sessionTtlMs,

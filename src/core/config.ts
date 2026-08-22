@@ -28,6 +28,19 @@ export interface AppConfig {
   imapIdleTimeoutMs: number;
   logLevel: LogLevel;
   deprecations: string[];
+  /** 能力被自动降级时的说明（例如：发信地址不是 iCloud 邮箱，邮件工具已禁用）。与 deprecations 分开，
+   *  因为二者含义不同：deprecations 说的是"这个变量名过时了"，notices 说的是"这个账号的某项能力被关闭了"。 */
+  notices: string[];
+}
+
+/** 真正使用 iCloud Mail 的账号，其发信地址一定落在 Apple 分配的这几个域名下。 */
+const ICLOUD_MAIL_DOMAINS = new Set(['icloud.com', 'me.com', 'mac.com', 'icloud.com.cn']);
+
+function isIcloudMailAddress(address: string): boolean {
+  const at = address.lastIndexOf('@');
+  if (at === -1) return false;
+  const domain = address.slice(at + 1).toLowerCase();
+  return ICLOUD_MAIL_DOMAINS.has(domain);
 }
 
 /** 旧的小写变量名 → 新命名。旧版把序号嵌在名字中间（icloud_account2、allow_mail2_read）。 */
@@ -94,7 +107,10 @@ function applyLegacy(env: NodeJS.ProcessEnv): { env: NodeJS.ProcessEnv; deprecat
   return { env: merged, deprecations };
 }
 
-function parseAccount(env: NodeJS.ProcessEnv, index: number): AccountConfig | undefined {
+function parseAccount(
+  env: NodeJS.ProcessEnv,
+  index: number,
+): { account: AccountConfig; notice?: string } | undefined {
   const suffix = `_${index}`;
   const email = clean(env[`ICLOUD_ACCOUNT${suffix}`]);
   const appPassword = clean(env[`ICLOUD_APP_PASSWORD${suffix}`]);
@@ -112,22 +128,41 @@ function parseAccount(env: NodeJS.ProcessEnv, index: number): AccountConfig | un
     throw new AppError('INVALID_INPUT', `ICLOUD_ACCOUNT${suffix} 不是合法邮箱：${email}`);
   }
 
+  const sender = clean(env[`ICLOUD_SENDER${suffix}`]) ?? email;
+  const label = clean(env[`ICLOUD_LABEL${suffix}`]) ?? email;
+
+  // readBool 必须无条件调用，即便下面会因为非 iCloud 发信域名把结果强制改成 false：
+  // 这样一个写错的 ALLOW_MAIL_* 取值仍然会被拒绝，而不是被域名判断悄悄掩盖。
+  const mailReadAllowed = readBool(env, `ALLOW_MAIL_READ${suffix}`, true);
+  const mailWriteAllowed = readBool(env, `ALLOW_MAIL_WRITE${suffix}`, false);
+  const mailCapable = isIcloudMailAddress(sender);
+
+  const notice = mailCapable
+    ? undefined
+    : `账号 ${label}：发信地址 ${sender} 不是 iCloud 邮箱地址，该账号的邮件工具已禁用（日历不受影响）。` +
+      `如果这是一个 iCloud Mail 账号，请设置 ICLOUD_SENDER${suffix} 为你的 iCloud 邮箱地址` +
+      `（@icloud.com / @me.com / @mac.com / @icloud.com.cn）；` +
+      `如果你没有 iCloud 邮箱，说明该账号并未使用 iCloud Mail，仅日历功能可用。`;
+
   return {
-    id: `account${suffix}`,
-    email,
-    sender: clean(env[`ICLOUD_SENDER${suffix}`]) ?? email,
-    label: clean(env[`ICLOUD_LABEL${suffix}`]) ?? email,
-    appPassword,
-    capabilities: {
-      mailRead: readBool(env, `ALLOW_MAIL_READ${suffix}`, true),
-      mailWrite: readBool(env, `ALLOW_MAIL_WRITE${suffix}`, false),
-      calendarRead: readBool(env, `ALLOW_CALENDAR_READ${suffix}`, true),
-      calendarWrite: readBool(env, `ALLOW_CALENDAR_WRITE${suffix}`, false),
-      remindersRead: readBool(env, `ALLOW_REMINDERS_READ${suffix}`, true),
-      remindersWrite: readBool(env, `ALLOW_REMINDERS_WRITE${suffix}`, false),
-      contactsRead: readBool(env, `ALLOW_CONTACTS_READ${suffix}`, true),
-      contactsWrite: readBool(env, `ALLOW_CONTACTS_WRITE${suffix}`, false),
+    account: {
+      id: `account${suffix}`,
+      email,
+      sender,
+      label,
+      appPassword,
+      capabilities: {
+        mailRead: mailCapable && mailReadAllowed,
+        mailWrite: mailCapable && mailWriteAllowed,
+        calendarRead: readBool(env, `ALLOW_CALENDAR_READ${suffix}`, true),
+        calendarWrite: readBool(env, `ALLOW_CALENDAR_WRITE${suffix}`, false),
+        remindersRead: readBool(env, `ALLOW_REMINDERS_READ${suffix}`, true),
+        remindersWrite: readBool(env, `ALLOW_REMINDERS_WRITE${suffix}`, false),
+        contactsRead: readBool(env, `ALLOW_CONTACTS_READ${suffix}`, true),
+        contactsWrite: readBool(env, `ALLOW_CONTACTS_WRITE${suffix}`, false),
+      },
     },
+    notice,
   };
 }
 
@@ -135,9 +170,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const { env: merged, deprecations } = applyLegacy(env);
 
   const accounts: AccountConfig[] = [];
+  const notices: string[] = [];
   for (let i = 1; i <= 5; i++) {
-    const account = parseAccount(merged, i);
-    if (account) accounts.push(account);
+    const parsed = parseAccount(merged, i);
+    if (parsed) {
+      accounts.push(parsed.account);
+      if (parsed.notice) notices.push(parsed.notice);
+    }
   }
 
   if (accounts.length === 0) {
@@ -160,6 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     imapIdleTimeoutMs: readInt(merged, 'IMAP_IDLE_TIMEOUT_SECONDS', 300) * 1000,
     logLevel: level.data,
     deprecations,
+    notices,
   };
 }
 

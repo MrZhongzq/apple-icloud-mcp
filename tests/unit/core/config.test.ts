@@ -30,6 +30,60 @@ describe('loadConfig', () => {
     expect(cfg.accounts[0]!.label).toBe('personal');
   });
 
+  it('forces mail capabilities off when sender falls back to a non-iCloud email, even with ALLOW_MAIL_* explicitly true', () => {
+    const cfg = loadConfig({
+      ICLOUD_ACCOUNT_1: 'me@gmail.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ALLOW_MAIL_READ_1: 'true',
+      ALLOW_MAIL_WRITE_1: 'true',
+    });
+    const acc = cfg.accounts[0]!;
+    expect(acc.capabilities.mailRead).toBe(false);
+    expect(acc.capabilities.mailWrite).toBe(false);
+    // calendar capabilities must be untouched by the mail domain gate
+    expect(acc.capabilities.calendarRead).toBe(true);
+    expect(acc.capabilities.calendarWrite).toBe(false);
+    expect(cfg.notices.some((n) => n.includes('me@gmail.com'))).toBe(true);
+  });
+
+  it('keeps mail capabilities and records no notice for an explicit iCloud sender', () => {
+    const cfg = loadConfig({
+      ICLOUD_ACCOUNT_1: 'me@gmail.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_SENDER_1: 'alias@icloud.com',
+      ALLOW_MAIL_READ_1: 'true',
+      ALLOW_MAIL_WRITE_1: 'true',
+    });
+    const acc = cfg.accounts[0]!;
+    expect(acc.capabilities.mailRead).toBe(true);
+    expect(acc.capabilities.mailWrite).toBe(true);
+    expect(cfg.notices).toHaveLength(0);
+  });
+
+  it('keeps mail capabilities for an explicit @icloud.com.cn sender', () => {
+    const cfg = loadConfig({
+      ICLOUD_ACCOUNT_1: 'me@gmail.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_SENDER_1: 'alias@icloud.com.cn',
+      ALLOW_MAIL_READ_1: 'true',
+    });
+    const acc = cfg.accounts[0]!;
+    expect(acc.capabilities.mailRead).toBe(true);
+    expect(cfg.notices).toHaveLength(0);
+  });
+
+  it('does not treat a domain that merely ends with a matching suffix (notme.com) as iCloud', () => {
+    const cfg = loadConfig({
+      ICLOUD_ACCOUNT_1: 'me@notme.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ALLOW_MAIL_READ_1: 'true',
+    });
+    const acc = cfg.accounts[0]!;
+    expect(acc.capabilities.mailRead).toBe(false);
+    expect(acc.capabilities.mailWrite).toBe(false);
+    expect(cfg.notices.some((n) => n.includes('me@notme.com'))).toBe(true);
+  });
+
   it('parses accounts 2..5 without any enable flag', () => {
     const cfg = loadConfig({
       ...base,

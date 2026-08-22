@@ -66,4 +66,17 @@ describe('registerAllTools', () => {
     registerAllTools(server, { config, sessions, logger });
     expect(names).toContain('mail_search');
   });
+
+  it('registers mail tools when account 1 has a non-iCloud sender but account 2 has a valid iCloud sender', () => {
+    const { server, names } = collect();
+    const config = loadConfig({
+      ICLOUD_ACCOUNT_1: 'me@gmail.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_ACCOUNT_2: 'work@gmail.com',
+      ICLOUD_APP_PASSWORD_2: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_SENDER_2: 'work@icloud.com',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names).toContain('mail_search');
+  });
 });

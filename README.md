@@ -18,7 +18,7 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 |---|---|---|---|
 | `ICLOUD_ACCOUNT_1` | yes | — | Apple ID email. Used for CalDAV auth and as the fallback send-from address. |
 | `ICLOUD_APP_PASSWORD_1` | yes | — | App-Specific Password, format `xxxx-xxxx-xxxx-xxxx`. |
-| `ICLOUD_SENDER_1` | no | = `ICLOUD_ACCOUNT_1` | IMAP/SMTP auth identity and mail-send "from" address, if it differs from the Apple ID (e.g. a custom alias). |
+| `ICLOUD_SENDER_1` | no | = `ICLOUD_ACCOUNT_1` | IMAP/SMTP auth identity and mail-send "from" address, if it differs from the Apple ID (e.g. a custom alias). **Must resolve to an iCloud mail domain** (`@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn`) — see the mail-domain note below the table. |
 | `ICLOUD_LABEL_1` | no | = the email | Display label, useful when running multiple accounts. |
 | `ALLOW_MAIL_READ_1` | no | `true` | Read defaults to **on**. |
 | `ALLOW_MAIL_WRITE_1` | no | `false` | Write (send/mark/move/delete) defaults to **off** — must be explicitly `true`. |
@@ -30,6 +30,8 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 | `LOG_LEVEL` | no | `info` | `error` \| `warn` \| `info` \| `debug`. All logging goes to **stderr** — stdout is reserved for the MCP protocol. |
 
 **Write permissions default to OFF.** This is a deliberate change from the previous version of this server, which defaulted writes to on — a typo in a variable name there would silently grant delete-mail permission. Now, an unset or misspelled write-permission variable fails closed.
+
+**The effective sender must be an iCloud mail address.** IMAP/SMTP authenticate with the effective sender (`ICLOUD_SENDER_n`, falling back to `ICLOUD_ACCOUNT_n` if unset) — not with `ICLOUD_ACCOUNT_n` itself, which CalDAV uses instead. Apple's IMAP/SMTP servers reject any username that isn't an Apple-assigned iCloud address, so if your Apple ID (or your `ICLOUD_SENDER_n`) is not `@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn`, that account's mail tools are **automatically disabled at startup** — `mailRead`/`mailWrite` are forced to `false` regardless of `ALLOW_MAIL_READ_n`/`ALLOW_MAIL_WRITE_n`, and a notice explaining why is printed to stderr. Calendar is unaffected. If you do have an iCloud mail address, set `ICLOUD_SENDER_n` to it; if you don't, that account simply doesn't use iCloud Mail and only calendar tools are available for it.
 
 **Legacy (v1) variable names still work**, mapped automatically with a deprecation warning on stderr: `icloud_account`, `icloud_app_pass`, `icloud_sender`, and the multi-account forms with the digit inside the name (`icloud_account2`, `allow_mail2_read`, `allow_calendar3_write`, …). `multiple_account_enable` is now a no-op — accounts 2–5 are detected by presence of `ICLOUD_ACCOUNT_n`, not by an enable flag.
 
@@ -100,6 +102,7 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 - **Attachments are not supported.** `mail_read` reports attachment filename/type/size but cannot download content; `mail_send` cannot attach files.
 - **`mail_delete` moves to trash, not permanently, unless `permanent: true`.**
 - **iCloud Notes are unsupported**, and will remain so under this approach — see above.
+- **Mail tools silently disappear for an account whose sender isn't an iCloud address.** Symptom: the `mail_*` tools are missing for that account (or, if you bypass this check by other means, IMAP/SMTP fail with `AUTHENTICATIONFAILED` / `AUTH_FAILED`). Cause: IMAP/SMTP authenticate with the effective sender (`ICLOUD_SENDER_n`, or `ICLOUD_ACCOUNT_n` as a fallback), and Apple's mail servers reject a non-iCloud username outright — a Gmail-based Apple ID is the common case. Fix: set `ICLOUD_SENDER_n` to your actual iCloud mail address (`@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn`); if you don't have one, you don't use iCloud Mail and only calendar is available for that account. Check stderr at startup for the exact notice naming the affected account.
 - Range queries (`calendar_list_events`) use overlap semantics: an event that starts before the window but runs into it is included — this is what "what's on today" should mean for an overnight or multi-day event, and matches RFC 4791.
 
 ## Testing
