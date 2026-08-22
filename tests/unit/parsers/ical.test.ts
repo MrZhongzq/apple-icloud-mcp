@@ -108,14 +108,15 @@ describe('parseCalendarObject', () => {
     expect(events.every((e) => e.all_day)).toBe(true);
   });
 
-  it('includes an event that starts before the window but runs into it', () => {
+  it('includes a recurring occurrence that starts before the window but runs into it', () => {
     const events = parseCalendarObject(fixture('overnight.ics'), ref, {
       rangeStart: new Date('2026-08-18T00:00:00Z'),
-      rangeEnd: new Date('2026-08-19T00:00:00Z'),
+      rangeEnd: new Date('2026-08-18T12:00:00Z'),
       expandRecurring: true,
     });
     expect(events).toHaveLength(1);
-    expect(events[0]!.title).toBe('通宵值班');
+    expect(events[0]!.start).toBe('2026-08-17T22:00:00.000Z');
+    expect(events[0]!.end).toBe('2026-08-18T06:00:00.000Z');
   });
 
   it('applies a RECURRENCE-ID override to that occurrence only', () => {
