@@ -88,18 +88,34 @@ export function createMailService(deps: MailServiceDeps): MailService {
 
       const messages = await Promise.all(
         raw.map(async (message) => {
-          const parsed = await parseEmail(message.source);
-          return {
-            uid: message.uid,
-            date: parsed.date ?? message.date.toISOString(),
-            from: parsed.from,
-            to: parsed.to,
-            subject: parsed.subject,
-            snippet: makeSnippet(parsed.text),
-            seen: message.flags.includes('\\Seen'),
-            flagged: message.flags.includes('\\Flagged'),
-            hasAttachments: parsed.attachments.length > 0,
-          };
+          const seen = message.flags.includes('\\Seen');
+          const flagged = message.flags.includes('\\Flagged');
+          try {
+            const parsed = await parseEmail(message.source);
+            return {
+              uid: message.uid,
+              date: parsed.date ?? message.date.toISOString(),
+              from: parsed.from,
+              to: parsed.to,
+              subject: parsed.subject,
+              snippet: makeSnippet(parsed.text),
+              seen,
+              flagged,
+              hasAttachments: parsed.attachments.length > 0,
+            };
+          } catch {
+            // 单封邮件解析失败不应让整页搜索失败——邮箱内容并非用户所写
+            return {
+              uid: message.uid,
+              date: message.date.toISOString(),
+              to: [],
+              subject: '(此邮件无法解析)',
+              snippet: '',
+              seen,
+              flagged,
+              hasAttachments: false,
+            };
+          }
         }),
       );
 
@@ -121,6 +137,9 @@ export function createMailService(deps: MailServiceDeps): MailService {
 
       const parsed = await parseEmail(message.source);
       const result = { ...parsed, uid: message.uid };
+      // html 是可选字段，可以直接删除；text 是必填字段，类型上不允许 undefined，
+      // 只能清空为空字符串。若邮件本身没有 html 部分，'html' 分支的守卫不会触发，
+      // text 会原样保留，调用方仍能拿到正文。
       if (format === 'text') delete result.html;
       if (format === 'html' && parsed.html) result.text = '';
       return result;

@@ -64,7 +64,9 @@ function decodeEntities(input: string): string {
       const code = body[1] === 'x' || body[1] === 'X'
         ? Number.parseInt(body.slice(2), 16)
         : Number.parseInt(body.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+      // 码点超出 Unicode 范围时保留原文，畸形邮件不应让解析抛错
+      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return match;
+      return String.fromCodePoint(code);
     }
     return ENTITIES[`&${body};`] ?? match;
   });

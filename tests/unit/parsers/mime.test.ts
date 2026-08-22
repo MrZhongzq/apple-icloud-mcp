@@ -87,6 +87,10 @@ describe('htmlToText', () => {
   it('does not double-decode already-escaped entity sequences', () => {
     expect(htmlToText('<p>&amp;lt;tag&amp;gt;</p>')).toBe('&lt;tag&gt;');
   });
+
+  it('leaves an out-of-range numeric entity as literal text', () => {
+    expect(htmlToText('<p>&#99999999;</p>')).toBe('&#99999999;');
+  });
 });
 
 describe('makeSnippet', () => {

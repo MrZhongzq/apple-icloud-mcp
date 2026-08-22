@@ -137,6 +137,11 @@ describe('MailService.search', () => {
     const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
     await expect(service.search({ limit: 500 })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
   });
+
+  it('rejects a limit below one', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
+    await expect(service.search({ limit: 0 })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  });
 });
 
 describe('MailService.read', () => {
@@ -152,6 +157,19 @@ describe('MailService.read', () => {
     const imap = makeImap({ fetchMessages: vi.fn().mockResolvedValue([]) });
     const service = createMailService({ account: makeAccount(), imap, smtp: makeSmtp() });
     await expect(service.read(999)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('leaves text intact when format is html but the message has no html part', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
+    const mail = await service.read(30, 'INBOX', 'html');
+    expect(mail.text).toContain('第二行。');
+    expect(mail.html).toBeUndefined();
+  });
+
+  it('returns both bodies when format is both', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
+    const mail = await service.read(30, 'INBOX', 'both');
+    expect(mail.text).toContain('第二行。');
   });
 });
 
