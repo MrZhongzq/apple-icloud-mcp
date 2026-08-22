@@ -256,10 +256,20 @@ export function parseCalendarObject(
   while (next && occurrences.length < MAX_OCCURRENCES && iterations < MAX_ITERATIONS) {
     iterations += 1;
     const startsAt = new Date(toIsoString(next));
+    // Termination stays driven by the occurrence's *start* passing rangeEnd: expansion
+    // walks forward chronologically by start time, so once a start is past rangeEnd no
+    // later occurrence (whose start is even later) could still overlap the window.
     if (rangeEnd && startsAt >= rangeEnd) break;
 
-    if (startsAt >= rangeStart) {
-      const details = event.getOccurrenceDetails(next);
+    const details = event.getOccurrenceDetails(next);
+    const endsAt = new Date(toIsoString(details.endDate));
+    // Inclusion is overlap-based (RFC 4791 time-range semantics), not start-only: an
+    // occurrence belongs in the result when its end is after rangeStart AND its start is
+    // before rangeEnd (already guaranteed by the break above). A start-only test would
+    // wrongly exclude an occurrence that begins before the window but runs into it (an
+    // overnight/multi-day occurrence) -- exactly the class of object the CalDAV server's
+    // own overlap-based time-range query would have returned to us.
+    if (endsAt > rangeStart) {
       // A RECURRENCE-ID override supplies its own VEVENT with its own title, location,
       // description, url, alarms and attendees -- only the master's occurrence should
       // fall back to the series template. `event_id`/`series_id` stay pinned to the

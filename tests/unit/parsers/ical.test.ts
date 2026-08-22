@@ -108,6 +108,16 @@ describe('parseCalendarObject', () => {
     expect(events.every((e) => e.all_day)).toBe(true);
   });
 
+  it('includes an event that starts before the window but runs into it', () => {
+    const events = parseCalendarObject(fixture('overnight.ics'), ref, {
+      rangeStart: new Date('2026-08-18T00:00:00Z'),
+      rangeEnd: new Date('2026-08-19T00:00:00Z'),
+      expandRecurring: true,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.title).toBe('通宵值班');
+  });
+
   it('applies a RECURRENCE-ID override to that occurrence only', () => {
     const events = parseCalendarObject(fixture('weekly-with-override.ics'), ref, {
       rangeStart: new Date('2026-08-01T00:00:00Z'),
