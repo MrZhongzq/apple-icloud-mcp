@@ -71,3 +71,16 @@ describe('MailService.search resilience', () => {
     expect(result.messages[0]!.seen).toBe(true);
   });
 });
+
+describe('MailService.read resilience (I8)', () => {
+  it('returns the IMAP-known envelope with parse_error: true instead of throwing INTERNAL', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
+    const result = await service.read(10);
+    expect(result.uid).toBe(10);
+    expect(result.parse_error).toBe(true);
+    // The message genuinely could not be parsed -- there is no decoded subject/body to
+    // report, but the call itself succeeds rather than surfacing an opaque INTERNAL error.
+    expect(result.subject).toBeTruthy();
+    expect(result.text).toBe('');
+  });
+});

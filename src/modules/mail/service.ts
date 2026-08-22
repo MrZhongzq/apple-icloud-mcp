@@ -23,7 +23,11 @@ export interface ListFoldersResult {
 export interface MailService {
   listFolders(): Promise<ListFoldersResult>;
   search(params: SearchParams): Promise<SearchResult>;
-  read(uid: number, folder?: string, format?: 'text' | 'html' | 'both'): Promise<ParsedEmail & { uid: number }>;
+  read(
+    uid: number,
+    folder?: string,
+    format?: 'text' | 'html' | 'both',
+  ): Promise<ParsedEmail & { uid: number; parse_error?: true }>;
   send(message: OutgoingMessage): Promise<SendResult>;
   mark(uids: number[], flags: { seen?: boolean; flagged?: boolean }, folder?: string): Promise<{ updated: number }>;
   move(uids: number[], from: string, to: string): Promise<{ moved: number }>;
@@ -147,8 +151,31 @@ export function createMailService(deps: MailServiceDeps): MailService {
         });
       }
 
-      const parsed = await parseEmail(message.source);
-      const result = { ...parsed, uid: message.uid };
+      // I8: search() already degrades a single unparseable message to a placeholder
+      // instead of failing the whole page (mailbox content is not something the user
+      // wrote, and can be malformed). read() bare-called parseEmail, so the *same*
+      // message surfaced here as an opaque INTERNAL '服务内部错误' with no hint at all.
+      // Chosen fallback shape: return the IMAP-known envelope (uid; nothing decodable)
+      // with an explicit parse_error: true field, matching search()'s "degrade, don't
+      // fail" approach rather than mapping to UPSTREAM_ERROR.
+      let parsed: ParsedEmail;
+      let parseError = false;
+      try {
+        parsed = await parseEmail(message.source);
+      } catch {
+        parseError = true;
+        parsed = {
+          to: [],
+          cc: [],
+          subject: '(此邮件无法解析)',
+          text: '',
+          attachments: [],
+          references: [],
+        };
+      }
+
+      const result: ParsedEmail & { uid: number; parse_error?: true } = { ...parsed, uid: message.uid };
+      if (parseError) result.parse_error = true;
       // html 是可选字段，可以直接删除；text 是必填字段，类型上不允许 undefined，
       // 只能清空为空字符串。若邮件本身没有 html 部分，'html' 分支的守卫不会触发，
       // text 会原样保留，调用方仍能拿到正文。
