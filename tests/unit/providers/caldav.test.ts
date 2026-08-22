@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mapCalDavError } from '../../../src/providers/icloud/caldav.js';
+import { hasWritePrivilege, applyPrivilegeFallback } from '../../../src/providers/icloud/caldav.js';
 
 describe('mapCalDavError', () => {
   it('maps 401 to AUTH_FAILED', () => {
@@ -27,5 +28,45 @@ describe('mapCalDavError', () => {
     const mapped = mapCalDavError({ status: 503 });
     expect(mapped.code).toBe('UPSTREAM_ERROR');
     expect(mapped.retryable).toBe(true);
+  });
+});
+
+describe('hasWritePrivilege', () => {
+  it('finds write in a multi-privilege array', () => {
+    expect(hasWritePrivilege({ privilege: [{ write: {} }, { read: {} }] })).toBe(true);
+  });
+
+  it('returns false for a read-only privilege set', () => {
+    expect(hasWritePrivilege({ privilege: { read: {} } })).toBe(false);
+  });
+
+  it('returns false when the property is absent', () => {
+    expect(hasWritePrivilege(undefined)).toBe(false);
+  });
+
+  it('matches nested write-ish privileges such as write-content', () => {
+    expect(hasWritePrivilege({ privilege: [{ 'write-content': {} }] })).toBe(true);
+  });
+});
+
+describe('applyPrivilegeFallback', () => {
+  it('reports all calendars writable when none was detected as writable', () => {
+    const out = applyPrivilegeFallback([
+      { url: 'a', name: 'A', readOnly: true, components: ['VEVENT'] },
+      { url: 'b', name: 'B', readOnly: true, components: ['VEVENT'] },
+    ]);
+    expect(out.every((c) => !c.readOnly)).toBe(true);
+  });
+
+  it('leaves a mixed result untouched', () => {
+    const out = applyPrivilegeFallback([
+      { url: 'a', name: 'A', readOnly: false, components: ['VEVENT'] },
+      { url: 'b', name: 'B', readOnly: true, components: ['VEVENT'] },
+    ]);
+    expect(out.map((c) => c.readOnly)).toEqual([false, true]);
+  });
+
+  it('handles an empty list', () => {
+    expect(applyPrivilegeFallback([])).toEqual([]);
   });
 });

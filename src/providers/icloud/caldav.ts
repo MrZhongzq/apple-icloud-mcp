@@ -78,14 +78,29 @@ const CALENDAR_PROPS = {
 };
 const CALENDAR_PROJECTED_PROPS = { currentUserPrivilegeSet: true };
 
-/** 在 current-user-privilege-set 的 xml-js compact 结构里递归寻找带 "write" 的节点名。 */
-function hasWritePrivilege(node: unknown): boolean {
+/**
+ * 在 current-user-privilege-set 的 xml-js compact 结构里递归寻找带 "write" 的节点名。
+ * 导出仅为测试。
+ */
+export function hasWritePrivilege(node: unknown): boolean {
   if (node === null || typeof node !== 'object') return false;
   for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
     if (key.toLowerCase().includes('write')) return true;
     if (hasWritePrivilege(value)) return true;
   }
   return false;
+}
+
+/**
+ * 权限发现的兜底：全部日历都判为只读时，更可能是 current-user-privilege-set
+ * 未按预期返回，而非该账号真的没有可写日历（iCloud 用户总有一个默认日历可写）。
+ * 此时视为“权限信息不可用”，一律报可写，由服务器用 403 做真正的裁决。
+ * 只要有任意一个日历探测到写权限，就说明机制正常，逐个结果照原样采信。
+ */
+export function applyPrivilegeFallback(calendars: CalendarInfo[]): CalendarInfo[] {
+  if (calendars.length === 0) return calendars;
+  if (calendars.some((c) => !c.readOnly)) return calendars;
+  return calendars.map((c) => ({ ...c, readOnly: false }));
 }
 
 /** CalDAV 认证用 account.email（Apple ID），与 IMAP 使用的 sender 不同。 */
@@ -130,7 +145,7 @@ export function createCalDavProvider(account: AccountConfig): CalDavProvider {
           props: CALENDAR_PROPS,
           projectedProps: CALENDAR_PROJECTED_PROPS,
         });
-        return calendars.map((cal) => {
+        const infos = calendars.map((cal) => {
           const components = (cal.components ?? []).map(String);
           const info: CalendarInfo = {
             url: cal.url,
@@ -141,6 +156,7 @@ export function createCalDavProvider(account: AccountConfig): CalDavProvider {
           if (typeof cal.calendarColor === 'string') info.color = cal.calendarColor;
           return info;
         });
+        return applyPrivilegeFallback(infos);
       } catch (err) {
         throw mapCalDavError(err);
       }
