@@ -9,6 +9,7 @@ import { createServer } from '../server/createServer.js';
 import { AppError } from '../core/errors.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
+const SHUTDOWN_TIMEOUT_MS = 5_000;
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
@@ -23,9 +24,17 @@ async function main(): Promise<void> {
 
   // unref 让定时器不阻止进程退出
   const sweeper = setInterval(() => {
-    void sessions.sweep().then((removed) => {
-      if (removed > 0) logger.debug('swept expired sessions', { removed });
-    });
+    void sessions
+      .sweep()
+      .then((removed) => {
+        if (removed > 0) logger.debug('swept expired sessions', { removed });
+      })
+      .catch((err: unknown) => {
+        // 后台定时器绝不能让未处理的 rejection 掀翻整个服务器
+        logger.warn('session sweep failed', {
+          detail: err instanceof Error ? err.name : typeof err,
+        });
+      });
   }, SWEEP_INTERVAL_MS);
   sweeper.unref();
 
@@ -37,10 +46,27 @@ async function main(): Promise<void> {
     accounts: config.accounts.length,
   });
 
+  let shuttingDown = false;
+
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      // 第二次信号意味着用户不想再等：放弃剩余的清理直接退出
+      logger.warn('forced shutdown', { signal });
+      process.exit(1);
+    }
+    shuttingDown = true;
     logger.info('shutting down', { signal });
     clearInterval(sweeper);
-    await sessions.destroyAll();
+
+    // 关闭连接不应无限期阻塞退出：logout() 对着已断开的 socket 可能永不返回
+    const closed = sessions.destroyAll().then(() => true);
+    const deadline = new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(false), SHUTDOWN_TIMEOUT_MS).unref();
+    });
+
+    if (!(await Promise.race([closed, deadline]))) {
+      logger.warn('shutdown timed out, exiting anyway', { ms: SHUTDOWN_TIMEOUT_MS });
+    }
     process.exit(0);
   };
 

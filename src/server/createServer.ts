@@ -52,6 +52,6 @@ export function registerAllTools(server: ToolRegistrar, deps: ServerDeps): void 
 
 export function createServer(deps: ServerDeps): McpServer {
   const server = new McpServer({ name: 'apple-icloud-mcp', version: '2.0.0' });
-  registerAllTools(server as unknown as ToolRegistrar, deps);
+  registerAllTools(server, deps);
   return server;
 }

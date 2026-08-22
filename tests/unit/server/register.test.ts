@@ -52,4 +52,18 @@ describe('registerAllTools', () => {
     registerAllTools(server, { config: loadConfig(base), sessions, logger });
     expect(new Set(names).size).toBe(names.length);
   });
+
+  it('registers mail tools when only one of several accounts enables mail', () => {
+    const { server, names } = collect();
+    const config = loadConfig({
+      ...base,
+      ALLOW_MAIL_READ_1: 'false',
+      ALLOW_MAIL_WRITE_1: 'false',
+      ICLOUD_ACCOUNT_2: 'work@icloud.com',
+      ICLOUD_APP_PASSWORD_2: 'abcd-efgh-ijkl-mnop',
+      ALLOW_MAIL_READ_2: 'true',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names).toContain('mail_search');
+  });
 });
