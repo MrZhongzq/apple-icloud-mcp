@@ -2,48 +2,49 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 项目概述
+## Project overview
 
-`apple-icloud-mcp`：把 iCloud 邮件（IMAP/SMTP）和日历（CalDAV）暴露成 MCP 工具的服务器。TypeScript + ESM（`"type": "module"`，`module: NodeNext`），Express 承载 MCP SDK 的 SSE transport。
+`apple-icloud-mcp`: an MCP server exposing Apple iCloud Mail (IMAP/SMTP) and Calendar (CalDAV) as tools, over the **stdio** transport. TypeScript, ESM (`"type": "module"`, `module: NodeNext`), `strict` + `noUncheckedIndexedAccess` on. Phase one covers Mail + Calendar only; Reminders/Contacts are phase two, a remote HTTP+OAuth transport is phase three — neither exists in this repo yet.
 
-## 常用命令
+## Commands
 
 ```bash
-npm start          # 开发：tsx 直接跑 src/server.ts（不编译）
-npm run build      # tsc → dist/
-npm run serve      # 生产：node dist/server.js（跑的是 dist/ 里已编译的代码）
-npx tsc --noEmit   # 仅类型检查
+npm start               # dev: tsx runs src/bin/stdio.ts directly, no build step
+npm run build            # tsc -> dist/
+npm run serve             # prod: node dist/bin/stdio.js (requires a prior build)
+npm run typecheck         # npx tsc --noEmit
+npm test                  # unit suite: vitest.config.ts, tests/unit/**, no network
+npm run test:integration  # live-iCloud suite: vitest.integration.config.ts, tests/integration/**
+                           # skipped entirely unless .env.test exists at repo root
 ```
 
-仓库没有测试框架、没有 lint 配置，改完代码只能靠 `npx tsc --noEmit` + 手动连服务器验证。
+`npx vitest run` (no config flag) runs the unit config and therefore never touches real iCloud. The integration suite is opt-in only — see `README.md` → Testing.
 
-其他启动方式：`.\scripts\start.ps1` / `./scripts/start.sh`（自动 `npm install` 后 `npm start`）；`docker build -t apple-icloud-mcp . && docker run -p 17733:17733 --env-file .env apple-icloud-mcp`。
+## Architecture
 
-服务端点：`http://localhost:17733/sse`（SSE），`POST /message`（客户端回传）。配置 `SSL_CERT` + `SSL_KEY` 且文件存在时自动切 HTTPS。
+Strict layering, request path `bin → server → modules → providers`, with `parsers` as a separate pure-function layer consumed by `modules`:
 
-## 架构
+- **`src/core/`** — cross-cutting, no I/O of its own. `config.ts` is the single source of credentials: `loadConfig(env)` scans `ICLOUD_ACCOUNT_1..5` etc. and builds `AccountConfig[]`, mapping legacy lowercase v1 variable names with a deprecation warning. `errors.ts` defines `AppError`/`ErrorCode` and `toErrorPayload()`, the only thing that ever crosses the tool boundary on failure. `session.ts` is an in-memory `Map`-backed session store (TTL-based expiry, swept periodically). `ids.ts` encodes/decodes opaque resource ids as base64url.
+- **`src/providers/icloud/`** — thin wrappers around `imapflow`, `nodemailer`, and `tsdav`, one file per protocol plus `index.ts` (`createProviders`) that assembles all three for a session. Each provider maps raw client errors to `AppError` via a local `mapXError()` function (`mapImapError`, `mapSmtpError`, `mapCalDavError`). No knowledge of MCP or tool schemas belongs here.
+- **`src/parsers/`** — pure functions, no I/O: `mime.ts` decodes MIME/RFC 2047 email content, `ical.ts` converts between iCal text and the `CalendarEvent`/`EventInput` domain types (parsing, building, patching, recurrence expansion). Because they're pure, these are the easiest layer to unit test exhaustively and where most of the calendar edge-case tests live (`tests/unit/parsers/ical*.test.ts`).
+- **`src/modules/{mail,calendar,session}/`** — one module per domain, each split into `service.ts` (business logic: permission gates, calls into providers/parsers, maps to response shapes) and `tools.ts` (zod input schemas + `registerTool` wiring; thin — delegates straight to the service).
+- **`src/server/`** — `createServer.ts` builds the `McpServer` and calls each module's `register*Tools`, gated on whether *any* configured account has that capability at all (an account-level filter, not per-call). `wrap.ts` is the tool boundary: serializes success as JSON text, catches anything and turns it into the `{ error: {...}, isError: true }` shape via `toErrorPayload`. `types.ts` defines the minimal `ToolRegistrar` interface the modules depend on, so tool-registration logic can be unit-tested without booting a real `McpServer`.
+- **`src/bin/stdio.ts`** — the only entrypoint. Loads config, builds the session store and server, connects a `StdioServerTransport`, installs `SIGINT`/`SIGTERM` handlers with a bounded shutdown timeout. Any startup failure (bad config, etc.) writes to **stderr** and exits non-zero — never stdout.
 
-四层，请求路径固定为 `server.ts → auth.ts → services/{mail,calendar}.ts`：
+`SKILL.md` is the usage contract an AI client reads (login → call with `session_id` → `work_done`, all 15 tools, error-code recovery table). **Adding or changing a tool touches at least three places**: the module's `tools.ts` (schema + registration), the module's `service.ts` (behavior), and `SKILL.md` (the contract). If it changes a documented limitation (see README's "Limitations" section), update the README too.
 
-- `src/config.ts`：唯一的凭据来源。`getConfig()` 每次调用都重新扫描环境变量，按下标拼出账号列表——账号 1 无后缀，账号 2–5 后缀为数字（`icloud_account2`、`allow_mail2_read`…），仅当 `multiple_account_enable=1` 时才扫描第 2–5 个。凭据不落盘、不缓存。
-- `src/services/auth.ts`：`login(email)` 在内存 `Map` 里建一个 uuid 会话并挂上 `AccountConfig`；`work_done` 调 `logout()` 删除。进程重启 = 所有会话失效，没有过期清理逻辑。
-- `src/server.ts`：手写工具清单（`ListToolsRequestSchema` 里直接写 JSON Schema，虽然依赖了 zod 但没用它）+ `CallToolRequestSchema` 的 switch 分发。`apple_login` / `work_done` 不校验会话，其余工具先 `getSession(session_id)`，取不到就返回错误文本。工具异常统一被 catch 成 `{ isError: true }` 的 JSON 文本，不会抛给客户端。
-- `src/services/*.ts`：每个函数第一行都是 `if (!account.allowXxx) throw` 的权限闸门，然后是纯粹的 IMAP/SMTP/CalDAV 调用。
+## Non-obvious constraints and why
 
-`SKILL.md` 是给 AI 客户端看的工具使用契约（登录 → 带 `session_id` 调用 → `work_done`）。**新增或修改工具时要同时改三处**：`server.ts` 的工具清单、`server.ts` 的 switch 分支、`SKILL.md` 的工具说明。
+- **ESM relative imports need an explicit `.js` extension**, even though the source files are `.ts` (`import { X } from '../core/config.js'`). This is `NodeNext` module resolution, not a typo — TypeScript resolves it to the `.ts` file at compile time but the emitted JS needs the extension to run.
+- **stdout belongs entirely to the MCP protocol.** Nothing in this codebase writes to stdout directly; all logging goes through `core/logger.ts` to **stderr**, and startup failures in `bin/stdio.ts` are written to stderr explicitly. Never add a `console.log` — it would corrupt the stdio JSON-RPC stream.
+- **IMAP/SMTP authenticate with `account.sender`; CalDAV authenticates with `account.email`.** These are two different fields on `AccountConfig` (`sender` falls back to `email` if `ICLOUD_SENDER_n` isn't set) because a user's IMAP/SMTP login identity can be an alias distinct from their Apple ID, while CalDAV always wants the Apple ID. This exact confusion caused real bugs in the v1 history (`Fix IMAP auth`, prior `Fix icloud email sender logic`) — when touching auth code in `providers/icloud/*.ts`, keep the two straight.
+- **Write permissions default to OFF** (`ALLOW_MAIL_WRITE_n` / `ALLOW_CALENDAR_WRITE_n`), while read defaults to ON. This was deliberately flipped from v1, where write defaulted to on and a misspelled variable name silently granted delete access. `core/config.ts::readBool` takes an explicit `fallback` per call — don't change a write-capability default to `true` without a very good reason and a note in the README.
+- **CalDAV etags never appear in a tool's public interface.** `expected_etag` is an *optional* optimistic-concurrency input a caller may supply, but `event_id`/`calendar_id` (built by `core/ids.ts`) never encode an etag, and no tool response surfaces one. Etags are read fresh from CalDAV (`loadForWrite` in `modules/calendar/service.ts`) immediately before every write and compared there — never trust or thread through a cached one.
+- **`calendar_update_event` patches the existing VEVENT in place; it does not rebuild it from the `CalendarEvent` model.** `parsers/ical.ts::applyEventPatch` mutates the parsed iCal AST for only the fields present in the patch. This is deliberate: rebuilding from the domain model would silently drop every iCal property our model doesn't represent — `ATTENDEE`, `ORGANIZER`, `CATEGORIES`, `STATUS`, `X-APPLE-*` — which is real user data (invitee lists, RSVP state) this phase does not manage. The model is still used to *validate* the merged result (e.g. `end` after `start`) before the patch is written.
+- **Event creation has no `timezone` field and never will in this phase** (`EventInput` in `parsers/ical.ts`). Emitting `DTSTART;TZID=` correctly requires shipping VTIMEZONE data this phase doesn't have, so created events are UTC-anchored; a recurring event drifts an hour across a DST transition for zones that observe it. This is documented in the README/SKILL, not a bug to silently "fix" by adding a timezone parameter without also solving VTIMEZONE.
+- **Calendar privilege detection fails safe, not closed.** `providers/icloud/caldav.ts::applyPrivilegeFallback`: if `current-user-privilege-set` detection finds *no* writable calendar at all across the account, every calendar is reported `writable: true` rather than `false` — because iCloud accounts always have at least one genuinely writable calendar, so an all-read-only result more likely means detection broke than that the account can't write anywhere. The server's own 403 handling (`mapCalDavError`) is the real backstop in that case, not the `writable` flag.
+- **`mail_delete` moves to trash by default; only `permanent: true` expunges.** Don't assume delete is immediate/irreversible unless that flag is set.
 
-## 关键约定与坑
+## Repository hygiene
 
-- **邮件用 `sender`，日历用 `email`。** IMAP/SMTP 认证用的是 `account.sender`（`icloud_sender` 未设置时回退到 `icloud_account`），CalDAV 用的是 `account.email`。这是历史上修过的 bug（`Fix IMAP auth`、`Fix icloud email sender logic`），改认证相关代码时别把两者混用。
-- **权限开关默认开启**：`process.env[...] !== 'false'`，变量缺失即视为允许。要关必须显式写 `false`。
-- **`dist/` 已提交进 git**，`npm run serve` 跑的是提交进去的产物。改了 `src/` 后如果走 `serve`，必须先 `npm run build`，否则行为不变。
-- **`transport` 是模块级单变量**，每次 `GET /sse` 都会覆盖它，因此同一时刻只支持一个 SSE 客户端。
-- **`calendar_update_event` 要求传 `calendar_url`，但 `updateEvent()` 实际没用它**（tsdav 只需要 `event_url` + `etag`）。
-- **创建事件落在第一个支持 VEVENT 的日历**（`calendar.ts` 里 `components.includes('VEVENT')` 筛选，找不到就用 `calendars[0]`），无法指定目标日历。
-- **`mail_delete` 只打 `\Deleted` 标记**，不做 expunge，邮件不会真正消失。
-- **iCloud Notes 不支持**，Apple 没有配合 App-Specific Password 的标准 API，不要尝试用 IMAP 读 Notes。
-- 环境变量取值从 `=` 或 `:` 后第一个非空格字符开始到行尾，值中间的空格/引号/连字符全部保留（见 README 与 SKILL.md 的说明）。
-
-## 仓库卫生
-
-仓库没有 `.gitignore`，`node_modules/`、`dist/` 和 `.env` 都被跟踪在版本库里。提交前留意别把新的凭据带进去。
+`dist/`, `node_modules/`, and `.env` are gitignored and untracked — always run `npm run build` before `npm run serve` after touching `src/`. `.env.test` (real integration credentials) is gitignored too; only `.env.example` and `.env.test.example` (placeholders) are committed. Never read, print, or commit the contents of `.env`.
