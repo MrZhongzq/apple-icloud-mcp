@@ -24,7 +24,9 @@ export function wrapTool<T>(
         tool: name,
         ms: Date.now() - startedAt,
         code: payload.error.code,
-        detail: err instanceof AppError ? err.message : String(err),
+        // AppError 的 message 是我们自己的固定文案，可安全记录；
+        // 未映射的原始异常可能内嵌 LOGIN 行等凭据，只记类型名。
+        detail: err instanceof AppError ? err.message : err instanceof Error ? err.name : typeof err,
       });
       return { ...asText(payload), isError: true };
     }

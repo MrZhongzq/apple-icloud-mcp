@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { wrapTool } from '../../server/wrap.js';
+import { AppError } from '../../core/errors.js';
 import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
 import type { Session } from '../../core/session.js';
 import type { MailService } from './service.js';
@@ -25,8 +26,15 @@ const querySchema = z
   })
   .optional();
 
-function toDate(value: string | undefined): Date | undefined {
-  return value === undefined ? undefined : new Date(value);
+function toDate(value: string | undefined, field: string): Date | undefined {
+  if (value === undefined) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new AppError('INVALID_INPUT', `${field} 不是合法的时间格式：${value}`, {
+      hint: '请使用 ISO 8601 格式，例如 2026-09-01T00:00:00Z',
+    });
+  }
+  return date;
 }
 
 export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): void {
@@ -76,8 +84,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
         const query = args.query
           ? {
               ...args.query,
-              since: toDate(args.query.since as string | undefined),
-              before: toDate(args.query.before as string | undefined),
+              since: toDate(args.query.since as string | undefined, 'since'),
+              before: toDate(args.query.before as string | undefined, 'before'),
             }
           : undefined;
         return serviceOf(args.session_id).search({

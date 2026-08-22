@@ -107,4 +107,32 @@ describe('registerMailTools', () => {
     expect(result.content[0]!.text).not.toContain('abcd-efgh');
     expect(JSON.parse(result.content[0]!.text).error.code).toBe('INTERNAL');
   });
+
+  it('never writes a raw error message to the log', async () => {
+    const lines: string[] = [];
+    const captureLogger = createLogger('warn', (l) => lines.push(l));
+    const { server, tools } = collect();
+    const search = vi.fn().mockRejectedValue(new Error('imap socket died: pass=abcd-efgh'));
+    registerMailTools(server, { ...depsWith({ search }), logger: captureLogger });
+
+    await tools.get('mail_search')!.handler({ session_id: 's1' });
+
+    expect(lines.join('\n')).not.toContain('abcd-efgh');
+    expect(lines.join('\n')).toContain('"detail":"Error"');
+  });
+
+  it('rejects a malformed date in the search query', async () => {
+    const { server, tools } = collect();
+    registerMailTools(server, depsWith({ search: vi.fn() }));
+
+    const result = await tools.get('mail_search')!.handler({
+      session_id: 's1',
+      query: { since: 'yesterday' },
+    });
+
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse(result.content[0]!.text);
+    expect(payload.error.code).toBe('INVALID_INPUT');
+    expect(payload.error.hint).toContain('ISO 8601');
+  });
 });

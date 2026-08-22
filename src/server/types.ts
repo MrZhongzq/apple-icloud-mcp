@@ -5,6 +5,8 @@ import type { Logger } from '../core/logger.js';
 export interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
+  /** MCP 的 CallToolResult 带索引签名；不加这一行，真实 McpServer 无法赋值给 ToolRegistrar。 */
+  [x: string]: unknown;
 }
 
 export interface ToolAnnotations {
@@ -21,8 +23,8 @@ export interface ToolConfig {
 }
 
 /**
- * McpServer 满足这个接口。模块依赖它而非具体实现，
- * 使工具层可以在不启动 MCP server 的情况下被测试。
+ * 真实的 McpServer 满足这个接口（其 CallToolResult 带索引签名，故 ToolResult 也带）。
+ * 模块依赖这个最小接口而非具体实现，使工具层可以在不启动 MCP server 的情况下被测试。
  */
 export interface ToolRegistrar {
   registerTool(
