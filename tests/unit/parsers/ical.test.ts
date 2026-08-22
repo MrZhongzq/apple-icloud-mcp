@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseCalendarObject, buildCalendarObject, readEventMeta, applyEventPatch } from '../../../src/parsers/ical.js';
+import { AppError } from '../../../src/core/errors.js';
 
 const ref = {
   collectionUrl: 'https://caldav.icloud.com/1/calendars/home/',
@@ -89,6 +90,32 @@ describe('parseCalendarObject', () => {
     });
     const ids = new Set(events.map((e) => e.event_id));
     expect(ids.size).toBe(1);
+  });
+
+  it('resolves a TZID-qualified start time via the IANA zone when no VTIMEZONE was shipped, instead of reading it as floating UTC', () => {
+    // Europe/Berlin is deliberately not used by any VTIMEZONE-equipped fixture in this
+    // suite: ICAL.TimezoneService is process-global and first-writer-wins (see I5), so a
+    // TZID any other test had already registered would mask exactly the bug under test.
+    const [event] = parseCalendarObject(fixture('unresolved-tzid.ics'), ref);
+    // 20260803T170000 Europe/Berlin (CEST, UTC+2 in August) == 2026-08-03T15:00:00Z.
+    // The old floating-UTC fallback would have emitted 17:00:00Z -- two hours wrong --
+    // while still reporting timezone: 'Europe/Berlin', an internally contradictory result.
+    expect(event!.start).toBe('2026-08-03T15:00:00.000Z');
+    expect(event!.end).toBe('2026-08-03T16:00:00.000Z');
+    expect(event!.timezone).toBe('Europe/Berlin');
+  });
+
+  it('throws UPSTREAM_ERROR naming the TZID when it is neither shipped as VTIMEZONE nor a recognisable IANA zone', () => {
+    let thrown: unknown;
+    try {
+      parseCalendarObject(fixture('invalid-tzid.ics'), ref);
+      throw new Error('should have thrown');
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(AppError);
+    expect((thrown as AppError).code).toBe('UPSTREAM_ERROR');
+    expect((thrown as AppError).message).toContain('Not/AZone');
   });
 
   it('reads a floating date-time as UTC wall-clock regardless of host timezone', () => {
