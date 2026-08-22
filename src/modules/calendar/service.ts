@@ -216,20 +216,30 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
         calendars.map(async (calendar) => {
           const objects = await caldav.fetchObjects(calendar.url, range);
           const events: CalendarEvent[] = [];
+          // R2: parseCalendarObject() can throw for a single malformed object (e.g. I5's
+          // unresolvable-TZID guard) -- that must not take the whole calendar out from
+          // inside the per-calendar allSettled body above. Contained here, one level
+          // lower, so every other object in the same calendar still comes back.
+          let unparseableObjects = 0;
           for (const object of objects) {
-            events.push(
-              ...parseCalendarObject(
-                object.data,
-                { collectionUrl: object.collectionUrl, resourceUrl: object.url },
-                {
-                  rangeStart: range.start,
-                  rangeEnd: range.end,
-                  expandRecurring: params.expand_recurring !== false,
-                },
-              ),
-            );
+            try {
+              events.push(
+                ...parseCalendarObject(
+                  object.data,
+                  { collectionUrl: object.collectionUrl, resourceUrl: object.url },
+                  {
+                    rangeStart: range.start,
+                    rangeEnd: range.end,
+                    expandRecurring: params.expand_recurring !== false,
+                  },
+                ),
+              );
+            } catch {
+              // A CalDAV object url is not meaningful to the model -- just count it.
+              unparseableObjects += 1;
+            }
           }
-          return events;
+          return { events, unparseableObjects };
         }),
       );
 
@@ -238,7 +248,14 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
       settled.forEach((outcome, index) => {
         const calendar = calendars[index]!;
         if (outcome.status === 'fulfilled') {
-          events.push(...outcome.value);
+          events.push(...outcome.value.events);
+          if (outcome.value.unparseableObjects > 0) {
+            partial_failures.push({
+              calendar_id: encodeUrl(calendar.url),
+              name: calendar.name,
+              reason: `${outcome.value.unparseableObjects} 个日程对象无法解析`,
+            });
+          }
         } else {
           const reason = outcome.reason instanceof AppError ? outcome.reason.message : '未知错误';
           partial_failures.push({ calendar_id: encodeUrl(calendar.url), name: calendar.name, reason });

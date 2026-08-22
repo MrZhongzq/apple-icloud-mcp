@@ -12,6 +12,7 @@ const WORK = 'https://caldav.icloud.com/1/calendars/work/';
 const EVENT_URL = `${HOME}timed-001.ics`;
 
 const timedIcs = readFileSync(join(process.cwd(), 'tests/fixtures/calendar/timed-shanghai.ics'), 'utf8');
+const invalidTzidIcs = readFileSync(join(process.cwd(), 'tests/fixtures/calendar/invalid-tzid.ics'), 'utf8');
 
 function makeAccount(overrides: Partial<AccountConfig['capabilities']> = {}): AccountConfig {
   return {
@@ -164,6 +165,27 @@ describe('CalendarService.listEvents', () => {
     await expect(
       service.listEvents({ ...range, calendar_ids: [encodeUrl(WORK), bogus] }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('isolates a single unparseable object within a calendar: the other event still returns, and the calendar is reported in partial_failures (R2)', async () => {
+    const caldav = makeCalDav({
+      listCalendars: vi
+        .fn()
+        .mockResolvedValue([{ url: HOME, name: '个人', readOnly: false, components: ['VEVENT'] }]),
+      fetchObjects: vi.fn().mockResolvedValue([
+        { collectionUrl: HOME, url: EVENT_URL, etag: 'etag-1', data: timedIcs },
+        { collectionUrl: HOME, url: `${HOME}bad-tz.ics`, etag: 'etag-2', data: invalidTzidIcs },
+      ]),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    const result = await service.listEvents(range);
+
+    // The whole calendar must not vanish: the good object's event is still returned.
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]!.title).toBe('项目评审');
+    expect(result.partial_failures).toEqual([
+      { calendar_id: encodeUrl(HOME), name: '个人', reason: expect.any(String) },
+    ]);
   });
 });
 
