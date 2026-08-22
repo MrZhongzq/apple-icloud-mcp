@@ -216,9 +216,21 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
           etag: current.etag,
           data,
         });
-        const [updated] = parseCalendarObject(data, ref);
-        if (!updated) throw new AppError('INTERNAL', '事件更新后无法回读');
-        return updated;
+
+        // scope 'this' writes an exception occurrence, not the master -- re-parse
+        // with expansion and hand back the occurrence actually edited (matched by its
+        // *original* recurrence_id, which stays pinned to the slot even if the patch
+        // moved the occurrence's start) rather than the series' own unmoved template.
+        const anchor = new Date(recurrenceId).getTime();
+        const movedTo = new Date(overrideInput.start).getTime();
+        const occurrences = parseCalendarObject(data, ref, {
+          rangeStart: new Date(Math.min(anchor, movedTo) - 86_400_000),
+          rangeEnd: new Date(Math.max(anchor, movedTo) + 86_400_000),
+          expandRecurring: true,
+        });
+        const edited = occurrences.find((e) => e.recurrence_id === recurrenceId);
+        if (!edited) throw new AppError('INTERNAL', '事件更新后无法回读该次发生');
+        return edited;
       }
 
       const [existing] = parseCalendarObject(current.data, ref);

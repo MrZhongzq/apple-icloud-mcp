@@ -19,6 +19,20 @@ const range = {
   expandRecurring: true,
 };
 
+/** 从 ICS 文本中取出指定的 VEVENT 块，避免用字符串位置去猜属性顺序。 */
+function veventBlocks(ics: string): string[] {
+  return ics
+    .split('BEGIN:VEVENT')
+    .slice(1)
+    .map((block) => block.split('END:VEVENT')[0] ?? '');
+}
+
+function overrideBlock(ics: string): string {
+  const found = veventBlocks(ics).find((b) => b.includes('RECURRENCE-ID'));
+  if (!found) throw new Error('没有找到带 RECURRENCE-ID 的覆盖组件');
+  return found;
+}
+
 describe('addExdate', () => {
   it('removes one occurrence from the expanded series', () => {
     const updated = addExdate(weekly, '2026-08-17T09:00:00.000Z');
@@ -84,10 +98,10 @@ describe('upsertOverride', () => {
       start: '2026-08-10T09:00:00.000Z',
       end: '2026-08-10T09:30:00.000Z',
     });
-    const overrideBlock = updated.slice(updated.indexOf('RECURRENCE-ID'));
-    expect(overrideBlock).toContain('zhangsan@example.com');
-    expect(overrideBlock).toContain('ORGANIZER');
-    expect(overrideBlock).not.toContain('RRULE');
+    const block = overrideBlock(updated);
+    expect(block).toContain('zhangsan@example.com');
+    expect(block).toContain('ORGANIZER');
+    expect(block).not.toContain('RRULE');
   });
 
   it("preserves an existing override's own properties when patching it again", () => {
@@ -100,6 +114,22 @@ describe('upsertOverride', () => {
     expect(twice).toContain('第二次改');
     expect(twice).not.toContain('第一次改');
     expect(twice.match(/RECURRENCE-ID/g)).toHaveLength(1);
-    expect(twice.slice(twice.indexOf('RECURRENCE-ID'))).toContain('zhangsan@example.com');
+    expect(overrideBlock(twice)).toContain('zhangsan@example.com');
+  });
+
+  it('keeps recurrence_id pinned to the original slot after an occurrence is moved', () => {
+    const moved = upsertOverride(fixture('weekly-with-override.ics'), '2026-08-10T09:00:00.000Z', {
+      title: '挪到下午',
+      start: '2026-08-10T14:00:00.000Z',
+      end: '2026-08-10T14:30:00.000Z',
+    });
+    const events = parseCalendarObject(moved, ref, {
+      rangeStart: new Date('2026-08-01T00:00:00Z'),
+      rangeEnd: new Date('2026-09-01T00:00:00Z'),
+      expandRecurring: true,
+    });
+    const occurrence = events.find((e) => e.title === '挪到下午');
+    expect(occurrence!.start).toBe('2026-08-10T14:00:00.000Z');
+    expect(occurrence!.recurrence_id).toBe('2026-08-10T09:00:00.000Z');
   });
 });

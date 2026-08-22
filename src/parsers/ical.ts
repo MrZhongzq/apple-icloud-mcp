@@ -280,7 +280,7 @@ export function parseCalendarObject(
         ...fields,
         event_id: template.event_id,
         series_id: template.series_id,
-        recurrence_id: toIsoString(details.startDate),
+        recurrence_id: toIsoString(details.recurrenceId),
         start: toIsoString(details.startDate),
         end: toIsoString(details.endDate),
       });
@@ -514,34 +514,6 @@ export function addExdate(icsText: string, recurrenceId: string): string {
   return root.toString();
 }
 
-/**
- * ical.js's Component API has no "insert at position" primitive -- every add*
- * call appends to the end of the raw jCal properties array. That is fine for
- * applyEventPatch (property order in the output is not load-bearing there),
- * but a freshly cloned override needs RECURRENCE-ID to sit near the top,
- * right after UID, rather than trailing after every unmodeled property the
- * clone carried along (ATTENDEE, ORGANIZER, CATEGORIES, ...) -- both for
- * conventional VEVENT shape and because callers scan "everything from
- * RECURRENCE-ID onward" to inspect just the override block.
- *
- * This reorders the raw jCal array directly, so it MUST run only after every
- * other Component-API mutation on `vevent` is finished: once the array is
- * spliced out of band, the component's internal hydrated-property cache is no
- * longer index-aligned with it, and a further getFirstProperty/
- * addPropertyWithValue/removeAllProperties call on this same component could
- * touch the wrong entry. `toString()` itself reads the raw jCal array
- * directly (see ical.js Component#toString), so serialization is unaffected.
- */
-function moveRecurrenceIdAfterUid(vevent: ICAL.Component): void {
-  const props = vevent.jCal[1] as unknown[][];
-  const idx = props.findIndex((p) => p[0] === 'recurrence-id');
-  if (idx < 0) return;
-  const [entry] = props.splice(idx, 1);
-  if (!entry) return;
-  const uidIdx = props.findIndex((p) => p[0] === 'uid');
-  props.splice(uidIdx + 1, 0, entry);
-}
-
 function findOverride(root: ICAL.Component, recurrenceId: string): ICAL.Component | undefined {
   return root.getAllSubcomponents('vevent').find((candidate) => {
     const rid = candidate.getFirstPropertyValue('recurrence-id');
@@ -582,7 +554,6 @@ export function upsertOverride(icsText: string, recurrenceId: string, input: Eve
   resetSequence(override);
   refreshDtstamp(override);
   applyPatchToVevent(override, input, { allowRecurrence: false });
-  moveRecurrenceIdAfterUid(override);
 
   root.addSubcomponent(override);
   return root.toString();

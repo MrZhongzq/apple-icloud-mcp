@@ -64,7 +64,7 @@ describe('single-occurrence scope', () => {
   it('writes an override when updating a single occurrence', async () => {
     const caldav = makeCalDav();
     const service = createCalendarService({ account, caldav });
-    await service.updateEvent(
+    const result = await service.updateEvent(
       eventId,
       { title: '这次改到下午', start: '2026-08-17T14:00:00.000Z', end: '2026-08-17T15:00:00.000Z' },
       { scope: 'this', recurrence_id: '2026-08-17T09:00:00.000Z' },
@@ -73,6 +73,9 @@ describe('single-occurrence scope', () => {
     const written = (caldav.update as ReturnType<typeof vi.fn>).mock.calls[0]![0].data as string;
     expect(written).toContain('RECURRENCE-ID');
     expect(written).toContain('这次改到下午');
+
+    expect(result.title).toBe('这次改到下午');
+    expect(result.start).toBe('2026-08-17T14:00:00.000Z');
   });
 
   it('requires recurrence_id when scope is this', async () => {
