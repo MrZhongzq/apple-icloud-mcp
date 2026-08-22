@@ -9,8 +9,19 @@ const DEFAULT_FOLDER = 'INBOX';
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
+export interface FolderPartialFailure {
+  path: string;
+  reason: string;
+}
+
+export interface ListFoldersResult {
+  folders: FolderInfo[];
+  /** 单个文件夹状态读取失败时出现；其余文件夹的结果仍然完整返回（I1）。 */
+  partial_failures?: FolderPartialFailure[];
+}
+
 export interface MailService {
-  listFolders(): Promise<FolderInfo[]>;
+  listFolders(): Promise<ListFoldersResult>;
   search(params: SearchParams): Promise<SearchResult>;
   read(uid: number, folder?: string, format?: 'text' | 'html' | 'both'): Promise<ParsedEmail & { uid: number }>;
   send(message: OutgoingMessage): Promise<SendResult>;
@@ -51,7 +62,7 @@ export function createMailService(deps: MailServiceDeps): MailService {
   };
 
   const findTrash = async (): Promise<string> => {
-    const folders = await imap.listFolders();
+    const { folders } = await imap.listFolders();
     const trash = folders.find((f) => f.specialUse === 'trash');
     if (!trash) {
       throw new AppError('NOT_FOUND', '找不到废纸篓文件夹', {
@@ -64,7 +75,8 @@ export function createMailService(deps: MailServiceDeps): MailService {
   return {
     async listFolders() {
       requireRead();
-      return imap.listFolders();
+      const { folders, failures } = await imap.listFolders();
+      return failures.length > 0 ? { folders, partial_failures: failures } : { folders };
     },
 
     async search(params) {

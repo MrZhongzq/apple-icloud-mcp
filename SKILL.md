@@ -24,7 +24,7 @@ This server exposes 15 tools for Apple iCloud Mail and Calendar. Read this befor
 
 ### Mail (all require `session_id`)
 
-- `mail_folders({ session_id })` → folder list with unread counts and `specialUse` (inbox/trash/sent/…).
+- `mail_folders({ session_id })` → `{ folders: FolderInfo[], partial_failures?: { path, reason }[] }` — folder list with unread counts and `specialUse` (inbox/trash/sent/…). `partial_failures` appears only when at least one folder's status could not be read; the rest of `folders` is still complete.
 - `mail_search({ session_id, folder?, query?, limit?, cursor? })` → `{ messages: MessageSummary[], nextCursor? }`. `query` fields: `from`, `to`, `subject`, `text`, `since`, `before` (ISO 8601), `unseen`, `flagged`. Headers/summary only — use `mail_read` for body. Page with `cursor`.
 - `mail_read({ session_id, uid, folder?, format? })` → full decoded body, headers, attachment metadata. `format` is `text` | `html` | `both`, default `text`. `uid` comes from `mail_search`.
 - `mail_send({ session_id, to[], cc?, bcc?, subject, text?, html?, in_reply_to? })` → send confirmation. At least one of `text`/`html` required.

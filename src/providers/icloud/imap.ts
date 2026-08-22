@@ -14,6 +14,17 @@ export interface FolderInfo {
   unseen: number;
 }
 
+export interface FolderStatusFailure {
+  path: string;
+  reason: string;
+}
+
+export interface ListFoldersResult {
+  folders: FolderInfo[];
+  /** 单个文件夹 STATUS 失败时出现该文件夹的记录；其余文件夹的结果仍然完整返回（I1）。 */
+  failures: FolderStatusFailure[];
+}
+
 export interface RawMessage {
   uid: number;
   date: Date;
@@ -34,7 +45,7 @@ export interface SearchCriteria {
 
 export interface ImapProvider {
   verify(): Promise<void>;
-  listFolders(): Promise<FolderInfo[]>;
+  listFolders(): Promise<ListFoldersResult>;
   searchUids(folder: string, criteria: SearchCriteria): Promise<number[]>;
   fetchMessages(folder: string, uids: number[]): Promise<RawMessage[]>;
   setFlags(folder: string, uids: number[], flags: string[], add: boolean): Promise<void>;
@@ -179,10 +190,18 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
 
     async listFolders() {
       const connection = await connect();
+      let list: Awaited<ReturnType<typeof connection.list>>;
       try {
-        const list = await connection.list();
-        const folders: FolderInfo[] = [];
-        for (const box of list) {
+        list = await connection.list();
+      } catch (err) {
+        throw mapImapError(err);
+      }
+
+      // I1: one folder's STATUS failing must not take out every other, healthy folder's
+      // result -- isolate per folder (Promise.allSettled) rather than aborting the whole
+      // listFolders() call on the first bad one.
+      const settled = await Promise.allSettled(
+        list.map(async (box): Promise<FolderInfo> => {
           // imapflow's pinned .d.ts claims Promise<StatusObject>, but the runtime (see
           // lib/commands/status.js) returns `false` on a server NO/BAD -- the type doesn't
           // reflect the documented failure path, hence the cast.
@@ -202,12 +221,20 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
             unseen: status.unseen ?? 0,
           };
           if (box.specialUse) info.specialUse = box.specialUse.replace('\\', '').toLowerCase();
-          folders.push(info);
+          return info;
+        }),
+      );
+
+      const folders: FolderInfo[] = [];
+      const failures: FolderStatusFailure[] = [];
+      settled.forEach((outcome, index) => {
+        if (outcome.status === 'fulfilled') {
+          folders.push(outcome.value);
+        } else {
+          failures.push({ path: list[index]!.path, reason: mapImapError(outcome.reason).message });
         }
-        return folders;
-      } catch (err) {
-        throw mapImapError(err);
-      }
+      });
+      return { folders, failures };
     },
 
     async searchUids(folder, criteria) {

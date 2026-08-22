@@ -40,7 +40,8 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
   });
 
   it('discovers a trash folder and an inbox', async () => {
-    const folders = await providers.imap.listFolders();
+    const { folders, failures } = await providers.imap.listFolders();
+    expect(failures).toEqual([]);
     expect(folders.some((f) => f.specialUse === 'inbox')).toBe(true);
     expect(folders.some((f) => f.specialUse === 'trash')).toBe(true);
   });

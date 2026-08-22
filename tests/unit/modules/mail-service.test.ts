@@ -34,10 +34,13 @@ function makeAccount(overrides: Partial<AccountConfig['capabilities']> = {}): Ac
 function makeImap(overrides: Partial<ImapProvider> = {}): ImapProvider {
   return {
     verify: vi.fn().mockResolvedValue(undefined),
-    listFolders: vi.fn().mockResolvedValue([
-      { path: 'INBOX', name: 'INBOX', specialUse: 'inbox', total: 3, unseen: 1 },
-      { path: 'Deleted Messages', name: 'Deleted Messages', specialUse: 'trash', total: 0, unseen: 0 },
-    ]),
+    listFolders: vi.fn().mockResolvedValue({
+      folders: [
+        { path: 'INBOX', name: 'INBOX', specialUse: 'inbox', total: 3, unseen: 1 },
+        { path: 'Deleted Messages', name: 'Deleted Messages', specialUse: 'trash', total: 0, unseen: 0 },
+      ],
+      failures: [],
+    }),
     searchUids: vi.fn().mockResolvedValue([30, 20, 10]),
     fetchMessages: vi.fn().mockResolvedValue([
       { uid: 30, date: new Date('2026-08-17T02:30:00Z'), flags: ['\\Seen'], source },
@@ -102,6 +105,28 @@ describe('MailService permissions', () => {
     } catch (e) {
       expect((e as AppError).hint).toContain('ALLOW_MAIL_WRITE');
     }
+  });
+});
+
+describe('MailService.listFolders (I1)', () => {
+  it('passes the successful folders straight through when nothing failed', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
+    const result = await service.listFolders();
+    expect(result.folders).toHaveLength(2);
+    expect(result.partial_failures).toBeUndefined();
+  });
+
+  it('surfaces a per-folder STATUS failure as partial_failures instead of failing mail_folders entirely', async () => {
+    const imap = makeImap({
+      listFolders: vi.fn().mockResolvedValue({
+        folders: [{ path: 'INBOX', name: 'INBOX', specialUse: 'inbox', total: 3, unseen: 1 }],
+        failures: [{ path: 'Broken', reason: '无法读取文件夹 Broken 的状态' }],
+      }),
+    });
+    const service = createMailService({ account: makeAccount(), imap, smtp: makeSmtp() });
+    const result = await service.listFolders();
+    expect(result.folders).toHaveLength(1);
+    expect(result.partial_failures).toEqual([{ path: 'Broken', reason: '无法读取文件夹 Broken 的状态' }]);
   });
 });
 
@@ -227,7 +252,10 @@ describe('MailService.mark / move / remove', () => {
 
   it('fails clearly when no trash folder can be discovered', async () => {
     const imap = makeImap({
-      listFolders: vi.fn().mockResolvedValue([{ path: 'INBOX', name: 'INBOX', total: 0, unseen: 0 }]),
+      listFolders: vi.fn().mockResolvedValue({
+        folders: [{ path: 'INBOX', name: 'INBOX', total: 0, unseen: 0 }],
+        failures: [],
+      }),
     });
     const service = createMailService({ account: makeAccount(), imap, smtp: makeSmtp() });
     await expect(service.remove([5])).rejects.toMatchObject({ code: 'NOT_FOUND' });

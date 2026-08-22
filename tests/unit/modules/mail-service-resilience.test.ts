@@ -37,7 +37,7 @@ function makeAccount(overrides: Partial<AccountConfig['capabilities']> = {}): Ac
 function makeImap(overrides: Partial<ImapProvider> = {}): ImapProvider {
   return {
     verify: vi.fn().mockResolvedValue(undefined),
-    listFolders: vi.fn().mockResolvedValue([]),
+    listFolders: vi.fn().mockResolvedValue({ folders: [], failures: [] }),
     searchUids: vi.fn().mockResolvedValue([10]),
     fetchMessages: vi.fn().mockResolvedValue([
       { uid: 10, date: new Date('2026-08-17T02:30:00Z'), flags: ['\\Seen'], source: Buffer.from('bogus') },

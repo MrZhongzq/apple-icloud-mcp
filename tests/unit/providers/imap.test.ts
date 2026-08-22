@@ -204,8 +204,46 @@ describe('createImapProvider surfaces imapflow false-return failures', () => {
     await expect(provider.searchUids('INBOX', {})).resolves.toEqual([]);
   });
 
-  it('rejects listFolders when STATUS reports failure, rather than reporting an empty/read folder', async () => {
+  it('isolates a single folder whose STATUS fails, rather than reporting it as empty/read (I1)', async () => {
+    // I1: listFolders isolates per folder -- a bad STATUS for one folder is reported as
+    // a failure for that folder specifically, not silently zeroed and not a blanket
+    // rejection that would also hide every other, healthy folder's status.
+    const provider = createImapProvider(account, {
+      createClient: () =>
+        makeFakeClient({
+          list: async () => [
+            { path: 'INBOX', name: 'INBOX', specialUse: undefined },
+            { path: 'Broken', name: 'Broken', specialUse: undefined },
+          ],
+          status: async (path: string) =>
+            path === 'Broken' ? false : { path, messages: 3, unseen: 1 },
+        }),
+    });
+
+    const result = await provider.listFolders();
+
+    expect(result.folders).toEqual([{ path: 'INBOX', name: 'INBOX', total: 3, unseen: 1 }]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.path).toBe('Broken');
+    expect(result.failures[0]!.reason).toBeTruthy();
+  });
+
+  it('reports every folder as a failure when STATUS fails for all of them, without throwing', async () => {
     const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    const result = await provider.listFolders();
+    expect(result.folders).toEqual([]);
+    expect(result.failures).toEqual([{ path: 'INBOX', reason: expect.any(String) }]);
+  });
+
+  it('still throws when the connection itself cannot list folders at all', async () => {
+    const provider = createImapProvider(account, {
+      createClient: () =>
+        makeFakeClient({
+          list: async () => {
+            throw Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' });
+          },
+        }),
+    });
     await expect(provider.listFolders()).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
   });
 });
