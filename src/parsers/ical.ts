@@ -40,12 +40,21 @@ export interface CalendarEvent {
   alarms: AlarmSpec[];
 }
 
+/**
+ * `timezone` is intentionally absent here (unlike on `CalendarEvent`). Creating an event
+ * with a local-wall-clock anchor (`DTSTART;TZID=...`) requires shipping a matching
+ * VTIMEZONE component, which needs timezone rule data phase one does not have. Every
+ * event we build is UTC-anchored instead: fine for a one-off event, since the ISO
+ * `start`/`end` already carry an absolute instant, but a UTC-anchored *recurring* event
+ * drifts an hour across any DST transition its RRULE crosses. This is a deliberate,
+ * documented gap for phase one, not an oversight -- local-wall-clock anchoring for
+ * recurring events is deferred to a later task that can supply VTIMEZONE data.
+ */
 export interface EventInput {
   title: string;
   start: string;
   end: string;
   all_day?: boolean;
-  timezone?: string;
   location?: string;
   description?: string;
   url?: string;
@@ -60,6 +69,13 @@ export interface ParseOptions {
 }
 
 const MAX_OCCURRENCES = 500;
+/** Hard stop on RecurExpansion steps, independent of how many occurrences fall in range.
+ *  Expansion always walks forward from the true DTSTART (see the note on `iterator()`
+ *  below), so a query far in the future against a FREQ=SECONDLY/MINUTELY rule from a
+ *  subscribed third-party calendar would otherwise iterate for a very long time before
+ *  ever reaching rangeEnd. This is a stdio server; an unbounded loop is a hang, not an
+ *  error, so we cap iteration count itself, separately from the emitted-occurrence cap. */
+const MAX_ITERATIONS = 50000;
 const PRODID = '-//apple-icloud-mcp//EN';
 
 function parseRoot(icsText: string): ICAL.Component {
@@ -79,19 +95,26 @@ function registerTimezones(root: ICAL.Component): void {
   }
 }
 
+const RECUR_FREQS: ReadonlySet<string> = new Set(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']);
+
 function recurrenceFromEvent(vevent: ICAL.Component): RecurrenceRule | undefined {
   const raw = vevent.getFirstPropertyValue('rrule');
   if (!raw) return undefined;
   const recur = raw as ICAL.Recur;
+
+  // recur.freq is typed as the bare string alias `frequencyValues`, so a rule this
+  // module cannot represent (e.g. FREQ=SECONDLY) must be validated against our own
+  // closed union rather than asserted into it -- otherwise we would report a value our
+  // own type claims is impossible.
+  if (!RECUR_FREQS.has(recur.freq)) return undefined;
   const rule: RecurrenceRule = { freq: recur.freq as RecurrenceRule['freq'] };
   if (recur.interval && recur.interval > 1) rule.interval = recur.interval;
   if (recur.count) rule.count = recur.count;
   if (recur.until) rule.until = toIsoString(recur.until);
 
-  const parts = recur.parts as Record<string, unknown> | undefined;
-  const byday = parts?.BYDAY;
+  const byday = recur.parts.BYDAY;
   if (Array.isArray(byday) && byday.length > 0) rule.byday = byday.map(String);
-  const bymonthday = parts?.BYMONTHDAY;
+  const bymonthday = recur.parts.BYMONTHDAY;
   if (Array.isArray(bymonthday) && bymonthday.length > 0) {
     rule.bymonthday = bymonthday.map(Number);
   }
@@ -129,18 +152,26 @@ function attendeesFromEvent(vevent: ICAL.Component): Attendee[] {
 }
 
 /**
- * `ICAL.Time#toJSDate()` for a DATE-only (all-day) value routes through the JS `Date`
- * constructor's *local* fields (see ical.js `Time#toJSDate`), so the resulting instant
- * shifts by the host machine's UTC offset — an all-day event parsed on a machine west
- * of UTC comes out a day early. All-day values carry no real instant, so we serialise
- * their Y-M-D directly as UTC midnight instead of bouncing through local time.
+ * `ICAL.Time#toJSDate()` routes DATE-only (all-day) *and* floating (no `Z`, no `TZID`)
+ * values through the JS `Date` constructor's *local* fields, so serialising the result
+ * shifts by the host machine's UTC offset -- the same value parses to a different instant
+ * on different machines. Neither case carries a real timezone to interpret against: a
+ * DATE value has none by definition, and a floating DATE-TIME has none because the
+ * calendar author omitted TZID/Z. We have no user-configured timezone to fall back to,
+ * so both are deliberately read as **UTC wall-clock** -- a deterministic reading beats a
+ * host-dependent one. Do not "fix" this by routing floating values through host-local
+ * time; that reintroduces exactly the bug this function exists to avoid.
  */
 function toIsoString(time: ICAL.Time): string {
-  if (time.isDate) {
+  if (time.isDate || time.zone === ICAL.Timezone.localTimezone) {
     const year = String(time.year).padStart(4, '0');
     const month = String(time.month).padStart(2, '0');
     const day = String(time.day).padStart(2, '0');
-    return `${year}-${month}-${day}T00:00:00.000Z`;
+    if (time.isDate) return `${year}-${month}-${day}T00:00:00.000Z`;
+    const hour = String(time.hour).padStart(2, '0');
+    const minute = String(time.minute).padStart(2, '0');
+    const second = String(time.second).padStart(2, '0');
+    return `${year}-${month}-${day}T${hour}:${minute}:${second}.000Z`;
   }
   return time.toJSDate().toISOString();
 }
@@ -206,25 +237,39 @@ export function parseCalendarObject(
     ];
   }
 
-  const rangeStart = options.rangeStart ?? event.startDate.toJSDate();
+  // The comparison instant for range clipping must be derived the same way as the
+  // emitted `start` (via toIsoString), not via the raw `toJSDate()`: for an all-day or
+  // floating occurrence those two disagree by up to the host's UTC offset, so an
+  // occurrence could be included/excluded on one machine and not another while its
+  // reported `start` stayed the same.
+  const rangeStart = options.rangeStart ?? new Date(toIsoString(event.startDate));
   const rangeEnd = options.rangeEnd;
   // NOTE: Event#iterator(startTime) treats startTime as an override of DTSTART for the
-  // RecurExpansion, not a "resume after" cursor — passing rangeStart here silently
+  // RecurExpansion, not a "resume after" cursor -- passing rangeStart here silently
   // recomputes the recurrence from midnight UTC on that date, discarding the original
   // wall-clock time and weekday. Always expand from the true startDate and filter below.
   const iterator = event.iterator();
 
   const occurrences: CalendarEvent[] = [];
   let next = iterator.next();
-  while (next && occurrences.length < MAX_OCCURRENCES) {
-    const startsAt = next.toJSDate();
+  let iterations = 0;
+  while (next && occurrences.length < MAX_OCCURRENCES && iterations < MAX_ITERATIONS) {
+    iterations += 1;
+    const startsAt = new Date(toIsoString(next));
     if (rangeEnd && startsAt >= rangeEnd) break;
 
     if (startsAt >= rangeStart) {
       const details = event.getOccurrenceDetails(next);
+      // A RECURRENCE-ID override supplies its own VEVENT with its own title, location,
+      // description, url, alarms and attendees -- only the master's occurrence should
+      // fall back to the series template. `event_id`/`series_id` stay pinned to the
+      // master's regardless, so every occurrence of one series still shares one id.
+      const isOverride = details.item.component !== master;
+      const fields = isOverride ? baseEvent(details.item.component, ref) : template;
       occurrences.push({
-        ...template,
-        title: details.item.summary ?? template.title,
+        ...fields,
+        event_id: template.event_id,
+        series_id: template.series_id,
         recurrence_id: toIsoString(details.startDate),
         start: toIsoString(details.startDate),
         end: toIsoString(details.endDate),

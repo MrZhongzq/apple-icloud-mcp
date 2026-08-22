@@ -90,6 +90,39 @@ describe('parseCalendarObject', () => {
     const ids = new Set(events.map((e) => e.event_id));
     expect(ids.size).toBe(1);
   });
+
+  it('reads a floating date-time as UTC wall-clock regardless of host timezone', () => {
+    const [event] = parseCalendarObject(fixture('floating.ics'), ref);
+    expect(event!.start).toBe('2026-08-17T14:00:00.000Z');
+    expect(event!.end).toBe('2026-08-17T15:00:00.000Z');
+    expect(event!.all_day).toBe(false);
+  });
+
+  it('includes an all-day occurrence that starts exactly at rangeStart', () => {
+    const events = parseCalendarObject(fixture('all-day-weekly.ics'), ref, {
+      rangeStart: new Date('2026-09-01T00:00:00Z'),
+      rangeEnd: new Date('2026-09-30T00:00:00Z'),
+      expandRecurring: true,
+    });
+    expect(events.map((e) => e.start.slice(0, 10))).toEqual(['2026-09-01', '2026-09-08', '2026-09-15']);
+    expect(events.every((e) => e.all_day)).toBe(true);
+  });
+
+  it('applies a RECURRENCE-ID override to that occurrence only', () => {
+    const events = parseCalendarObject(fixture('weekly-with-override.ics'), ref, {
+      rangeStart: new Date('2026-08-01T00:00:00Z'),
+      rangeEnd: new Date('2026-09-01T00:00:00Z'),
+      expandRecurring: true,
+    });
+    expect(events).toHaveLength(3);
+    const overridden = events.find((e) => e.start === '2026-08-10T09:00:00.000Z');
+    expect(overridden!.title).toBe('周会（改到大会议室）');
+    expect(overridden!.location).toBe('会议室 B');
+    const normal = events.find((e) => e.start === '2026-08-03T09:00:00.000Z');
+    expect(normal!.title).toBe('周会');
+    expect(normal!.location).toBe('会议室 A');
+    expect(new Set(events.map((e) => e.event_id)).size).toBe(1);
+  });
 });
 
 describe('buildCalendarObject', () => {
