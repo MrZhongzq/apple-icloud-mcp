@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { parseCalendarObject, buildCalendarObject, readEventMeta } from '../../../src/parsers/ical.js';
+import { parseCalendarObject, buildCalendarObject, readEventMeta, applyEventPatch } from '../../../src/parsers/ical.js';
 
 const ref = {
   collectionUrl: 'https://caldav.icloud.com/1/calendars/home/',
@@ -208,5 +208,33 @@ describe('readEventMeta', () => {
       { uid: 'u1', sequence: 4 },
     );
     expect(readEventMeta(ics)).toEqual({ uid: 'u1', sequence: 5 });
+  });
+});
+
+describe('applyEventPatch', () => {
+  it('preserves properties the model does not know about', () => {
+    const updated = applyEventPatch(fixture('with-attendees.ics'), { location: '会议室 B' });
+    expect(updated).toContain('LOCATION:会议室 B');
+    expect(updated).toContain('zhangsan@example.com');
+    expect(updated).toContain('lisi@example.com');
+    expect(updated).toContain('ORGANIZER');
+    expect(updated).toContain('CATEGORIES:工作,重要');
+    expect(updated).toContain('X-APPLE-TRAVEL-ADVISORY-BEHAVIOR');
+  });
+
+  it('replaces rather than duplicates a patched property', () => {
+    const updated = applyEventPatch(fixture('with-attendees.ics'), { location: '会议室 B' });
+    expect(updated.match(/^LOCATION:/gm)).toHaveLength(1);
+    expect(updated).not.toContain('会议室 A');
+  });
+
+  it('bumps SEQUENCE', () => {
+    const updated = applyEventPatch(fixture('with-attendees.ics'), { title: '改名' });
+    expect(updated).toContain('SEQUENCE:1');
+  });
+
+  it('leaves untouched fields alone', () => {
+    const updated = applyEventPatch(fixture('with-attendees.ics'), { location: '会议室 B' });
+    expect(updated).toContain('SUMMARY:项目评审');
   });
 });

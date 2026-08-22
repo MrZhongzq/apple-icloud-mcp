@@ -366,6 +366,70 @@ export function buildCalendarObject(
   return { ics: calendar.toString(), uid };
 }
 
+/**
+ * 在既有 VEVENT 上原地施加补丁，只改动 patch 指定的属性。
+ * 与 buildCalendarObject 的区别是刻意的：更新既有事件时，任何我们的数据模型
+ * 未覆盖的属性（ATTENDEE、ORGANIZER、CATEGORIES、STATUS、X-APPLE-* 等）
+ * 都必须原样保留——按模型重建会把它们静默删掉，而这是写在用户真实日历上的。
+ */
+export function applyEventPatch(icsText: string, patch: Partial<EventInput>): string {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+
+  const vevent = root
+    .getAllSubcomponents('vevent')
+    .find((c) => !c.hasProperty('recurrence-id'));
+  if (!vevent) {
+    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
+  }
+
+  const allDay = patch.all_day ?? (vevent.getFirstProperty('dtstart')?.getFirstValue() as ICAL.Time | undefined)?.isDate === true;
+
+  const setValue = (name: string, value: string | undefined): void => {
+    if (value === undefined) return;
+    vevent.removeAllProperties(name);
+    vevent.addPropertyWithValue(name, value);
+  };
+
+  setValue('summary', patch.title);
+  setValue('location', patch.location);
+  setValue('description', patch.description);
+  setValue('url', patch.url);
+
+  if (patch.start !== undefined) {
+    vevent.removeAllProperties('dtstart');
+    vevent.addPropertyWithValue('dtstart', toIcalTime(patch.start, allDay));
+  }
+  if (patch.end !== undefined) {
+    vevent.removeAllProperties('dtend');
+    vevent.addPropertyWithValue('dtend', toIcalTime(patch.end, allDay));
+  }
+  if (patch.recurrence !== undefined) {
+    vevent.removeAllProperties('rrule');
+    vevent.addPropertyWithValue('rrule', ICAL.Recur.fromString(recurrenceToString(patch.recurrence)));
+  }
+  if (patch.alarms !== undefined) {
+    for (const existing of vevent.getAllSubcomponents('valarm')) {
+      vevent.removeSubcomponent(existing);
+    }
+    for (const alarm of patch.alarms) {
+      const valarm = new ICAL.Component(['valarm', [], []]);
+      valarm.addPropertyWithValue('action', alarm.action === 'email' ? 'EMAIL' : 'DISPLAY');
+      valarm.addPropertyWithValue('description', patch.title ?? String(vevent.getFirstPropertyValue('summary') ?? ''));
+      valarm.addPropertyWithValue('trigger', ICAL.Duration.fromSeconds(-Math.abs(alarm.minutes_before) * 60));
+      vevent.addSubcomponent(valarm);
+    }
+  }
+
+  const sequence = Number(vevent.getFirstPropertyValue('sequence') ?? 0);
+  vevent.removeAllProperties('sequence');
+  vevent.addPropertyWithValue('sequence', String(sequence + 1));
+  vevent.removeAllProperties('dtstamp');
+  vevent.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+
+  return root.toString();
+}
+
 export function readEventMeta(icsText: string): { uid: string; sequence: number } {
   const root = parseRoot(icsText);
   const vevent = root.getAllSubcomponents('vevent').find((c) => !c.hasProperty('recurrence-id'));

@@ -206,6 +206,21 @@ describe('CalendarService.updateEvent', () => {
     });
     expect(caldav.fetchOne).not.toHaveBeenCalled();
   });
+
+  it('keeps attendees when updating an event through the service', async () => {
+    const withAttendees = readFileSync(join(process.cwd(), 'tests/fixtures/calendar/with-attendees.ics'), 'utf8');
+    const caldav = makeCalDav({
+      fetchOne: vi.fn().mockResolvedValue({
+        collectionUrl: HOME, url: EVENT_URL, etag: 'etag-1', data: withAttendees,
+      }),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    await service.updateEvent(encodeRef({ collectionUrl: HOME, resourceUrl: EVENT_URL }), { location: '会议室 B' });
+
+    const written = (caldav.update as ReturnType<typeof vi.fn>).mock.calls[0]![0].data as string;
+    expect(written).toContain('zhangsan@example.com');
+    expect(written).toContain('LOCATION:会议室 B');
+  });
 });
 
 describe('CalendarService.deleteEvent', () => {
