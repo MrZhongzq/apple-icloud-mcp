@@ -40,7 +40,15 @@ export function mapCalDavError(err: unknown): AppError {
     });
   }
   if (status === 403) {
-    return new AppError('PERMISSION_DENIED', '没有该日历的写入权限', { cause: err });
+    // Distinct from the service layer's PERMISSION_DENIED for a disabled capability (which
+    // hints at an env var to flip) -- this is iCloud itself refusing the write on this one
+    // calendar (e.g. a shared calendar the account can read but not write, or privilege
+    // discovery having fallen back to reporting it writable). SKILL.md's recovery table
+    // distinguishes the two meanings by this hint.
+    return new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该日历的写入', {
+      hint: '换用 calendar_list 返回的另一个 calendar_id 重试，而不是重试同一个日历',
+      cause: err,
+    });
   }
   if (status === 404) {
     return new AppError('NOT_FOUND', '日历资源不存在或已被删除', {

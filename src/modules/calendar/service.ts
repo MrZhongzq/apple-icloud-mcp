@@ -11,7 +11,7 @@ import {
   type CalendarEvent,
   type EventInput,
 } from '../../parsers/ical.js';
-import type { CalDavProvider } from '../../providers/icloud/caldav.js';
+import type { CalDavProvider, CalendarInfo } from '../../providers/icloud/caldav.js';
 
 const MAX_EVENTS = 1000;
 
@@ -254,26 +254,53 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
       parseRange(input.start, input.end);
 
       const calendars = await eventCalendars();
-      const target = calendarId
-        ? calendars.find((c) => c.url === decodeUrl(calendarId))
-        : calendars.find((c) => !c.readOnly);
+      const { ics, uid } = buildCalendarObject(input);
+
+      const writeTo = async (target: CalendarInfo): Promise<CalendarEvent> => {
+        const created = await caldav.create(target.url, `${uid}.ics`, ics);
+        const [event] = parseCalendarObject(ics, {
+          collectionUrl: created.collectionUrl,
+          resourceUrl: created.url,
+        });
+        if (!event) throw new AppError('INTERNAL', '事件创建后无法回读');
+        return event;
+      };
+
+      if (calendarId) {
+        const target = calendars.find((c) => c.url === decodeUrl(calendarId));
+        if (!target) {
+          throw new AppError('NOT_FOUND', '找不到可写入的日历', {
+            hint: '调用 calendar_list 查看可用日历及其 writable 状态',
+          });
+        }
+        // An explicit calendar_id is not retried against a different calendar on
+        // PERMISSION_DENIED -- the caller asked for this specific one, and the server's
+        // 403 is the real backstop (see applyPrivilegeFallback's doc comment).
+        return writeTo(target);
+      }
 
       // 权限发现失败的系统性风险已在 provider 层用 applyPrivilegeFallback 兜住
       // （全部只读即视为探测失败、一律报可写），因此这里为空只可能是真的没有日历。
-      if (!target) {
+      const writable = calendars.filter((c) => !c.readOnly);
+      const primary = writable[0];
+      if (!primary) {
         throw new AppError('NOT_FOUND', '找不到可写入的日历', {
           hint: '调用 calendar_list 查看可用日历及其 writable 状态',
         });
       }
 
-      const { ics, uid } = buildCalendarObject(input);
-      const created = await caldav.create(target.url, `${uid}.ics`, ics);
-      const [event] = parseCalendarObject(ics, {
-        collectionUrl: created.collectionUrl,
-        resourceUrl: created.url,
-      });
-      if (!event) throw new AppError('INTERNAL', '事件创建后无法回读');
-      return event;
+      try {
+        return await writeTo(primary);
+      } catch (err) {
+        if (!(err instanceof AppError) || err.code !== 'PERMISSION_DENIED') throw err;
+        // I6: no explicit calendar_id was given, so the default target was our own guess
+        // (first "writable" calendar) -- applyPrivilegeFallback can report a read-only
+        // subscription as writable when privilege discovery itself failed. Retry once
+        // against the next writable candidate before giving up.
+        const fallback = writable[1];
+        if (!fallback) throw err;
+        return writeTo(fallback);
+      }
     },
 
     async updateEvent(eventId, patch, options = {}) {

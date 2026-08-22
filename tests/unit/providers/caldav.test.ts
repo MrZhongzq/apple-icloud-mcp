@@ -8,8 +8,15 @@ describe('mapCalDavError', () => {
     expect(mapped.code).toBe('AUTH_FAILED');
   });
 
-  it('maps 403 to PERMISSION_DENIED', () => {
-    expect(mapCalDavError({ status: 403 }).code).toBe('PERMISSION_DENIED');
+  it('maps 403 to PERMISSION_DENIED with a hint distinct from the env-var-capability hint (I6)', () => {
+    // The service layer uses the same PERMISSION_DENIED code for a disabled capability,
+    // with a hint naming an env var -- that advice is wrong for a server-side 403 on one
+    // particular calendar. The CalDAV 403 needs its own hint pointing at calendar_list.
+    const mapped = mapCalDavError({ status: 403 });
+    expect(mapped.code).toBe('PERMISSION_DENIED');
+    expect(mapped.hint).toBeTruthy();
+    expect(mapped.hint).not.toContain('ALLOW_CALENDAR_WRITE');
+    expect(mapped.hint).toContain('calendar_list');
   });
 
   it('maps 404 to NOT_FOUND with a recovery hint', () => {

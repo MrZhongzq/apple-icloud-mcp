@@ -195,6 +195,70 @@ describe('CalendarService.createEvent', () => {
       service.createEvent({ title: 'x', start: '2026-09-10T03:00:00Z', end: '2026-09-10T02:00:00Z' }),
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
   });
+
+  it('retries once against the next writable calendar when no calendar_id was given and the default target refuses the write (I6)', async () => {
+    const secondWritable = 'https://caldav.icloud.com/1/calendars/second/';
+    const caldav = makeCalDav({
+      listCalendars: vi.fn().mockResolvedValue([
+        { url: HOME, name: '个人', readOnly: false, components: ['VEVENT'] },
+        { url: secondWritable, name: '备用', readOnly: false, components: ['VEVENT'] },
+      ]),
+      create: vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          throw new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该日历的写入');
+        })
+        .mockImplementationOnce(async (calendarUrl: string, filename: string, ics: string) => ({
+          collectionUrl: calendarUrl,
+          url: `${calendarUrl}${filename}`,
+          etag: 'etag-new',
+          data: ics,
+        })),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+
+    const event = await service.createEvent({
+      title: '新会议',
+      start: '2026-09-10T02:00:00Z',
+      end: '2026-09-10T03:00:00Z',
+    });
+
+    expect(caldav.create).toHaveBeenCalledTimes(2);
+    expect((caldav.create as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toBe(HOME);
+    expect((caldav.create as ReturnType<typeof vi.fn>).mock.calls[1]![0]).toBe(secondWritable);
+    expect(event.title).toBe('新会议');
+  });
+
+  it('does not retry against a different calendar when an explicit calendar_id was given', async () => {
+    const caldav = makeCalDav({
+      create: vi.fn().mockImplementationOnce(async () => {
+        throw new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该日历的写入');
+      }),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+
+    await expect(
+      service.createEvent(
+        { title: 'x', start: '2026-09-10T02:00:00Z', end: '2026-09-10T03:00:00Z' },
+        encodeUrl(HOME),
+      ),
+    ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    expect(caldav.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces the failure when no second writable calendar exists to retry against', async () => {
+    const caldav = makeCalDav({
+      create: vi.fn().mockImplementationOnce(async () => {
+        throw new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该日历的写入');
+      }),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+
+    await expect(
+      service.createEvent({ title: 'x', start: '2026-09-10T02:00:00Z', end: '2026-09-10T03:00:00Z' }),
+    ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    expect(caldav.create).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('CalendarService.updateEvent', () => {
