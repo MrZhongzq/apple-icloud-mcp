@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { ImapFlow } from 'imapflow';
-import { mapImapError, createImapProvider, toImapFlowLogger } from '../../../src/providers/icloud/imap.js';
+import { mapImapError, createImapProvider, toImapFlowLogger, toImapQuery } from '../../../src/providers/icloud/imap.js';
 import { createLogger } from '../../../src/core/logger.js';
 import { AppError } from '../../../src/core/errors.js';
 import type { AccountConfig } from '../../../src/core/config.js';
@@ -106,6 +106,28 @@ function makeFakeClient(overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as unknown as ImapFlow;
 }
+
+describe('toImapQuery', () => {
+  it('maps unseen: true to seen: false', () => {
+    expect(toImapQuery({ unseen: true })).toMatchObject({ seen: false });
+  });
+
+  it('maps unseen: false to seen: true, instead of dropping the criterion', () => {
+    expect(toImapQuery({ unseen: false })).toMatchObject({ seen: true });
+  });
+
+  it('maps flagged: true to flagged: true', () => {
+    expect(toImapQuery({ flagged: true })).toMatchObject({ flagged: true });
+  });
+
+  it('maps flagged: false to flagged: false, instead of dropping the criterion', () => {
+    expect(toImapQuery({ flagged: false })).toMatchObject({ flagged: false });
+  });
+
+  it('falls back to {all: true} only when no criterion at all was given', () => {
+    expect(toImapQuery({})).toEqual({ all: true });
+  });
+});
 
 describe('toImapFlowLogger', () => {
   it('never writes directly to stdout/stderr -- everything routes through the project Logger', () => {

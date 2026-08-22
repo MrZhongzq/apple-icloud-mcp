@@ -99,7 +99,8 @@ function buildOptions(account: AccountConfig, logger?: Logger): ImapFlowOptions 
   };
 }
 
-function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
+/** 导出仅为测试。 */
+export function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
   const query: Record<string, unknown> = {};
   if (criteria.from) query.from = criteria.from;
   if (criteria.to) query.to = criteria.to;
@@ -107,8 +108,11 @@ function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
   if (criteria.text) query.body = criteria.text;
   if (criteria.since) query.since = criteria.since;
   if (criteria.before) query.before = criteria.before;
-  if (criteria.unseen) query.seen = false;
-  if (criteria.flagged) query.flagged = true;
+  // `unseen: false` / `flagged: false` are meaningful queries ("already read", "not
+  // starred") -- a truthiness check silently drops them and the search falls back to
+  // matching everything. Both must be checked against `undefined`, not truthiness.
+  if (criteria.unseen !== undefined) query.seen = !criteria.unseen;
+  if (criteria.flagged !== undefined) query.flagged = criteria.flagged;
   return Object.keys(query).length > 0 ? query : { all: true };
 }
 
