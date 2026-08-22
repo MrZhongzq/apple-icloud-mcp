@@ -69,6 +69,7 @@ function makeSmtp(): SmtpProvider {
       accepted: ['friend@example.com'],
       rejected: [],
     }),
+    close: vi.fn().mockResolvedValue(undefined),
   };
 }
 

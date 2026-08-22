@@ -1,4 +1,4 @@
-import { ImapFlow, type ImapFlowOptions, type StatusObject } from 'imapflow';
+import { ImapFlow, type ImapFlowOptions, type Logger as ImapFlowLogger, type StatusObject } from 'imapflow';
 import { AppError } from '../../core/errors.js';
 import type { AccountConfig } from '../../core/config.js';
 import type { Logger } from '../../core/logger.js';
@@ -95,7 +95,7 @@ export function mapImapError(err: unknown): AppError {
  * call) since these frames can be verbose and may embed message metadata.
  */
 /** 导出仅为测试。 */
-export function toImapFlowLogger(logger: Logger): NonNullable<ImapFlowOptions['logger']> {
+export function toImapFlowLogger(logger: Logger): ImapFlowLogger {
   const forward = (data: unknown): void => logger.debug('imapflow', { data });
   return { debug: forward, info: forward, warn: forward, error: forward };
 }

@@ -58,6 +58,7 @@ function makeSmtp(): SmtpProvider {
       accepted: [],
       rejected: [],
     }),
+    close: vi.fn().mockResolvedValue(undefined),
   };
 }
 
