@@ -14,6 +14,10 @@ const weekly = readFileSync(
   join(process.cwd(), 'tests/fixtures/calendar/weekly-with-exdate.ics'),
   'utf8',
 );
+const nonRecurring = readFileSync(
+  join(process.cwd(), 'tests/fixtures/calendar/with-attendees.ics'),
+  'utf8',
+);
 
 const account: AccountConfig = {
   id: 'account_1',
@@ -33,7 +37,7 @@ const account: AccountConfig = {
   },
 };
 
-function makeCalDav(): CalDavProvider {
+function makeCalDav(data: string = weekly): CalDavProvider {
   return {
     verify: vi.fn().mockResolvedValue(undefined),
     listCalendars: vi
@@ -42,7 +46,7 @@ function makeCalDav(): CalDavProvider {
     fetchObjects: vi.fn().mockResolvedValue([]),
     fetchOne: vi
       .fn()
-      .mockResolvedValue({ collectionUrl: HOME, url: EVENT_URL, etag: 'etag-1', data: weekly }),
+      .mockResolvedValue({ collectionUrl: HOME, url: EVENT_URL, etag: 'etag-1', data }),
     create: vi.fn(),
     update: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
@@ -129,5 +133,68 @@ describe('single-occurrence scope', () => {
     const service = createCalendarService({ account, caldav });
     await service.deleteEvent(eventId);
     expect(caldav.remove).toHaveBeenCalled();
+  });
+});
+
+describe('scope: this on a non-recurring event (I4)', () => {
+  it('rejects deleteEvent with INVALID_INPUT and writes nothing', async () => {
+    const caldav = makeCalDav(nonRecurring);
+    const service = createCalendarService({ account, caldav });
+    await expect(
+      service.deleteEvent(eventId, { scope: 'this', recurrence_id: '2026-08-17T06:00:00.000Z' }),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(caldav.update).not.toHaveBeenCalled();
+    expect(caldav.remove).not.toHaveBeenCalled();
+  });
+
+  it('rejects updateEvent with INVALID_INPUT and writes nothing', async () => {
+    const caldav = makeCalDav(nonRecurring);
+    const service = createCalendarService({ account, caldav });
+    await expect(
+      service.updateEvent(
+        eventId,
+        { title: 'x' },
+        { scope: 'this', recurrence_id: '2026-08-17T06:00:00.000Z' },
+      ),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(caldav.update).not.toHaveBeenCalled();
+  });
+
+  it('the non-recurring rejection hint points at scope: all', async () => {
+    const caldav = makeCalDav(nonRecurring);
+    const service = createCalendarService({ account, caldav });
+    try {
+      await service.deleteEvent(eventId, { scope: 'this', recurrence_id: '2026-08-17T06:00:00.000Z' });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as { hint?: string }).hint).toContain('all');
+    }
+  });
+});
+
+describe('scope: this with a recurrence_id that matches no real occurrence (I4)', () => {
+  it('rejects updateEvent before writing anything', async () => {
+    const caldav = makeCalDav(weekly);
+    const service = createCalendarService({ account, caldav });
+    // weekly-with-exdate.ics only has occurrences on 08-03, 08-17, 08-24 (08-10 is
+    // excluded); this instant does not correspond to any actual occurrence at all.
+    await expect(
+      service.updateEvent(
+        eventId,
+        { title: 'x' },
+        { scope: 'this', recurrence_id: '2026-08-05T09:00:00.000Z' },
+      ),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(caldav.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects deleteEvent before writing anything', async () => {
+    const caldav = makeCalDav(weekly);
+    const service = createCalendarService({ account, caldav });
+    await expect(
+      service.deleteEvent(eventId, { scope: 'this', recurrence_id: '2026-08-05T09:00:00.000Z' }),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect(caldav.update).not.toHaveBeenCalled();
+    expect(caldav.remove).not.toHaveBeenCalled();
   });
 });

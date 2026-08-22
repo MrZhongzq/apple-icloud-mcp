@@ -1,5 +1,6 @@
 import { AppError } from '../../core/errors.js';
 import { decodeRef, decodeUrl, encodeRef, encodeUrl } from '../../core/ids.js';
+import type { ResourceRef } from '../../core/ids.js';
 import type { AccountConfig } from '../../core/config.js';
 import {
   addExdate,
@@ -124,6 +125,41 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
     return options.recurrence_id;
   };
 
+  /**
+   * scope: 'this' 只对重复事件有意义。findMaster 类的底层解析函数接受任何不带
+   * RECURRENCE-ID 的 VEVENT（重复与否都行），两条 scope:'this' 路径都没有另行校验——
+   * 对非重复事件，deleteEvent 会写入一个不起作用的 EXDATE 却报告删除成功，
+   * updateEvent 会给一个没有 RRULE 的对象附加 RECURRENCE-ID，写盘后回读失败，
+   * 报出让人费解的 INTERNAL——都发生在已经改动日历之后。
+   */
+  const requireRecurringSeries = (series: CalendarEvent): void => {
+    if (!series.recurrence) {
+      throw new AppError('INVALID_INPUT', '该事件不是重复事件，scope 为 this 时没有意义', {
+        hint: '非重复事件请省略 scope（等同 scope: "all"）',
+      });
+    }
+  };
+
+  /** 写入前校验 recurrence_id 确实对应一次真实发生（未被 EXDATE 排除、未超出 COUNT/UNTIL）。 */
+  const requireRealOccurrence = (icsText: string, ref: ResourceRef, recurrenceId: string): void => {
+    const anchor = new Date(recurrenceId).getTime();
+    if (Number.isNaN(anchor)) {
+      throw new AppError('INVALID_INPUT', `recurrence_id 不是合法的时间格式：${recurrenceId}`, {
+        hint: '请使用 ISO 8601 格式，例如 2026-09-10T14:00:00+08:00',
+      });
+    }
+    const occurrences = parseCalendarObject(icsText, ref, {
+      rangeStart: new Date(anchor - 1_000),
+      rangeEnd: new Date(anchor + 1_000),
+      expandRecurring: true,
+    });
+    if (!occurrences.some((e) => e.recurrence_id === recurrenceId)) {
+      throw new AppError('INVALID_INPUT', `recurrence_id ${recurrenceId} 不对应该事件的任何实际发生`, {
+        hint: '从 calendar_list_events 展开后的事件对象中取 recurrence_id',
+      });
+    }
+  };
+
   return {
     async listCalendars() {
       requireRead();
@@ -203,6 +239,8 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
         const recurrenceId = requireRecurrenceId(options);
         const [existingSeries] = parseCalendarObject(current.data, ref);
         if (!existingSeries) throw new AppError('NOT_FOUND', '该事件已不存在');
+        requireRecurringSeries(existingSeries);
+        requireRealOccurrence(current.data, ref, recurrenceId);
 
         // existingSeries 的 start/end 是主事件自身的模板时间，与本次发生无关。
         // 直接沿用它的 end 会让 DTEND 落在别的日期上（常见结果是早于 DTSTART，
@@ -280,6 +318,11 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
 
       if (options.scope === 'this') {
         const recurrenceId = requireRecurrenceId(options);
+        const [existingSeries] = parseCalendarObject(current.data, ref);
+        if (!existingSeries) throw new AppError('NOT_FOUND', '该事件已不存在');
+        requireRecurringSeries(existingSeries);
+        requireRealOccurrence(current.data, ref, recurrenceId);
+
         const data = addExdate(current.data, recurrenceId);
         await caldav.update({
           collectionUrl: ref.collectionUrl,
