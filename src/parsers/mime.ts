@@ -91,7 +91,9 @@ export function htmlToText(html: string): string {
 export function makeSnippet(text: string, maxLength = 200): string {
   const collapsed = text.replace(/\s+/g, ' ').trim();
   if (collapsed.length <= maxLength) return collapsed;
-  return collapsed.slice(0, maxLength) + '…';
+  // Plain .slice() counts UTF-16 code units, which can cut a surrogate-pair emoji in
+  // half (producing a lone, unpaired surrogate). Array.from() iterates by code point.
+  return Array.from(collapsed).slice(0, maxLength).join('') + '…';
 }
 
 export async function parseEmail(source: Buffer | string): Promise<ParsedEmail> {

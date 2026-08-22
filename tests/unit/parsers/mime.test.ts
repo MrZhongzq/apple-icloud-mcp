@@ -101,4 +101,11 @@ describe('makeSnippet', () => {
   it('leaves short text untouched', () => {
     expect(makeSnippet('短', 200)).toBe('短');
   });
+
+  it('does not split a surrogate-pair emoji at the truncation boundary', () => {
+    // 'abc😀def' collapsed is 8 UTF-16 code units long ('😀' is a surrogate pair, 2
+    // units); a plain .slice(0, 4) would cut right through the emoji's surrogate pair,
+    // producing a lone unpaired surrogate. Cutting by code point keeps it whole.
+    expect(makeSnippet('abc😀def', 4)).toBe('abc😀…');
+  });
 });
