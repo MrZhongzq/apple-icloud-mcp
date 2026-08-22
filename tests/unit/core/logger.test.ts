@@ -19,6 +19,11 @@ describe('redact', () => {
     expect(redact('plain')).toBe('plain');
     expect(redact(42)).toBe(42);
   });
+
+  it('serializes Date values instead of flattening them to empty objects', () => {
+    const out = redact({ startedAt: new Date('2026-01-01T00:00:00.000Z') }) as Record<string, unknown>;
+    expect(out.startedAt).toBe('2026-01-01T00:00:00.000Z');
+  });
 });
 
 describe('createLogger', () => {

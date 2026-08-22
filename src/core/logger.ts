@@ -7,6 +7,7 @@ const SENSITIVE_KEY = /pass|password|secret|token|authorization|credential|appPa
 /** 递归遮蔽敏感字段。凭据永远不进日志。 */
 export function redact(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redact);
+  if (value instanceof Date) return value.toISOString();
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
