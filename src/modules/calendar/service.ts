@@ -2,9 +2,11 @@ import { AppError } from '../../core/errors.js';
 import { decodeRef, decodeUrl, encodeRef, encodeUrl } from '../../core/ids.js';
 import type { AccountConfig } from '../../core/config.js';
 import {
+  addExdate,
   applyEventPatch,
   buildCalendarObject,
   parseCalendarObject,
+  upsertOverride,
   type CalendarEvent,
   type EventInput,
 } from '../../parsers/ical.js';
@@ -28,6 +30,8 @@ export interface ListEventsParams {
 
 export interface UpdateOptions {
   expected_etag?: string;
+  scope?: 'this' | 'all';
+  recurrence_id?: string;
 }
 
 export interface CalendarService {
@@ -110,6 +114,16 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
     return { ref, current };
   };
 
+  /** scope 为 'this' 时必须知道目标是哪一次发生，否则无从定位。 */
+  const requireRecurrenceId = (options: UpdateOptions): string => {
+    if (!options.recurrence_id) {
+      throw new AppError('INVALID_INPUT', 'scope 为 this 时必须提供 recurrence_id', {
+        hint: 'recurrence_id 取自 calendar_list_events 展开后的事件对象',
+      });
+    }
+    return options.recurrence_id;
+  };
+
   return {
     async listCalendars() {
       requireRead();
@@ -185,6 +199,28 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
       requireWrite();
       const { ref, current } = await loadForWrite(eventId, options.expected_etag);
 
+      if (options.scope === 'this') {
+        const recurrenceId = requireRecurrenceId(options);
+        const [existingSeries] = parseCalendarObject(current.data, ref);
+        if (!existingSeries) throw new AppError('NOT_FOUND', '该事件已不存在');
+        const overrideInput: EventInput = {
+          ...toInput(existingSeries),
+          start: recurrenceId,
+          end: existingSeries.end,
+          ...patch,
+        };
+        const data = upsertOverride(current.data, recurrenceId, overrideInput);
+        await caldav.update({
+          collectionUrl: ref.collectionUrl,
+          url: ref.resourceUrl,
+          etag: current.etag,
+          data,
+        });
+        const [updated] = parseCalendarObject(data, ref);
+        if (!updated) throw new AppError('INTERNAL', '事件更新后无法回读');
+        return updated;
+      }
+
       const [existing] = parseCalendarObject(current.data, ref);
       if (!existing) {
         throw new AppError('NOT_FOUND', '该事件已不存在');
@@ -212,6 +248,19 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
     async deleteEvent(eventId, options = {}) {
       requireWrite();
       const { ref, current } = await loadForWrite(eventId, options.expected_etag);
+
+      if (options.scope === 'this') {
+        const recurrenceId = requireRecurrenceId(options);
+        const data = addExdate(current.data, recurrenceId);
+        await caldav.update({
+          collectionUrl: ref.collectionUrl,
+          url: ref.resourceUrl,
+          etag: current.etag,
+          data,
+        });
+        return { deleted: true };
+      }
+
       await caldav.remove({ url: ref.resourceUrl, etag: current.etag });
       return { deleted: true };
     },

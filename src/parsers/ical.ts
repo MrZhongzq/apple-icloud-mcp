@@ -366,24 +366,34 @@ export function buildCalendarObject(
   return { ics: calendar.toString(), uid };
 }
 
+interface ApplyPatchOptions {
+  /**
+   * Whether patch.recurrence may write RRULE onto this component. Overrides
+   * (VEVENTs carrying RECURRENCE-ID) must never carry their own RRULE, so
+   * `upsertOverride` always passes `false` here regardless of what its caller's
+   * patch happens to contain -- the caller may innocently be forwarding the
+   * series' own recurrence rule as part of a "full desired state" input.
+   */
+  allowRecurrence?: boolean;
+}
+
 /**
- * 在既有 VEVENT 上原地施加补丁，只改动 patch 指定的属性。
- * 与 buildCalendarObject 的区别是刻意的：更新既有事件时，任何我们的数据模型
- * 未覆盖的属性（ATTENDEE、ORGANIZER、CATEGORIES、STATUS、X-APPLE-* 等）
- * 都必须原样保留——按模型重建会把它们静默删掉，而这是写在用户真实日历上的。
+ * 把 patch 中给出的字段原地写入一个 VEVENT 组件，未给出的字段保持不动。
+ * 这是 applyEventPatch（整条序列）与 upsertOverride（单次覆盖）共用的唯一
+ * 实现——两处都必须保留调用方数据模型未覆盖的属性（ATTENDEE、ORGANIZER、
+ * CATEGORIES、STATUS、X-APPLE-* 等），按模型重建会把它们静默删掉，而这是
+ * 写在用户真实日历上的。不在此处处理 SEQUENCE / DTSTAMP，那由调用方按各自
+ * 的语义（整条序列递增 vs. 新建覆盖重置为 0）决定。
  */
-export function applyEventPatch(icsText: string, patch: Partial<EventInput>): string {
-  const root = parseRoot(icsText);
-  registerTimezones(root);
-
-  const vevent = root
-    .getAllSubcomponents('vevent')
-    .find((c) => !c.hasProperty('recurrence-id'));
-  if (!vevent) {
-    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
-  }
-
-  const allDay = patch.all_day ?? (vevent.getFirstProperty('dtstart')?.getFirstValue() as ICAL.Time | undefined)?.isDate === true;
+function applyPatchToVevent(
+  vevent: ICAL.Component,
+  patch: Partial<EventInput>,
+  options: ApplyPatchOptions = {},
+): void {
+  const allowRecurrence = options.allowRecurrence ?? true;
+  const allDay =
+    patch.all_day ??
+    (vevent.getFirstProperty('dtstart')?.getFirstValue() as ICAL.Time | undefined)?.isDate === true;
 
   const setValue = (name: string, value: string | undefined): void => {
     if (value === undefined) return;
@@ -404,7 +414,7 @@ export function applyEventPatch(icsText: string, patch: Partial<EventInput>): st
     vevent.removeAllProperties('dtend');
     vevent.addPropertyWithValue('dtend', toIcalTime(patch.end, allDay));
   }
-  if (patch.recurrence !== undefined) {
+  if (allowRecurrence && patch.recurrence !== undefined) {
     vevent.removeAllProperties('rrule');
     vevent.addPropertyWithValue('rrule', ICAL.Recur.fromString(recurrenceToString(patch.recurrence)));
   }
@@ -420,12 +430,46 @@ export function applyEventPatch(icsText: string, patch: Partial<EventInput>): st
       vevent.addSubcomponent(valarm);
     }
   }
+}
 
+function refreshDtstamp(vevent: ICAL.Component): void {
+  vevent.removeAllProperties('dtstamp');
+  vevent.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+}
+
+/** 序列的整体补丁语义：SEQUENCE 递增。 */
+function bumpSequence(vevent: ICAL.Component): void {
   const sequence = Number(vevent.getFirstPropertyValue('sequence') ?? 0);
   vevent.removeAllProperties('sequence');
   vevent.addPropertyWithValue('sequence', String(sequence + 1));
-  vevent.removeAllProperties('dtstamp');
-  vevent.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+}
+
+/** 新建覆盖事件的语义：SEQUENCE 从 0 起算。 */
+function resetSequence(vevent: ICAL.Component): void {
+  vevent.removeAllProperties('sequence');
+  vevent.addPropertyWithValue('sequence', '0');
+}
+
+/**
+ * 在既有 VEVENT 上原地施加补丁，只改动 patch 指定的属性。
+ * 与 buildCalendarObject 的区别是刻意的：更新既有事件时，任何我们的数据模型
+ * 未覆盖的属性（ATTENDEE、ORGANIZER、CATEGORIES、STATUS、X-APPLE-* 等）
+ * 都必须原样保留——按模型重建会把它们静默删掉，而这是写在用户真实日历上的。
+ */
+export function applyEventPatch(icsText: string, patch: Partial<EventInput>): string {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+
+  const vevent = root
+    .getAllSubcomponents('vevent')
+    .find((c) => !c.hasProperty('recurrence-id'));
+  if (!vevent) {
+    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
+  }
+
+  applyPatchToVevent(vevent, patch);
+  bumpSequence(vevent);
+  refreshDtstamp(vevent);
 
   return root.toString();
 }
@@ -442,4 +486,104 @@ export function readEventMeta(icsText: string): { uid: string; sequence: number 
     uid: String(uid ?? ''),
     sequence: Number(sequence ?? 0),
   };
+}
+
+function findMaster(root: ICAL.Component): ICAL.Component {
+  const master = root.getAllSubcomponents('vevent').find((c) => !c.hasProperty('recurrence-id'));
+  if (!master) throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的重复事件');
+  return master;
+}
+
+function sameInstant(a: ICAL.Time, isoTime: string): boolean {
+  return a.toJSDate().getTime() === new Date(isoTime).getTime();
+}
+
+/** 从重复序列中排除单次发生。 */
+export function addExdate(icsText: string, recurrenceId: string): string {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+  const master = findMaster(root);
+
+  const target = ICAL.Time.fromJSDate(new Date(recurrenceId), true);
+  const already = master
+    .getAllProperties('exdate')
+    .some((p) => sameInstant(p.getFirstValue() as ICAL.Time, recurrenceId));
+  if (already) return root.toString();
+
+  master.addPropertyWithValue('exdate', target);
+  return root.toString();
+}
+
+/**
+ * ical.js's Component API has no "insert at position" primitive -- every add*
+ * call appends to the end of the raw jCal properties array. That is fine for
+ * applyEventPatch (property order in the output is not load-bearing there),
+ * but a freshly cloned override needs RECURRENCE-ID to sit near the top,
+ * right after UID, rather than trailing after every unmodeled property the
+ * clone carried along (ATTENDEE, ORGANIZER, CATEGORIES, ...) -- both for
+ * conventional VEVENT shape and because callers scan "everything from
+ * RECURRENCE-ID onward" to inspect just the override block.
+ *
+ * This reorders the raw jCal array directly, so it MUST run only after every
+ * other Component-API mutation on `vevent` is finished: once the array is
+ * spliced out of band, the component's internal hydrated-property cache is no
+ * longer index-aligned with it, and a further getFirstProperty/
+ * addPropertyWithValue/removeAllProperties call on this same component could
+ * touch the wrong entry. `toString()` itself reads the raw jCal array
+ * directly (see ical.js Component#toString), so serialization is unaffected.
+ */
+function moveRecurrenceIdAfterUid(vevent: ICAL.Component): void {
+  const props = vevent.jCal[1] as unknown[][];
+  const idx = props.findIndex((p) => p[0] === 'recurrence-id');
+  if (idx < 0) return;
+  const [entry] = props.splice(idx, 1);
+  if (!entry) return;
+  const uidIdx = props.findIndex((p) => p[0] === 'uid');
+  props.splice(uidIdx + 1, 0, entry);
+}
+
+function findOverride(root: ICAL.Component, recurrenceId: string): ICAL.Component | undefined {
+  return root.getAllSubcomponents('vevent').find((candidate) => {
+    const rid = candidate.getFirstPropertyValue('recurrence-id');
+    return rid !== null && sameInstant(rid as ICAL.Time, recurrenceId);
+  });
+}
+
+/**
+ * 新增或替换某次发生的覆盖事件（RECURRENCE-ID）。
+ *
+ * 已存在覆盖事件时，原地对它施加补丁（与 applyEventPatch 相同做法），而不是
+ * 删除重建——否则该覆盖事件自身携带的、我们数据模型未覆盖的属性会被静默丢弃。
+ *
+ * 新建覆盖事件时，通过 jCal 序列化往返克隆 master VEVENT 而非逐字段手工拷贝
+ * ——手工拷贝正是属性被遗漏的方式——这样 ATTENDEE / ORGANIZER / CATEGORIES 等
+ * 才能完整地带到覆盖事件上（这仍然是同一次会议、同样的与会人）。克隆后必须
+ * 去掉 RRULE / EXDATE / RDATE：覆盖事件本身不能再定义或参与重复规则，留着
+ * 会产生一个非法的 iCal 对象。
+ */
+export function upsertOverride(icsText: string, recurrenceId: string, input: EventInput): string {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+  const master = findMaster(root);
+
+  const existingOverride = findOverride(root, recurrenceId);
+  if (existingOverride) {
+    applyPatchToVevent(existingOverride, input, { allowRecurrence: false });
+    bumpSequence(existingOverride);
+    refreshDtstamp(existingOverride);
+    return root.toString();
+  }
+
+  const override = new ICAL.Component(JSON.parse(JSON.stringify(master.jCal)) as unknown[]);
+  override.removeAllProperties('rrule');
+  override.removeAllProperties('exdate');
+  override.removeAllProperties('rdate');
+  override.addPropertyWithValue('recurrence-id', ICAL.Time.fromJSDate(new Date(recurrenceId), true));
+  resetSequence(override);
+  refreshDtstamp(override);
+  applyPatchToVevent(override, input, { allowRecurrence: false });
+  moveRecurrenceIdAfterUid(override);
+
+  root.addSubcomponent(override);
+  return root.toString();
 }
