@@ -75,6 +75,57 @@ describe('registerCalendarTools', () => {
     expect(JSON.parse(result.content[0]!.text).title).toBe('新会议');
   });
 
+  it('passes the session through when listing calendars', async () => {
+    const { server, tools } = collect();
+    const listCalendars = vi.fn().mockResolvedValue([{ calendar_id: 'c1', name: '个人', writable: true }]);
+    registerCalendarTools(server, depsWith({ listCalendars }));
+
+    const result = await tools.get('calendar_list')!.handler({ session_id: 's1' });
+
+    expect(listCalendars).toHaveBeenCalledWith();
+    expect(JSON.parse(result.content[0]!.text)[0].name).toBe('个人');
+  });
+
+  it('forwards the range and calendar filter when listing events', async () => {
+    const { server, tools } = collect();
+    const listEvents = vi.fn().mockResolvedValue([]);
+    registerCalendarTools(server, depsWith({ listEvents }));
+
+    await tools.get('calendar_list_events')!.handler({
+      session_id: 's1',
+      start: '2026-09-01T00:00:00Z',
+      end: '2026-09-30T00:00:00Z',
+      calendar_ids: ['abc'],
+      expand_recurring: false,
+    });
+
+    expect(listEvents).toHaveBeenCalledWith({
+      start: '2026-09-01T00:00:00Z',
+      end: '2026-09-30T00:00:00Z',
+      calendar_ids: ['abc'],
+      expand_recurring: false,
+    });
+  });
+
+  it('forwards scope and recurrence_id when deleting a single occurrence', async () => {
+    const { server, tools } = collect();
+    const deleteEvent = vi.fn().mockResolvedValue({ deleted: true });
+    registerCalendarTools(server, depsWith({ deleteEvent }));
+
+    await tools.get('calendar_delete_event')!.handler({
+      session_id: 's1',
+      event_id: 'e1',
+      scope: 'this',
+      recurrence_id: '2026-08-17T09:00:00.000Z',
+    });
+
+    expect(deleteEvent).toHaveBeenCalledWith('e1', {
+      expected_etag: undefined,
+      scope: 'this',
+      recurrence_id: '2026-08-17T09:00:00.000Z',
+    });
+  });
+
   it('forwards scope and recurrence_id when updating', async () => {
     const { server, tools } = collect();
     const updateEvent = vi.fn().mockResolvedValue({ event_id: 'e1' });
