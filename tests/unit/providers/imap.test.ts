@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ImapFlow } from 'imapflow';
-import { mapImapError, createImapProvider } from '../../../src/providers/icloud/imap.js';
+import { mapImapError, createImapProvider, toImapFlowLogger } from '../../../src/providers/icloud/imap.js';
+import { createLogger } from '../../../src/core/logger.js';
 import { AppError } from '../../../src/core/errors.js';
 import type { AccountConfig } from '../../../src/core/config.js';
 
@@ -75,5 +76,114 @@ describe('createImapProvider connection reuse', () => {
     await both;
 
     expect(built).toBe(1);
+  });
+});
+
+/**
+ * imapflow signals a server NO/BAD by *returning* false from these commands, not by
+ * throwing (verified against the pinned node_modules/imapflow source). A provider that
+ * merely awaits-and-discards the return value reports fabricated success on a failed
+ * mutation, or a false "empty"/"zero" result on a failed read (search/status).
+ */
+function makeFakeClient(overrides: Record<string, unknown> = {}) {
+  return {
+    usable: true,
+    connect: async () => undefined,
+    noop: async () => undefined,
+    logout: async () => undefined,
+    close: () => undefined,
+    getMailboxLock: async () => ({ release: () => undefined }),
+    list: async () => [{ path: 'INBOX', name: 'INBOX', specialUse: undefined }],
+    status: async () => false,
+    search: async () => false,
+    messageFlagsAdd: async () => false,
+    messageFlagsRemove: async () => false,
+    messageMove: async () => false,
+    messageDelete: async () => false,
+    fetch: async function* () {
+      /* no messages */
+    },
+    ...overrides,
+  } as unknown as ImapFlow;
+}
+
+describe('toImapFlowLogger', () => {
+  it('never writes directly to stdout/stderr -- everything routes through the project Logger', () => {
+    const lines: string[] = [];
+    const logger = createLogger('debug', (line) => lines.push(line));
+    const imapFlowLogger = toImapFlowLogger(logger);
+
+    imapFlowLogger.debug({ msg: 'debug frame' });
+    imapFlowLogger.info({ msg: 'info frame', password: 'hunter2' });
+    imapFlowLogger.warn({ msg: 'warn frame' });
+    imapFlowLogger.error({ msg: 'error frame' });
+
+    expect(lines).toHaveLength(4);
+    expect(lines.every((l) => JSON.parse(l).level === 'debug')).toBe(true);
+  });
+
+  it('is silent when the logger threshold is above debug (imapflow logs can be verbose)', () => {
+    const lines: string[] = [];
+    const logger = createLogger('info', (line) => lines.push(line));
+    const imapFlowLogger = toImapFlowLogger(logger);
+
+    imapFlowLogger.info({ msg: 'should not surface at info threshold' });
+
+    expect(lines).toHaveLength(0);
+  });
+
+  it('redacts credential-shaped fields before they reach the log line', () => {
+    const lines: string[] = [];
+    const logger = createLogger('debug', (line) => lines.push(line));
+    const imapFlowLogger = toImapFlowLogger(logger);
+
+    imapFlowLogger.debug({ auth: { pass: 'app-specific-password' } });
+
+    expect(lines[0]).not.toContain('app-specific-password');
+  });
+});
+
+describe('createImapProvider surfaces imapflow false-return failures', () => {
+  it('rejects setFlags when messageFlagsAdd reports failure', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.setFlags('INBOX', [1], ['\\Seen'], true)).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+    });
+  });
+
+  it('rejects setFlags when messageFlagsRemove reports failure', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.setFlags('INBOX', [1], ['\\Seen'], false)).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+    });
+  });
+
+  it('rejects moveMessages when messageMove reports failure', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.moveMessages('INBOX', [1], 'Archive')).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+    });
+  });
+
+  it('rejects expunge when messageDelete reports failure', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.expunge('INBOX', [1])).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
+  });
+
+  it('rejects searchUids when SEARCH itself fails (false), rather than reporting zero matches', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.searchUids('INBOX', {})).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
+  });
+
+  it('does not confuse a genuinely empty SEARCH result with a failure', async () => {
+    const provider = createImapProvider(account, {
+      createClient: () => makeFakeClient({ search: async () => [] }),
+    });
+    await expect(provider.searchUids('INBOX', {})).resolves.toEqual([]);
+  });
+
+  it('rejects listFolders when STATUS reports failure, rather than reporting an empty/read folder', async () => {
+    const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
+    await expect(provider.listFolders()).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
   });
 });

@@ -1,6 +1,7 @@
-import { ImapFlow, type ImapFlowOptions } from 'imapflow';
+import { ImapFlow, type ImapFlowOptions, type StatusObject } from 'imapflow';
 import { AppError } from '../../core/errors.js';
 import type { AccountConfig } from '../../core/config.js';
+import type { Logger } from '../../core/logger.js';
 
 const HOST = 'imap.mail.me.com';
 const PORT = 993;
@@ -76,13 +77,25 @@ export function mapImapError(err: unknown): AppError {
   return new AppError('UPSTREAM_ERROR', 'iCloud 邮件操作失败', { retryable: true, cause: err });
 }
 
-function buildOptions(account: AccountConfig): ImapFlowOptions {
+/**
+ * imapflow's `logger` option wants an object with debug/info/warn/error methods each
+ * taking a single opaque object -- routed through our own Logger so nothing bypasses
+ * stderr, and always at *our* debug level (regardless of imapflow's own level for the
+ * call) since these frames can be verbose and may embed message metadata.
+ */
+/** 导出仅为测试。 */
+export function toImapFlowLogger(logger: Logger): NonNullable<ImapFlowOptions['logger']> {
+  const forward = (data: unknown): void => logger.debug('imapflow', { data });
+  return { debug: forward, info: forward, warn: forward, error: forward };
+}
+
+function buildOptions(account: AccountConfig, logger?: Logger): ImapFlowOptions {
   return {
     host: HOST,
     port: PORT,
     secure: true,
     auth: { user: account.sender, pass: account.appPassword },
-    logger: false,
+    logger: logger ? toImapFlowLogger(logger) : false,
   };
 }
 
@@ -102,6 +115,8 @@ function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
 export interface ImapProviderDeps {
   /** 测试注入点：默认构造真实 ImapFlow 连接。 */
   createClient?: () => ImapFlow;
+  /** imapflow 自身诊断日志的落地点；缺省仍是 logger: false（完全静音）。 */
+  logger?: Logger;
 }
 
 /**
@@ -109,7 +124,7 @@ export interface ImapProviderDeps {
  * 这两者的混用是旧版本反复修过的 bug，改动此处务必确认。
  */
 export function createImapProvider(account: AccountConfig, deps: ImapProviderDeps = {}): ImapProvider {
-  const createClient = deps.createClient ?? (() => new ImapFlow(buildOptions(account)));
+  const createClient = deps.createClient ?? (() => new ImapFlow(buildOptions(account, deps.logger)));
   let client: ImapFlow | undefined;
   let connecting: Promise<ImapFlow> | undefined;
 
@@ -164,7 +179,18 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
         const list = await connection.list();
         const folders: FolderInfo[] = [];
         for (const box of list) {
-          const status = await connection.status(box.path, { messages: true, unseen: true });
+          // imapflow's pinned .d.ts claims Promise<StatusObject>, but the runtime (see
+          // lib/commands/status.js) returns `false` on a server NO/BAD -- the type doesn't
+          // reflect the documented failure path, hence the cast.
+          const status = (await connection.status(box.path, {
+            messages: true,
+            unseen: true,
+          })) as StatusObject | false;
+          // Coercing a `false` failure to `{ messages: 0, unseen: 0 }` via `??` would report
+          // the folder as empty and fully-read instead of surfacing the failure.
+          if (status === false) {
+            throw new AppError('UPSTREAM_ERROR', `无法读取文件夹 ${box.path} 的状态`, { retryable: true });
+          }
           const info: FolderInfo = {
             path: box.path,
             name: box.name,
@@ -183,7 +209,13 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
     async searchUids(folder, criteria) {
       return withMailbox(folder, async (connection) => {
         const uids = await connection.search(toImapQuery(criteria), { uid: true });
-        return uids ? [...uids].sort((a, b) => b - a) : [];
+        // imapflow's search() *returns* `false` on a server NO/BAD, distinct from a
+        // genuinely empty match set ([]). Collapsing both to [] turns a failed search into
+        // a false "no matching mail" -- a false negative on a read path.
+        if (uids === false) {
+          throw new AppError('UPSTREAM_ERROR', `文件夹 ${folder} 中的搜索失败`, { retryable: true });
+        }
+        return [...uids].sort((a, b) => b - a);
       });
     },
 
@@ -217,22 +249,37 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
       if (uids.length === 0) return;
       await withMailbox(folder, async (connection) => {
         const range = uids.join(',');
-        if (add) await connection.messageFlagsAdd(range, flags, { uid: true });
-        else await connection.messageFlagsRemove(range, flags, { uid: true });
+        // imapflow's messageFlagsAdd/Remove *return* false on a server NO/BAD; awaiting and
+        // discarding the result reports fabricated success on a failed STORE.
+        const ok = add
+          ? await connection.messageFlagsAdd(range, flags, { uid: true })
+          : await connection.messageFlagsRemove(range, flags, { uid: true });
+        if (!ok) {
+          throw new AppError('UPSTREAM_ERROR', '设置邮件标记失败', { retryable: true });
+        }
       });
     },
 
     async moveMessages(folder, uids, target) {
       if (uids.length === 0) return;
       await withMailbox(folder, async (connection) => {
-        await connection.messageMove(uids.join(','), target, { uid: true });
+        // imapflow's messageMove *returns* false on a server NO/BAD -- it does not throw.
+        const ok = await connection.messageMove(uids.join(','), target, { uid: true });
+        if (!ok) {
+          throw new AppError('UPSTREAM_ERROR', '移动邮件失败', { retryable: true });
+        }
       });
     },
 
     async expunge(folder, uids) {
       if (uids.length === 0) return;
       await withMailbox(folder, async (connection) => {
-        await connection.messageDelete(uids.join(','), { uid: true });
+        // messageDelete() flags \Deleted then EXPUNGEs; a failed EXPUNGE leaves messages
+        // flagged-and-hidden. imapflow *returns* false here on failure, it does not throw.
+        const ok = await connection.messageDelete(uids.join(','), { uid: true });
+        if (!ok) {
+          throw new AppError('UPSTREAM_ERROR', '永久删除邮件失败', { retryable: true });
+        }
       });
     },
 

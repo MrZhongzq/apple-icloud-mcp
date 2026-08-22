@@ -208,6 +208,14 @@ describe('MailService.mark / move / remove', () => {
     expect(result).toEqual({ deleted: 1, permanent: false });
   });
 
+  it('rejects instead of reporting a count when the provider fails to move messages', async () => {
+    const imap = makeImap({
+      moveMessages: vi.fn().mockRejectedValue(new AppError('UPSTREAM_ERROR', 'iCloud 拒绝了移动请求', { retryable: true })),
+    });
+    const service = createMailService({ account: makeAccount(), imap, smtp: makeSmtp() });
+    await expect(service.move([5], 'INBOX', 'Archive')).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
+  });
+
   it('expunges instead when permanent deletion is requested', async () => {
     const imap = makeImap();
     const service = createMailService({ account: makeAccount(), imap, smtp: makeSmtp() });

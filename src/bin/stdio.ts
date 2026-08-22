@@ -19,7 +19,7 @@ async function main(): Promise<void> {
 
   const sessions = createSessionStore({
     ttlMs: config.sessionTtlMs,
-    providerFactory: createProviders,
+    providerFactory: (account) => createProviders(account, { logger }),
   });
 
   // unref 让定时器不阻止进程退出
