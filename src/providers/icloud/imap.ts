@@ -127,11 +127,18 @@ export function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
   return Object.keys(query).length > 0 ? query : { all: true };
 }
 
+/** Spec §4.2's documented default: an idle connection closes after 300s, then reconnects transparently. */
+const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
+
 export interface ImapProviderDeps {
   /** 测试注入点：默认构造真实 ImapFlow 连接。 */
   createClient?: () => ImapFlow;
   /** imapflow 自身诊断日志的落地点；缺省仍是 logger: false（完全静音）。 */
   logger?: Logger;
+  /** 空闲多久后主动断开重连（毫秒）；缺省 300s（spec §4.2 文档化的默认值）。 */
+  idleTimeoutMs?: number;
+  /** 测试注入点：默认 Date.now。 */
+  now?: () => number;
 }
 
 /**
@@ -140,16 +147,37 @@ export interface ImapProviderDeps {
  */
 export function createImapProvider(account: AccountConfig, deps: ImapProviderDeps = {}): ImapProvider {
   const createClient = deps.createClient ?? (() => new ImapFlow(buildOptions(account, deps.logger)));
+  const idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  const now = deps.now ?? (() => Date.now());
   let client: ImapFlow | undefined;
   let connecting: Promise<ImapFlow> | undefined;
+  let lastUsedAt = 0;
 
   /**
    * 单飞（single-flight）：并发调用共享同一次连接尝试。
    * 若不这样做，两个并发调用会各自建立并认证一条连接，闭包只保留后完成的那条，
    * 另一条成为永不关闭的泄漏 socket，并占用 iCloud 的每账号连接配额。
+   *
+   * 惰性空闲重连（spec §4.2）：没有后台定时器，只在下一次实际操作时检查——若距
+   * 上次使用已超过 idleTimeoutMs，先关闭旧连接再重新连接。这段检查特意保持同步
+   * （只在真的需要关闭旧连接时才 await），不包在一个总是 await 的辅助函数里——
+   * 那样会在"没有空闲连接需要关闭"的最常见路径上插入一次多余的微任务让步，使两个
+   * 并发调用不再在同一个事件循环 tick 内一起走到下面的单飞判断，从而各自建立连接。
    */
   const connect = async (): Promise<ImapFlow> => {
-    if (client?.usable) return client;
+    if (client && now() - lastUsedAt > idleTimeoutMs) {
+      const stale = client;
+      client = undefined;
+      try {
+        await stale.logout();
+      } catch {
+        stale.close();
+      }
+    }
+    if (client?.usable) {
+      lastUsedAt = now();
+      return client;
+    }
     connecting ??= (async () => {
       const next = createClient();
       try {
@@ -158,6 +186,7 @@ export function createImapProvider(account: AccountConfig, deps: ImapProviderDep
         throw mapImapError(err);
       }
       client = next;
+      lastUsedAt = now();
       return next;
     })().finally(() => {
       connecting = undefined;

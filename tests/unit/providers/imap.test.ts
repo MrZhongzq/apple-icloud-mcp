@@ -165,6 +165,93 @@ describe('toImapFlowLogger', () => {
   });
 });
 
+describe('createImapProvider idle timeout (I7)', () => {
+  /**
+   * Spec §4.2 requires an idle IMAP connection to close and transparently reconnect.
+   * Implemented lazily: on the next operation, if the connection has been idle longer
+   * than idleTimeoutMs, close it before reconnecting -- there is no background timer.
+   */
+  function makeCountingClient(onLogout: () => void) {
+    return {
+      usable: true,
+      connect: async () => undefined,
+      noop: async () => undefined,
+      logout: async () => onLogout(),
+      close: () => undefined,
+    };
+  }
+
+  it('closes and transparently reconnects once idle longer than idleTimeoutMs', async () => {
+    let built = 0;
+    let closed = 0;
+    let now = 0;
+    const provider = createImapProvider(account, {
+      createClient: () => {
+        built += 1;
+        return makeCountingClient(() => {
+          closed += 1;
+        }) as unknown as ImapFlow;
+      },
+      idleTimeoutMs: 1_000,
+      now: () => now,
+    });
+
+    await provider.verify();
+    expect(built).toBe(1);
+
+    now += 500; // well within the 1000ms idle timeout
+    await provider.verify();
+    expect(built).toBe(1);
+    expect(closed).toBe(0);
+
+    now += 1_500; // idle past the timeout since the last operation
+    await provider.verify();
+    expect(built).toBe(2);
+    expect(closed).toBe(1);
+  });
+
+  it('does not reconnect when operations stay within the idle window', async () => {
+    let built = 0;
+    let now = 0;
+    const provider = createImapProvider(account, {
+      createClient: () => {
+        built += 1;
+        return makeCountingClient(() => undefined) as unknown as ImapFlow;
+      },
+      idleTimeoutMs: 1_000,
+      now: () => now,
+    });
+
+    await provider.verify();
+    for (let i = 0; i < 5; i++) {
+      now += 400; // each step is under the timeout, resets the idle clock
+      await provider.verify();
+    }
+    expect(built).toBe(1);
+  });
+
+  it('defaults to a 300s idle timeout when none is configured', async () => {
+    let built = 0;
+    let now = 0;
+    const provider = createImapProvider(account, {
+      createClient: () => {
+        built += 1;
+        return makeCountingClient(() => undefined) as unknown as ImapFlow;
+      },
+      now: () => now,
+    });
+
+    await provider.verify();
+    now += 299_000; // just under the documented 300s default, measured from the last op
+    await provider.verify();
+    expect(built).toBe(1);
+
+    now += 300_001; // now past 300s since *that* last operation
+    await provider.verify();
+    expect(built).toBe(2);
+  });
+});
+
 describe('createImapProvider surfaces imapflow false-return failures', () => {
   it('rejects setFlags when messageFlagsAdd reports failure', async () => {
     const provider = createImapProvider(account, { createClient: () => makeFakeClient() });
