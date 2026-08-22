@@ -99,23 +99,40 @@ function toImapQuery(criteria: SearchCriteria): Record<string, unknown> {
   return Object.keys(query).length > 0 ? query : { all: true };
 }
 
+export interface ImapProviderDeps {
+  /** 测试注入点：默认构造真实 ImapFlow 连接。 */
+  createClient?: () => ImapFlow;
+}
+
 /**
  * IMAP 认证用 account.sender（iCloud 邮箱或别名），不是 account.email。
  * 这两者的混用是旧版本反复修过的 bug，改动此处务必确认。
  */
-export function createImapProvider(account: AccountConfig): ImapProvider {
+export function createImapProvider(account: AccountConfig, deps: ImapProviderDeps = {}): ImapProvider {
+  const createClient = deps.createClient ?? (() => new ImapFlow(buildOptions(account)));
   let client: ImapFlow | undefined;
+  let connecting: Promise<ImapFlow> | undefined;
 
+  /**
+   * 单飞（single-flight）：并发调用共享同一次连接尝试。
+   * 若不这样做，两个并发调用会各自建立并认证一条连接，闭包只保留后完成的那条，
+   * 另一条成为永不关闭的泄漏 socket，并占用 iCloud 的每账号连接配额。
+   */
   const connect = async (): Promise<ImapFlow> => {
     if (client?.usable) return client;
-    const next = new ImapFlow(buildOptions(account));
-    try {
-      await next.connect();
-    } catch (err) {
-      throw mapImapError(err);
-    }
-    client = next;
-    return next;
+    connecting ??= (async () => {
+      const next = createClient();
+      try {
+        await next.connect();
+      } catch (err) {
+        throw mapImapError(err);
+      }
+      client = next;
+      return next;
+    })().finally(() => {
+      connecting = undefined;
+    });
+    return connecting;
   };
 
   const withMailbox = async <T>(folder: string, fn: (c: ImapFlow) => Promise<T>): Promise<T> => {
@@ -179,7 +196,12 @@ export function createImapProvider(account: AccountConfig): ImapProvider {
           { uid: true, flags: true, envelope: true, source: true },
           { uid: true },
         )) {
-          if (!message.source) continue;
+          if (!message.source) {
+            throw new AppError('UPSTREAM_ERROR', 'iCloud 返回的邮件缺少正文数据', {
+              hint: '稍后重试；若持续出现，请改用更小的 limit 分批读取',
+              retryable: true,
+            });
+          }
           messages.push({
             uid: message.uid,
             date: message.envelope?.date ?? new Date(0),
