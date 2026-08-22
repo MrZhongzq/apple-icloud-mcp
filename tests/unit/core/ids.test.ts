@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encodeRef, decodeRef } from '../../../src/core/ids.js';
+import { encodeRef, decodeRef, encodeUrl, decodeUrl } from '../../../src/core/ids.js';
 import { AppError } from '../../../src/core/errors.js';
 
 describe('resource refs', () => {
@@ -23,5 +23,17 @@ describe('resource refs', () => {
   it('rejects an id missing the separator', () => {
     const bad = Buffer.from('https://example.com/only-one-part').toString('base64url');
     expect(() => decodeRef(bad)).toThrowError(AppError);
+  });
+});
+
+describe('calendar url ids', () => {
+  const url = 'https://p01-caldav.icloud.com/12345/calendars/home/';
+
+  it('round-trips a calendar url', () => {
+    expect(decodeUrl(encodeUrl(url))).toBe(url);
+  });
+
+  it('rejects an id that does not decode to a url', () => {
+    expect(() => decodeUrl(Buffer.from('nope').toString('base64url'))).toThrowError(AppError);
   });
 });

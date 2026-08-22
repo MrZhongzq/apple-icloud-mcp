@@ -28,3 +28,17 @@ export function decodeRef(id: string): ResourceRef {
 
   return { collectionUrl, resourceUrl };
 }
+
+export function encodeUrl(url: string): string {
+  return Buffer.from(url, 'utf8').toString('base64url');
+}
+
+export function decodeUrl(id: string): string {
+  const decoded = Buffer.from(id, 'base64url').toString('utf8');
+  if (!decoded.startsWith('http')) {
+    throw new AppError('INVALID_INPUT', 'calendar_id 格式不正确', {
+      hint: '请使用 calendar_list 返回的 calendar_id 原值',
+    });
+  }
+  return decoded;
+}

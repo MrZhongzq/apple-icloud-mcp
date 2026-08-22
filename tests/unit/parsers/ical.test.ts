@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { parseCalendarObject, buildCalendarObject } from '../../../src/parsers/ical.js';
+import { parseCalendarObject, buildCalendarObject, readEventMeta } from '../../../src/parsers/ical.js';
 
 const ref = {
   collectionUrl: 'https://caldav.icloud.com/1/calendars/home/',
@@ -183,5 +183,19 @@ describe('buildCalendarObject', () => {
     expect(uid).toBe('existing-uid');
     expect(ics).toContain('UID:existing-uid');
     expect(ics).toContain('SEQUENCE:3');
+  });
+});
+
+describe('readEventMeta', () => {
+  it('reads the uid and defaults the sequence to zero', () => {
+    expect(readEventMeta(fixture('all-day.ics'))).toEqual({ uid: 'allday-001', sequence: 0 });
+  });
+
+  it('reads an explicit sequence', () => {
+    const { ics } = buildCalendarObject(
+      { title: 'x', start: '2026-09-10T02:00:00.000Z', end: '2026-09-10T03:00:00.000Z' },
+      { uid: 'u1', sequence: 4 },
+    );
+    expect(readEventMeta(ics)).toEqual({ uid: 'u1', sequence: 5 });
   });
 });

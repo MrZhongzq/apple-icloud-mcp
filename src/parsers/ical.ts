@@ -355,3 +355,17 @@ export function buildCalendarObject(
   calendar.addSubcomponent(vevent);
   return { ics: calendar.toString(), uid };
 }
+
+export function readEventMeta(icsText: string): { uid: string; sequence: number } {
+  const root = parseRoot(icsText);
+  const vevent = root.getAllSubcomponents('vevent').find((c) => !c.hasProperty('recurrence-id'));
+  if (!vevent) {
+    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
+  }
+  const uid = vevent.getFirstPropertyValue('uid');
+  const sequence = vevent.getFirstPropertyValue('sequence');
+  return {
+    uid: String(uid ?? ''),
+    sequence: Number(sequence ?? 0),
+  };
+}
