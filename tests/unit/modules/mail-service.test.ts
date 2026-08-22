@@ -8,6 +8,7 @@ import type { ImapProvider } from '../../../src/providers/icloud/imap.js';
 import type { SmtpProvider } from '../../../src/providers/icloud/smtp.js';
 
 const source = readFileSync(join(process.cwd(), 'tests/fixtures/mail/chinese-base64.eml'));
+const multipartSource = readFileSync(join(process.cwd(), 'tests/fixtures/mail/multipart-qp.eml'));
 
 function makeAccount(overrides: Partial<AccountConfig['capabilities']> = {}): AccountConfig {
   return {
@@ -47,6 +48,14 @@ function makeImap(overrides: Partial<ImapProvider> = {}): ImapProvider {
     close: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
+}
+
+function makeImapWithHtml(): ImapProvider {
+  return makeImap({
+    fetchMessages: vi.fn().mockResolvedValue([
+      { uid: 31, date: new Date('2026-08-18T09:00:00Z'), flags: [], source: multipartSource },
+    ]),
+  });
 }
 
 function makeSmtp(): SmtpProvider {
@@ -159,17 +168,25 @@ describe('MailService.read', () => {
     await expect(service.read(999)).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('leaves text intact when format is html but the message has no html part', async () => {
-    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
-    const mail = await service.read(30, 'INBOX', 'html');
-    expect(mail.text).toContain('第二行。');
+  it('drops the html body when format is text', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImapWithHtml(), smtp: makeSmtp() });
+    const mail = await service.read(31, 'INBOX', 'text');
+    expect(mail.text).toContain('纯文本部分');
     expect(mail.html).toBeUndefined();
   });
 
-  it('returns both bodies when format is both', async () => {
-    const service = createMailService({ account: makeAccount(), imap: makeImap(), smtp: makeSmtp() });
-    const mail = await service.read(30, 'INBOX', 'both');
-    expect(mail.text).toContain('第二行。');
+  it('empties the text body when format is html', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImapWithHtml(), smtp: makeSmtp() });
+    const mail = await service.read(31, 'INBOX', 'html');
+    expect(mail.text).toBe('');
+    expect(mail.html).toContain('第一段');
+  });
+
+  it('keeps both bodies when format is both', async () => {
+    const service = createMailService({ account: makeAccount(), imap: makeImapWithHtml(), smtp: makeSmtp() });
+    const mail = await service.read(31, 'INBOX', 'both');
+    expect(mail.text).toContain('纯文本部分');
+    expect(mail.html).toContain('第一段');
   });
 });
 
