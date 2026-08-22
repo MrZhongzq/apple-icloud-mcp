@@ -95,6 +95,7 @@ describe('CalendarService.listCalendars', () => {
       name: '个人',
       color: '#FF0000',
       writable: true,
+      supports: ['VEVENT'],
     });
     expect(calendars[1]!.writable).toBe(false);
   });

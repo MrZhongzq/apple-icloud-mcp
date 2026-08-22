@@ -34,7 +34,7 @@ This server exposes 15 tools for Apple iCloud Mail and Calendar. Read this befor
 
 ### Calendar (all require `session_id`)
 
-- `calendar_list({ session_id })` → `{ calendar_id, name, color?, writable }[]`.
+- `calendar_list({ session_id })` → `{ calendar_id, name, color?, writable, supports }[]`. `supports` lists the CalDAV component types the calendar holds (e.g. `["VEVENT"]`).
 - `calendar_list_events({ session_id, start, end, calendar_ids?, expand_recurring? })` → `{ events: CalendarEvent[], partial_failures?: { calendar_id, name, reason }[] }`, `events` sorted by start. Overlap semantics: an event starting before `start` that runs into the window is included. Recurring events expand into one entry per occurrence by default (`expand_recurring` default `true`); each occurrence carries a `recurrence_id`. `partial_failures` appears only when at least one queried calendar failed (e.g. a stale subscribed/shared calendar returning 403) — `events` still contains every successfully-read calendar's results, so tell the user which calendar(s) named in `partial_failures` are broken rather than treating the whole call as failed.
 - `calendar_create_event({ session_id, calendar_id?, event })` → the created `CalendarEvent`. `event.start`/`event.end` **must carry an explicit UTC offset** (e.g. `2026-09-10T14:00:00+08:00`) — there is no `timezone` field; a bare local time is read as UTC. `calendar_id` omitted → written to the first writable calendar. See "Recurring event caveat" below.
 - `calendar_update_event({ session_id, event_id, patch, scope?, recurrence_id?, expected_etag? })` → the updated `CalendarEvent`. `patch` carries only the fields to change. See "scope and recurrence_id" below.

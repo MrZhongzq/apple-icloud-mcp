@@ -20,6 +20,8 @@ export interface CalendarSummary {
   name: string;
   color?: string;
   writable: boolean;
+  /** 该日历支持的 CalDAV 组件类型（如 VEVENT）；spec §5.3。 */
+  supports: string[];
 }
 
 export interface ListEventsParams {
@@ -181,6 +183,7 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
           calendar_id: encodeUrl(cal.url),
           name: cal.name,
           writable: !cal.readOnly,
+          supports: cal.components,
         };
         if (cal.color) summary.color = cal.color;
         return summary;
