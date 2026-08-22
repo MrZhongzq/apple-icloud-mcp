@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCalendarService } from '../../../src/modules/calendar/service.js';
 import { encodeRef, encodeUrl } from '../../../src/core/ids.js';
+import { AppError } from '../../../src/core/errors.js';
 import type { AccountConfig } from '../../../src/core/config.js';
 import type { CalDavProvider } from '../../../src/providers/icloud/caldav.js';
 
@@ -121,10 +122,11 @@ describe('CalendarService.listEvents', () => {
 
   it('returns parsed events sorted by start time', async () => {
     const service = createCalendarService({ account: makeAccount(), caldav: makeCalDav() });
-    const events = await service.listEvents(range);
-    expect(events[0]!.title).toBe('项目评审');
-    expect(events[0]!.start).toBe('2026-08-17T06:00:00.000Z');
-    expect(events[0]!.event_id).toBe(encodeRef({ collectionUrl: HOME, resourceUrl: EVENT_URL }));
+    const result = await service.listEvents(range);
+    expect(result.events[0]!.title).toBe('项目评审');
+    expect(result.events[0]!.start).toBe('2026-08-17T06:00:00.000Z');
+    expect(result.events[0]!.event_id).toBe(encodeRef({ collectionUrl: HOME, resourceUrl: EVENT_URL }));
+    expect(result.partial_failures).toBeUndefined();
   });
 
   it('rejects a range whose end precedes its start', async () => {
@@ -132,6 +134,35 @@ describe('CalendarService.listEvents', () => {
     await expect(
       service.listEvents({ start: range.end, end: range.start }),
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  });
+
+  it('isolates a per-calendar fetch failure: other calendars still return events, and the failure is reported (I1)', async () => {
+    const caldav = makeCalDav({
+      fetchObjects: vi
+        .fn()
+        .mockImplementation(async (calendarUrl: string) => {
+          if (calendarUrl === WORK) {
+            throw new AppError('PERMISSION_DENIED', '没有该日历的写入权限');
+          }
+          return [{ collectionUrl: HOME, url: EVENT_URL, etag: 'etag-1', data: timedIcs }];
+        }),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    const result = await service.listEvents(range);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]!.title).toBe('项目评审');
+    expect(result.partial_failures).toEqual([
+      { calendar_id: encodeUrl(WORK), name: '工作', reason: expect.stringContaining('权限') },
+    ]);
+  });
+
+  it('throws NOT_FOUND naming a calendar_ids entry that matches no known calendar (I10)', async () => {
+    const service = createCalendarService({ account: makeAccount(), caldav: makeCalDav() });
+    const bogus = encodeUrl('https://caldav.icloud.com/1/calendars/does-not-exist/');
+    await expect(
+      service.listEvents({ ...range, calendar_ids: [encodeUrl(WORK), bogus] }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 });
 

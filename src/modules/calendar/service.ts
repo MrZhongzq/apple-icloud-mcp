@@ -29,6 +29,18 @@ export interface ListEventsParams {
   expand_recurring?: boolean;
 }
 
+export interface PartialFailure {
+  calendar_id: string;
+  name: string;
+  reason: string;
+}
+
+export interface ListEventsResult {
+  events: CalendarEvent[];
+  /** 单个日历读取失败时出现；其余日历的结果仍然完整返回（I1）。 */
+  partial_failures?: PartialFailure[];
+}
+
 export interface UpdateOptions {
   expected_etag?: string;
   scope?: 'this' | 'all';
@@ -37,7 +49,7 @@ export interface UpdateOptions {
 
 export interface CalendarService {
   listCalendars(): Promise<CalendarSummary[]>;
-  listEvents(params: ListEventsParams): Promise<CalendarEvent[]>;
+  listEvents(params: ListEventsParams): Promise<ListEventsResult>;
   createEvent(input: EventInput, calendarId?: string): Promise<CalendarEvent>;
   updateEvent(eventId: string, patch: Partial<EventInput>, options?: UpdateOptions): Promise<CalendarEvent>;
   deleteEvent(eventId: string, options?: UpdateOptions): Promise<{ deleted: true }>;
@@ -178,30 +190,63 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
     async listEvents(params) {
       requireRead();
       const range = parseRange(params.start, params.end);
-      const wanted = params.calendar_ids?.map(decodeUrl);
-      const calendars = (await eventCalendars()).filter(
-        (cal) => !wanted || wanted.includes(cal.url),
-      );
+      const allCalendars = await eventCalendars();
 
-      const events: CalendarEvent[] = [];
-      for (const calendar of calendars) {
-        const objects = await caldav.fetchObjects(calendar.url, range);
-        for (const object of objects) {
-          events.push(
-            ...parseCalendarObject(
-              object.data,
-              { collectionUrl: object.collectionUrl, resourceUrl: object.url },
-              {
-                rangeStart: range.start,
-                rangeEnd: range.end,
-                expandRecurring: params.expand_recurring !== false,
-              },
-            ),
+      // I10: an id that no longer resolves to any calendar must not silently degrade to
+      // "query nothing" -- the deleted/renamed calendar_ids entry gets named explicitly.
+      const wanted = params.calendar_ids?.map(decodeUrl);
+      if (wanted) {
+        const missing = wanted.filter((url) => !allCalendars.some((cal) => cal.url === url));
+        if (missing.length > 0) {
+          throw new AppError(
+            'NOT_FOUND',
+            `以下 calendar_id 不对应任何日历：${missing.map(encodeUrl).join('、')}`,
+            { hint: '重新调用 calendar_list 获取当前有效的 calendar_id' },
           );
         }
       }
+      const calendars = allCalendars.filter((cal) => !wanted || wanted.includes(cal.url));
 
-      return events.sort((a, b) => a.start.localeCompare(b.start)).slice(0, MAX_EVENTS);
+      // I1: one subscribed/shared calendar going stale (403, timeout, ...) must not abort
+      // every other calendar's read -- isolate per calendar and surface the failures.
+      const settled = await Promise.allSettled(
+        calendars.map(async (calendar) => {
+          const objects = await caldav.fetchObjects(calendar.url, range);
+          const events: CalendarEvent[] = [];
+          for (const object of objects) {
+            events.push(
+              ...parseCalendarObject(
+                object.data,
+                { collectionUrl: object.collectionUrl, resourceUrl: object.url },
+                {
+                  rangeStart: range.start,
+                  rangeEnd: range.end,
+                  expandRecurring: params.expand_recurring !== false,
+                },
+              ),
+            );
+          }
+          return events;
+        }),
+      );
+
+      const events: CalendarEvent[] = [];
+      const partial_failures: PartialFailure[] = [];
+      settled.forEach((outcome, index) => {
+        const calendar = calendars[index]!;
+        if (outcome.status === 'fulfilled') {
+          events.push(...outcome.value);
+        } else {
+          const reason = outcome.reason instanceof AppError ? outcome.reason.message : '未知错误';
+          partial_failures.push({ calendar_id: encodeUrl(calendar.url), name: calendar.name, reason });
+        }
+      });
+
+      const result: ListEventsResult = {
+        events: events.sort((a, b) => a.start.localeCompare(b.start)).slice(0, MAX_EVENTS),
+      };
+      if (partial_failures.length > 0) result.partial_failures = partial_failures;
+      return result;
     },
 
     async createEvent(input, calendarId) {
