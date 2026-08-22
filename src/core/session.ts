@@ -48,6 +48,15 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
     } catch {
       // 连接可能已被对端关闭，销毁流程不因此失败
     }
+    try {
+      // I9: the nodemailer transporter holds the App password and was never torn down
+      // before -- work_done's description claimed credentials were cleared from memory,
+      // which was false. It still lives in `account.appPassword` for the process
+      // lifetime; this closes the transporter's connection(s), it does not erase memory.
+      await session.providers.smtp.close();
+    } catch {
+      // 同上：连接可能已经关闭
+    }
   };
 
   return {

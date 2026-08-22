@@ -21,18 +21,23 @@ const account: AccountConfig = {
   },
 };
 
-function makeProviders(): SessionProviders & { closed: () => number } {
+function makeProviders(): SessionProviders & { closed: () => number; smtpClosed: () => number } {
   let closeCount = 0;
+  let smtpCloseCount = 0;
   const providers = {
     imap: {
       close: async () => {
         closeCount += 1;
       },
     },
-    smtp: {},
+    smtp: {
+      close: async () => {
+        smtpCloseCount += 1;
+      },
+    },
     caldav: {},
   } as unknown as SessionProviders;
-  return Object.assign(providers, { closed: () => closeCount });
+  return Object.assign(providers, { closed: () => closeCount, smtpClosed: () => smtpCloseCount });
 }
 
 describe('SessionStore', () => {
@@ -119,6 +124,28 @@ describe('SessionStore', () => {
     await store.destroy(session.id);
     expect(providers.closed()).toBe(1);
     expect(store.size()).toBe(0);
+  });
+
+  it('also closes the smtp transporter when destroyed (I9)', async () => {
+    // The nodemailer transporter holds the App password and was never torn down before --
+    // work_done's description claimed credentials were cleared from memory, which was
+    // false; closing the transporter is part of actually making that true.
+    const providers = makeProviders();
+    const store = createSessionStore({ ttlMs: 1000, providerFactory: () => providers });
+    const session = store.create(account);
+    await store.destroy(session.id);
+    expect(providers.smtpClosed()).toBe(1);
+  });
+
+  it('survives an smtp provider that throws while closing', async () => {
+    const providers = {
+      imap: { close: vi.fn().mockResolvedValue(undefined) },
+      smtp: { close: vi.fn().mockRejectedValue(new Error('already closed')) },
+      caldav: {},
+    } as unknown as SessionProviders;
+    const store = createSessionStore({ ttlMs: 1000, providerFactory: () => providers });
+    const session = store.create(account);
+    await expect(store.destroy(session.id)).resolves.toBe(true);
   });
 
   it('returns false when destroying an unknown session', async () => {

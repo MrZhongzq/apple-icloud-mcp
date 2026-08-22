@@ -127,6 +127,18 @@ describe('apple_login', () => {
 });
 
 describe('work_done', () => {
+  it('does not claim to clear credentials from memory -- the App password lives in config for the process lifetime (I9)', async () => {
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, { sessions: store, logger: silentLogger, config });
+
+    const description = tools.get('work_done')!.config.description ?? '';
+    expect(description).not.toContain('清除内存中的凭据');
+    expect(description).toContain('销毁');
+    expect(description).toMatch(/关闭.*连接/);
+    expect(description).toContain('session_id');
+  });
+
   it('destroys the session', async () => {
     const { server, tools } = collect();
     const { store, destroy } = makeSessions(healthyProviders());

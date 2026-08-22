@@ -66,7 +66,8 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
     {
       title: '结束会话',
       description:
-        '销毁会话、关闭连接并清除内存中的凭据。完成全部 iCloud 相关任务后必须调用。',
+        '销毁该 session_id 对应的会话、关闭其 IMAP/SMTP 连接，并使该 session_id 之后不能再使用。' +
+        '完成全部 iCloud 相关任务后必须调用。',
       inputSchema: { session_id: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },

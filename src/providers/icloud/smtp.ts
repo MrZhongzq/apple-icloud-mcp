@@ -24,6 +24,12 @@ export interface SendResult {
 export interface SmtpProvider {
   send(message: OutgoingMessage): Promise<SendResult>;
   verify(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface SmtpProviderDeps {
+  /** 测试注入点：默认构造真实 nodemailer transporter。 */
+  createTransport?: () => Transporter;
 }
 
 export function mapSmtpError(err: unknown): AppError {
@@ -50,17 +56,21 @@ export function mapSmtpError(err: unknown): AppError {
 }
 
 /** SMTP 与 IMAP 一样使用 account.sender 认证，且发件人必须是该地址。 */
-export function createSmtpProvider(account: AccountConfig): SmtpProvider {
+export function createSmtpProvider(account: AccountConfig, deps: SmtpProviderDeps = {}): SmtpProvider {
+  const buildTransport =
+    deps.createTransport ??
+    (() =>
+      nodemailer.createTransport({
+        host: HOST,
+        port: PORT,
+        secure: false,
+        requireTLS: true,
+        auth: { user: account.sender, pass: account.appPassword },
+      }));
   let transporter: Transporter | undefined;
 
   const get = (): Transporter => {
-    transporter ??= nodemailer.createTransport({
-      host: HOST,
-      port: PORT,
-      secure: false,
-      requireTLS: true,
-      auth: { user: account.sender, pass: account.appPassword },
-    });
+    transporter ??= buildTransport();
     return transporter;
   };
 
@@ -94,6 +104,13 @@ export function createSmtpProvider(account: AccountConfig): SmtpProvider {
       } catch (err) {
         throw mapSmtpError(err);
       }
+    },
+
+    async close() {
+      // 惰性构造：verify()/send() 从未调用过时 transporter 还不存在，无需关闭。
+      if (!transporter) return;
+      transporter.close();
+      transporter = undefined;
     },
   };
 }
