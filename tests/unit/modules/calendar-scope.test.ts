@@ -85,6 +85,31 @@ describe('single-occurrence scope', () => {
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
   });
 
+  it('keeps the occurrence duration when patching only a non-time field', async () => {
+    const caldav = makeCalDav();
+    const service = createCalendarService({ account, caldav });
+
+    await service.updateEvent(eventId, { title: '只改标题' }, {
+      scope: 'this',
+      recurrence_id: '2026-08-17T09:00:00.000Z',
+    });
+
+    const written = (caldav.update as ReturnType<typeof vi.fn>).mock.calls[0]![0].data as string;
+    const override = written
+      .split('BEGIN:VEVENT')
+      .find((block) => block.includes('RECURRENCE-ID'));
+    expect(override).toBeDefined();
+    expect(override).toContain('DTSTART:20260817T090000Z');
+    expect(override).toContain('DTEND:20260817T093000Z');
+  });
+
+  it('requires recurrence_id when deleting a single occurrence', async () => {
+    const service = createCalendarService({ account, caldav: makeCalDav() });
+    await expect(service.deleteEvent(eventId, { scope: 'this' })).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+    });
+  });
+
   it('still deletes the whole series when scope is all', async () => {
     const caldav = makeCalDav();
     const service = createCalendarService({ account, caldav });

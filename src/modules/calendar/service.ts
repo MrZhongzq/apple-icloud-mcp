@@ -203,12 +203,23 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
         const recurrenceId = requireRecurrenceId(options);
         const [existingSeries] = parseCalendarObject(current.data, ref);
         if (!existingSeries) throw new AppError('NOT_FOUND', '该事件已不存在');
+
+        // existingSeries 的 start/end 是主事件自身的模板时间，与本次发生无关。
+        // 直接沿用它的 end 会让 DTEND 落在别的日期上（常见结果是早于 DTSTART，
+        // 写出畸形 VEVENT）。正确做法是把序列的时长套到本次发生的起点上。
+        const seriesDurationMs =
+          new Date(existingSeries.end).getTime() - new Date(existingSeries.start).getTime();
+        const overrideStart = patch.start ?? recurrenceId;
+        const overrideEnd =
+          patch.end ?? new Date(new Date(overrideStart).getTime() + seriesDurationMs).toISOString();
+
         const overrideInput: EventInput = {
           ...toInput(existingSeries),
-          start: recurrenceId,
-          end: existingSeries.end,
           ...patch,
+          start: overrideStart,
+          end: overrideEnd,
         };
+        parseRange(overrideInput.start, overrideInput.end);
         const data = upsertOverride(current.data, recurrenceId, overrideInput);
         await caldav.update({
           collectionUrl: ref.collectionUrl,
