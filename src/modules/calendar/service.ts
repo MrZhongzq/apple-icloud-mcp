@@ -210,8 +210,14 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
         const seriesDurationMs =
           new Date(existingSeries.end).getTime() - new Date(existingSeries.start).getTime();
         const overrideStart = patch.start ?? recurrenceId;
+        const overrideStartMs = new Date(overrideStart).getTime();
+        if (Number.isNaN(overrideStartMs)) {
+          throw new AppError('INVALID_INPUT', `start 不是合法的时间格式：${overrideStart}`, {
+            hint: '请使用 ISO 8601 格式，例如 2026-09-10T14:00:00+08:00',
+          });
+        }
         const overrideEnd =
-          patch.end ?? new Date(new Date(overrideStart).getTime() + seriesDurationMs).toISOString();
+          patch.end ?? new Date(overrideStartMs + seriesDurationMs).toISOString();
 
         const overrideInput: EventInput = {
           ...toInput(existingSeries),

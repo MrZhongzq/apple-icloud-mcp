@@ -110,6 +110,20 @@ describe('single-occurrence scope', () => {
     });
   });
 
+  it('rejects a malformed start with a clear error rather than a generic one', async () => {
+    const caldav = makeCalDav();
+    const service = createCalendarService({ account, caldav });
+
+    await expect(
+      service.updateEvent(eventId, { start: 'next tuesday' }, {
+        scope: 'this',
+        recurrence_id: '2026-08-17T09:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+
+    expect(caldav.update).not.toHaveBeenCalled();
+  });
+
   it('still deletes the whole series when scope is all', async () => {
     const caldav = makeCalDav();
     const service = createCalendarService({ account, caldav });
