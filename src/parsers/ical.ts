@@ -596,8 +596,8 @@ function findMaster(root: ICAL.Component): ICAL.Component {
 // comment on `toIsoString`) -- routing through the same function `addExdate`/
 // `upsertOverride` use to *emit* instants keeps "is this the same occurrence" consistent
 // with "what does this occurrence's start actually read as" for every value type.
-function sameInstant(a: ICAL.Time, isoTime: string): boolean {
-  return toIsoString(a) === new Date(isoTime).toISOString();
+function sameInstant(a: ICAL.Time, isoTime: string, tzid?: string): boolean {
+  return toIsoString(a, tzid) === new Date(isoTime).toISOString();
 }
 
 interface AnchoredTime {
@@ -655,12 +655,13 @@ export function addExdate(icsText: string, recurrenceId: string): string {
   const root = parseRoot(icsText);
   registerTimezones(root);
   const master = findMaster(root);
+  const masterTzid = timezoneOf(master);
 
   const already = master
     .getAllProperties('exdate')
-    .some((p) => sameInstant(p.getFirstValue() as ICAL.Time, recurrenceId));
+    .some((p) => sameInstant(p.getFirstValue() as ICAL.Time, recurrenceId, masterTzid));
 
-  const orphan = findOverride(root, recurrenceId);
+  const orphan = findOverride(root, recurrenceId, masterTzid);
   if (orphan) root.removeSubcomponent(orphan);
 
   if (!already) {
@@ -670,10 +671,20 @@ export function addExdate(icsText: string, recurrenceId: string): string {
   return root.toString();
 }
 
-function findOverride(root: ICAL.Component, recurrenceId: string): ICAL.Component | undefined {
+// R1: recurrenceId is an absolute UTC instant, but a candidate's own RECURRENCE-ID
+// property may be TZID-anchored with no accompanying VTIMEZONE in this object (I5's
+// case). Without the master's tzid, sameInstant() falls back to reading it as floating
+// UTC wall-clock -- wrong by the zone's offset -- so a prior write of our own is never
+// recognised as the same occurrence: upsertOverride() then appends a second override
+// instead of replacing the first, and addExdate() can neither find-and-drop an existing
+// override for the excluded slot (I2) nor recognise its own previously-written EXDATE
+// (breaking idempotency). tzid must always be the *master's* tzid, matching
+// anchorToMaster()/addAnchoredProperty()'s write side, regardless of what zone the
+// candidate component itself happens to carry.
+function findOverride(root: ICAL.Component, recurrenceId: string, tzid?: string): ICAL.Component | undefined {
   return root.getAllSubcomponents('vevent').find((candidate) => {
     const rid = candidate.getFirstPropertyValue('recurrence-id');
-    return rid !== null && sameInstant(rid as ICAL.Time, recurrenceId);
+    return rid !== null && sameInstant(rid as ICAL.Time, recurrenceId, tzid);
   });
 }
 
@@ -693,8 +704,9 @@ export function upsertOverride(icsText: string, recurrenceId: string, input: Eve
   const root = parseRoot(icsText);
   registerTimezones(root);
   const master = findMaster(root);
+  const masterTzid = timezoneOf(master);
 
-  const existingOverride = findOverride(root, recurrenceId);
+  const existingOverride = findOverride(root, recurrenceId, masterTzid);
   if (existingOverride) {
     applyPatchToVevent(existingOverride, input, { allowRecurrence: false });
     bumpSequence(existingOverride);

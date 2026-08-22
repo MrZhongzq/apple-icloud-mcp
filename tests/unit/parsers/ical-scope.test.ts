@@ -15,6 +15,7 @@ const weekly = fixture('weekly-with-exdate.ics');
 const withOverride = fixture('weekly-with-override.ics');
 const allDayWeekly = fixture('all-day-weekly.ics');
 const timedShanghaiWeekly = fixture('timed-shanghai-weekly.ics');
+const unresolvedTzidWeekly = fixture('unresolved-tzid-weekly.ics');
 
 const range = {
   rangeStart: new Date('2026-08-01T00:00:00Z'),
@@ -217,5 +218,48 @@ describe('RECURRENCE-ID / EXDATE value-type matching the master (I3)', () => {
     expect(edited).toBeDefined();
     expect(events.find((e) => e.start === '2026-08-03T06:00:00.000Z')!.title).toBe('周三会议');
     expect(events.find((e) => e.start === '2026-08-17T06:00:00.000Z')!.title).toBe('周三会议');
+  });
+});
+
+describe('sameInstant must use the master tzid (R1: idempotency with an unresolved TZID)', () => {
+  // unresolved-tzid-weekly.ics has DTSTART;TZID=Europe/Berlin with no accompanying
+  // VTIMEZONE. 2026-11-04T14:00 Europe/Berlin (CET, UTC+1 in November) is
+  // 2026-11-04T13:00:00Z -- if sameInstant() ever falls back to the floating branch
+  // (no tzid threaded through) it would instead read RECURRENCE-ID/EXDATE as
+  // 14:00:00Z, one hour off, and never match the recurrenceId this test passes in.
+  const recurrenceId = '2026-11-04T13:00:00.000Z';
+
+  it('upsertOverride called twice on the same occurrence leaves exactly one RECURRENCE-ID component', () => {
+    const once = upsertOverride(unresolvedTzidWeekly, recurrenceId, {
+      title: '第一次改',
+      start: '2026-11-04T15:00:00.000Z',
+      end: '2026-11-04T16:00:00.000Z',
+    });
+    const twice = upsertOverride(once, recurrenceId, {
+      title: '第二次改',
+      start: '2026-11-04T17:00:00.000Z',
+      end: '2026-11-04T18:00:00.000Z',
+    });
+    expect(twice.match(/RECURRENCE-ID/g)).toHaveLength(1);
+    expect(twice).toContain('第二次改');
+    expect(twice).not.toContain('第一次改');
+  });
+
+  it('addExdate on a slot that already has an override removes that override too', () => {
+    const withOverrideWritten = upsertOverride(unresolvedTzidWeekly, recurrenceId, {
+      title: '临时改期',
+      start: '2026-11-04T15:00:00.000Z',
+      end: '2026-11-04T16:00:00.000Z',
+    });
+    expect(withOverrideWritten).toContain('RECURRENCE-ID');
+
+    const excluded = addExdate(withOverrideWritten, recurrenceId);
+    expect(veventBlocks(excluded).some((b) => b.includes('RECURRENCE-ID'))).toBe(false);
+  });
+
+  it('addExdate called twice leaves exactly one EXDATE', () => {
+    const once = addExdate(unresolvedTzidWeekly, recurrenceId);
+    const twice = addExdate(once, recurrenceId);
+    expect(twice.match(/EXDATE/g)).toHaveLength(1);
   });
 });
