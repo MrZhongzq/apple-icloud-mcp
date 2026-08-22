@@ -78,6 +78,57 @@ describe('loadConfig', () => {
   it('rejects an unrecognised boolean', () => {
     expect(() => loadConfig({ ...base, ALLOW_MAIL_WRITE_1: 'maybe' })).toThrowError(AppError);
   });
+
+  it('rejects an account without a password and points at the Apple ID page', () => {
+    try {
+      loadConfig({ ICLOUD_ACCOUNT_1: 'me@icloud.com' });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as AppError).code).toBe('INVALID_INPUT');
+      expect((e as AppError).hint).toContain('appleid.apple.com');
+    }
+  });
+
+  it('rejects a malformed account email', () => {
+    expect(() =>
+      loadConfig({ ICLOUD_ACCOUNT_1: 'not-an-email', ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop' }),
+    ).toThrowError(AppError);
+  });
+
+  it('rejects an unrecognised LOG_LEVEL', () => {
+    expect(() => loadConfig({ ...base, LOG_LEVEL: 'chatty' })).toThrowError(AppError);
+  });
+
+  it('rejects a non-positive session TTL', () => {
+    expect(() => loadConfig({ ...base, SESSION_TTL_MINUTES: '0' })).toThrowError(AppError);
+  });
+
+  it('lets an explicitly set new name win over its legacy equivalent', () => {
+    const cfg = loadConfig({
+      icloud_account: 'legacy@icloud.com',
+      icloud_app_pass: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_ACCOUNT_1: 'modern@icloud.com',
+    });
+    expect(cfg.accounts[0]!.email).toBe('modern@icloud.com');
+  });
+
+  it('maps legacy multi-account names for accounts 2-5', () => {
+    const cfg = loadConfig({
+      ...base,
+      icloud_account2: 'work@icloud.com',
+      icloud_app_pass2: 'wxyz-wxyz-wxyz-wxyz',
+      allow_calendar2_write: 'true',
+    });
+    expect(cfg.accounts.map((a) => a.email)).toEqual(['me@icloud.com', 'work@icloud.com']);
+    expect(cfg.accounts[1]!.capabilities.calendarWrite).toBe(true);
+    expect(cfg.deprecations.join(' ')).toContain('icloud_account2');
+  });
+
+  it('records a deprecation for the obsolete multiple_account_enable flag', () => {
+    const cfg = loadConfig({ ...base, multiple_account_enable: '1' });
+    expect(cfg.deprecations.join(' ')).toContain('multiple_account_enable');
+    expect(cfg.accounts).toHaveLength(1);
+  });
 });
 
 describe('findAccount', () => {

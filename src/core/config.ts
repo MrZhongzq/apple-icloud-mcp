@@ -30,16 +30,23 @@ export interface AppConfig {
   deprecations: string[];
 }
 
-/** 旧的小写变量名 → 新命名。命中即记一条弃用提示。 */
-const LEGACY_MAP: Record<string, string> = {
-  icloud_account: 'ICLOUD_ACCOUNT_1',
-  icloud_app_pass: 'ICLOUD_APP_PASSWORD_1',
-  icloud_sender: 'ICLOUD_SENDER_1',
-  allow_mail_read: 'ALLOW_MAIL_READ_1',
-  allow_mail_write: 'ALLOW_MAIL_WRITE_1',
-  allow_calendar_read: 'ALLOW_CALENDAR_READ_1',
-  allow_calendar_write: 'ALLOW_CALENDAR_WRITE_1',
-};
+/** 旧的小写变量名 → 新命名。旧版把序号嵌在名字中间（icloud_account2、allow_mail2_read）。 */
+function buildLegacyMap(): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (let i = 1; i <= 5; i++) {
+    const old = i === 1 ? '' : String(i);
+    map[`icloud_account${old}`] = `ICLOUD_ACCOUNT_${i}`;
+    map[`icloud_app_pass${old}`] = `ICLOUD_APP_PASSWORD_${i}`;
+    map[`icloud_sender${old}`] = `ICLOUD_SENDER_${i}`;
+    map[`allow_mail${old}_read`] = `ALLOW_MAIL_READ_${i}`;
+    map[`allow_mail${old}_write`] = `ALLOW_MAIL_WRITE_${i}`;
+    map[`allow_calendar${old}_read`] = `ALLOW_CALENDAR_READ_${i}`;
+    map[`allow_calendar${old}_write`] = `ALLOW_CALENDAR_WRITE_${i}`;
+  }
+  return map;
+}
+
+const LEGACY_MAP: Record<string, string> = buildLegacyMap();
 
 const emailSchema = z.email();
 const logLevelSchema = z.enum(['error', 'warn', 'info', 'debug']);
@@ -80,6 +87,9 @@ function applyLegacy(env: NodeJS.ProcessEnv): { env: NodeJS.ProcessEnv; deprecat
       merged[newKey] = value;
       deprecations.push(`环境变量 ${oldKey} 已弃用，请改用 ${newKey}`);
     }
+  }
+  if (env.multiple_account_enable !== undefined) {
+    deprecations.push('环境变量 multiple_account_enable 已废弃：账号 2-5 现在按 ICLOUD_ACCOUNT_2..5 是否存在自动识别');
   }
   return { env: merged, deprecations };
 }
