@@ -103,11 +103,6 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
         session_id: sessionId,
         list_id: z.string().optional(),
         reminder: reminderSchema,
-        // 与 reminder.priority 共享同一个 zod 定义，不是独立输入通道——handler 只读取
-        // args.reminder。之所以在顶层重复暴露，是因为 priority 的方向违反直觉，调用方
-        // （包括仅检查顶层 schema、不深入嵌套对象的客户端）必须无需展开 reminder 就能
-        // 读到这条说明；这里的重复纯粹是文档可见性，不代表第二个可写入口。
-        priority: reminderShape.priority,
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },

@@ -75,9 +75,26 @@ describe('registerReminderTools', () => {
     const { server, tools } = collect();
     registerReminderTools(server, depsWith({}));
     const shape = tools.get('reminders_create')!.config.inputSchema as Record<string, z.ZodTypeAny>;
-    const described = shape.priority!.description ?? '';
+    const nested = (shape.reminder as z.ZodObject<Record<string, z.ZodTypeAny>>).shape;
+    const described = nested.priority!.description ?? '';
     expect(described).toMatch(/1/);
     expect(described).toMatch(/9/);
+  });
+
+  it('advertises no top-level field the handler does not read', () => {
+    const { server, tools } = collect();
+    registerReminderTools(server, depsWith({}));
+    const allowed: Record<string, string[]> = {
+      reminders_lists: ['session_id'],
+      reminders_list: ['session_id', 'list_ids', 'completed', 'due_before', 'due_after', 'limit'],
+      reminders_create: ['session_id', 'list_id', 'reminder'],
+      reminders_update: ['session_id', 'reminder_id', 'patch', 'expected_etag'],
+      reminders_delete: ['session_id', 'reminder_id', 'expected_etag'],
+    };
+    for (const [name, tool] of tools) {
+      const keys = Object.keys(tool.config.inputSchema as Record<string, unknown>).sort();
+      expect(keys, `${name} 的 inputSchema 顶层字段与 handler 读取的不一致`).toEqual(allowed[name]!.sort());
+    }
   });
 
   it('forwards the list query verbatim', async () => {
