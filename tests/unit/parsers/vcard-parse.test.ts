@@ -30,6 +30,20 @@ describe('parseVCard', () => {
     expect(c.name.full).toBe('张 三');
   });
 
+  it('flattens a multi-value name segment', () => {
+    // N 与 ADR 一样在 ical.js 的 design 表里声明了 multiValue:","，
+    // 所以裸逗号会把该段变成子数组。ORG 没有这个声明，不会。
+    const c = parseVCard(card('FN:x', 'N:张, 王;三;;;'), ref);
+    expect(c.name.family).toBe('张, 王');
+    expect(c.name.given).toBe('三');
+  });
+
+  it('degrades to an empty full name rather than throwing when a card has neither FN nor N', () => {
+    const c = parseVCard(card('UID:U-1'), ref);
+    expect(c.name.full).toBe('');
+    expect(c.contact_id).toBeTruthy();
+  });
+
   it('flattens a structured segment that itself parsed as an array', () => {
     // 裸逗号是 vCard 合法的多值分隔符，ical.js 会把该段解析成数组。
     // 这是唯一走得到 flattenSegment 的输入形态 —— 转义逗号不会触发它。

@@ -84,16 +84,16 @@ function parseRoot(text: string): ICAL.Component {
   try {
     jcal = ICAL.parse(text);
   } catch (cause) {
-    throw new AppError('INVALID_INPUT', '联系人数据解析失败', { cause });
+    throw new AppError('UPSTREAM_ERROR', '联系人数据解析失败', { cause });
   }
   let root: ICAL.Component;
   try {
     root = new ICAL.Component(jcal as unknown[]);
   } catch (cause) {
-    throw new AppError('INVALID_INPUT', '联系人数据解析失败', { cause });
+    throw new AppError('UPSTREAM_ERROR', '联系人数据解析失败', { cause });
   }
   if (root.name !== 'vcard') {
-    throw new AppError('INVALID_INPUT', '联系人数据不是有效的 vCard');
+    throw new AppError('UPSTREAM_ERROR', '联系人数据不是有效的 vCard');
   }
   return root;
 }
