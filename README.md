@@ -132,7 +132,7 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 | Tool | Summary |
 |---|---|
 | `apple_accounts` | List configured accounts and their read/write capabilities. No session required. |
-| `apple_login` | Authenticate (verifies IMAP + CalDAV live) and open a session; returns `session_id`. |
+| `apple_login` | Authenticate and open a session; returns `session_id`. Verifies live only the protocols the account's enabled capabilities need — IMAP for mail, CalDAV for calendar/reminders, CardDAV for contacts. |
 | `work_done` | Close the session and release its connections. Call when finished. |
 | `mail_folders` | List mail folders with unread counts and special-use tags (inbox, trash, …). |
 | `mail_search` | Search messages by folder/sender/subject/text/date/flags; paginated, headers-only. |

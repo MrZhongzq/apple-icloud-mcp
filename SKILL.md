@@ -10,7 +10,7 @@ This server exposes 25 tools for Apple iCloud Mail, Calendar, Reminders, and Con
 ## Workflow
 
 1. **(Optional) `apple_accounts`** — no session needed. Lists configured accounts and their capabilities. Call this first if you don't already know which account/email to use, especially in multi-account setups.
-2. **`apple_login`** — establish a session. This actually connects to IMAP and CalDAV to verify the credentials, so a bad password fails here, immediately, not later. Returns `session_id`. If there is exactly one configured account, `account` may be omitted.
+2. **`apple_login`** — establish a session. This actually connects to verify the credentials, so a bad password fails here, immediately, not later. Only the protocols the account's enabled capabilities need are contacted — IMAP for mail, CalDAV for calendar and reminders, CardDAV for contacts — so an account whose mail tools are disabled still logs in fine. Returns `session_id`. If there is exactly one configured account, `account` may be omitted.
 3. **Do the work** — every other tool call requires the `session_id` from step 2, passed as the `session_id` argument.
 4. **`work_done`** — call this once you have completely finished the user's task and no longer need iCloud access. It destroys the session and closes the underlying connections. Do not skip this at the end of a task.
 
