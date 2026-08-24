@@ -1,7 +1,7 @@
 import ICAL from 'ical.js';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../core/errors.js';
-import { encodeRef, type ResourceRef } from '../core/ids.js';
+import { encodeRef, encodeUrl, type ResourceRef } from '../core/ids.js';
 
 export interface RecurrenceRule {
   freq: 'DAILY' | 'WEEKLY' | 'MONTHLY' | 'YEARLY';
@@ -265,10 +265,14 @@ function toIsoString(time: ICAL.Time, tzid?: string): string {
   return `${year}-${month}-${day}T${hour}:${minute}:${second}.000Z`;
 }
 
-function timezoneOf(vevent: ICAL.Component): string | undefined {
-  const dtstart = vevent.getFirstProperty('dtstart');
-  const tzid = dtstart?.getParameter('tzid');
+function timezoneOfProperty(component: ICAL.Component, propertyName: string): string | undefined {
+  const property = component.getFirstProperty(propertyName);
+  const tzid = property?.getParameter('tzid');
   return typeof tzid === 'string' ? tzid : undefined;
+}
+
+function timezoneOf(vevent: ICAL.Component): string | undefined {
+  return timezoneOfProperty(vevent, 'dtstart');
 }
 
 function baseEvent(vevent: ICAL.Component, ref: ResourceRef): Omit<CalendarEvent, 'start' | 'end'> {
@@ -725,4 +729,61 @@ export function upsertOverride(icsText: string, recurrenceId: string, input: Eve
 
   root.addSubcomponent(override);
   return root.toString();
+}
+
+export interface Reminder {
+  reminder_id: string;
+  list_id: string;
+  uid: string;
+  title: string;
+  notes?: string;
+  due?: string;
+  completed: boolean;
+  completed_at?: string;
+  /** iCal 原值 0-9：0 未设置，1 最高，9 最低。Apple 客户端用 1/5/9 表示高/中/低。 */
+  priority?: number;
+  percent_complete?: number;
+  created?: string;
+}
+
+export function parseTodoObject(icsText: string, ref: ResourceRef): Reminder[] {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+
+  return root.getAllSubcomponents('vtodo').map((vtodo) => {
+    const status = String(vtodo.getFirstPropertyValue('status') ?? '').toUpperCase();
+    const completedAt = vtodo.getFirstPropertyValue('completed');
+    const percent = vtodo.getFirstPropertyValue('percent-complete');
+
+    const reminder: Reminder = {
+      reminder_id: encodeRef(ref),
+      list_id: encodeUrl(ref.collectionUrl),
+      uid: String(vtodo.getFirstPropertyValue('uid') ?? ''),
+      title: String(vtodo.getFirstPropertyValue('summary') ?? ''),
+      completed: status === 'COMPLETED' || Number(percent ?? 0) === 100,
+    };
+
+    const notes = vtodo.getFirstPropertyValue('description');
+    if (typeof notes === 'string' && notes) reminder.notes = notes;
+
+    const due = vtodo.getFirstPropertyValue('due');
+    if (due && typeof due !== 'string') {
+      reminder.due = toIsoString(due as ICAL.Time, timezoneOfProperty(vtodo, 'due'));
+    }
+
+    if (completedAt && typeof completedAt !== 'string') {
+      reminder.completed_at = toIsoString(completedAt as ICAL.Time);
+    }
+
+    const priority = vtodo.getFirstPropertyValue('priority');
+    if (priority !== null && priority !== undefined) reminder.priority = Number(priority);
+    if (percent !== null && percent !== undefined) reminder.percent_complete = Number(percent);
+
+    const created = vtodo.getFirstPropertyValue('created');
+    if (created && typeof created !== 'string') {
+      reminder.created = toIsoString(created as ICAL.Time);
+    }
+
+    return reminder;
+  });
 }

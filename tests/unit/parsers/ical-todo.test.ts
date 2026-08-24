@@ -1,0 +1,46 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parseTodoObject } from '../../../src/parsers/ical.js';
+import { encodeRef } from '../../../src/core/ids.js';
+
+const ref = {
+  collectionUrl: 'https://caldav.icloud.com/1/calendars/reminders/',
+  resourceUrl: 'https://caldav.icloud.com/1/calendars/reminders/x.ics',
+};
+
+const fixture = (name: string): string =>
+  readFileSync(join(process.cwd(), 'tests/fixtures/calendar', name), 'utf8');
+
+describe('parseTodoObject', () => {
+  it('reads title, notes, due and priority', () => {
+    const [todo] = parseTodoObject(fixture('todo-basic.ics'), ref);
+    expect(todo!.title).toBe('买咖啡豆');
+    expect(todo!.notes).toBe('曼特宁，中深烘');
+    expect(todo!.due).toBe('2026-08-15T09:00:00.000Z');
+    expect(todo!.priority).toBe(1);
+    expect(todo!.completed).toBe(false);
+  });
+
+  it('derives completed from STATUS and reports the completion instant', () => {
+    const [todo] = parseTodoObject(fixture('todo-completed.ics'), ref);
+    expect(todo!.completed).toBe(true);
+    expect(todo!.completed_at).toBe('2026-08-11T13:30:00.000Z');
+    expect(todo!.percent_complete).toBe(100);
+  });
+
+  it('gives the reminder an opaque id derived from its ref', () => {
+    const [todo] = parseTodoObject(fixture('todo-basic.ics'), ref);
+    expect(todo!.reminder_id).toBe(encodeRef(ref));
+    expect(todo!.uid).toBe('todo-001');
+  });
+
+  it('handles a DATE-valued due without shifting it by the host timezone', () => {
+    const [todo] = parseTodoObject(fixture('todo-with-extras.ics'), ref);
+    expect(todo!.due!.slice(0, 10)).toBe('2026-09-01');
+  });
+
+  it('returns an empty array when the object holds no VTODO', () => {
+    expect(parseTodoObject(fixture('all-day.ics'), ref)).toEqual([]);
+  });
+});
