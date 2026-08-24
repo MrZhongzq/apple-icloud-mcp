@@ -139,7 +139,7 @@ function parseAccount(
 
   const notice = mailCapable
     ? undefined
-    : `账号 ${label}：发信地址 ${sender} 不是 iCloud 邮箱地址，该账号的邮件工具已禁用（日历不受影响）。` +
+    : `账号 ${label}：发信地址 ${sender} 不是 iCloud 邮箱地址，该账号的邮件工具已禁用（日历、提醒事项与通讯录不受影响）。` +
       `如果这是一个 iCloud Mail 账号，请设置 ICLOUD_SENDER${suffix} 为你的 iCloud 邮箱地址` +
       `（@icloud.com / @me.com / @mac.com / @icloud.com.cn）；` +
       `如果你没有 iCloud 邮箱，说明该账号并未使用 iCloud Mail，仅日历功能可用。`;
