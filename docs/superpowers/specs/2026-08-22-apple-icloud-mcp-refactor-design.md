@@ -232,7 +232,7 @@ vCard 的解析与生成在 `parsers/vcard.ts`，模型只见结构化字段。
 **针对真实 iCloud 账号的实测结论（2026-08-24，1429 个联系人）**，本节的实现据此确定：
 
 - iCloud CardDAV **不支持 `addressbook-query` REPORT**（返回 `400 Bad Request: Didn't understand the report`）。`supported-report-set` 只声明 `sync-collection` 与 `addressbook-multiget`。因此服务端过滤不可用。
-- `contacts_search` 改为：首次全量拉取并记录 `sync-token`（实测 1429 张卡 6.9 秒 / 305 KB），后续带 token 走 `sync-collection` 只取变更集，匹配在会话缓存内完成。缓存随会话生命周期存续，由服务器的变更集保证新鲜度。
+- `contacts_search` 改为：首次全量拉取并记录 `sync-token`（实测 1429 张卡约 4.5 秒），后续带 token 走 `sync-collection` 只取变更集，匹配在会话缓存内完成。（性能数字于 2026-08-25 经落地实现复测：不带 token 的 sync-collection 全量约 4.5 秒，无变更的增量同步约 0.4 秒。此前记录的 6.9 秒来自设计期的另一条路径，不是当前实现。）缓存随会话生命周期存续，由服务器的变更集保证新鲜度。
 - iCloud 下发的 vCard 版本为 **3.0**（非 4.0）。解析层仍需容忍 4.0，但 fixture 以 3.0 为主。
 - 实际出现的属性集中在 `FN`/`N`/`ORG`/`TEL`/`EMAIL`/`ADR`/`TITLE`/`UID`/`REV`/`PRODID`；单张平均 218 字节，最大 1496 字节。
 - **`PHOTO` 极少但存在**（1429 张中有 2 张）。`contacts_read` 只返回是否存在头像，绝不把 base64 放进响应。
