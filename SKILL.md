@@ -74,6 +74,8 @@ This server exposes 25 tools for Apple iCloud Mail, Calendar, Reminders, and Con
 
 **Clearing rules on `patch` (and on `contacts_create`'s scalar fields) mirror reminders' `due`, extended to two shapes.** Scalar fields (`nickname`, `organization`, `department`, `title`, `birthday`, `note`) are three-state: omit to leave unchanged, send a string to set it, send `null` to clear it. Array fields (`emails`, `phones`, `addresses`, `urls`, `impp`) are whole-value replacement, not append: omit to leave unchanged, send the full new array to replace every existing entry, send `[]` to clear all of them. There is no operation to add or remove a single email/phone/address in place — send the complete array you want.
 
+**`birthday` takes exactly two shapes: `1990-05-20` (`YYYY-MM-DD`) or `--05-20` (`--MM-DD`, when the year is unknown).** Anything else — a natural-language date like `next tuesday`, a year on its own, `1990/05/20` — is rejected with `INVALID_INPUT`, on both `contacts_create` and `contacts_update`. Convert whatever the user said into one of those two forms before sending it; do not pass their words through. Reading a contact back, `birthday` is absent when the stored value is not one of these shapes, and a birthday Apple stored with no year comes back as `--MM-DD` (never with a placeholder year such as 1604).
+
 **`contact_id` and `address_book_id` are opaque strings**, exactly like every other id in this server — never parsed, constructed, or truncated; always the exact value a previous tool call returned. Same etag rule too: `expected_etag` is an optional optimistic-concurrency input, but neither id ever contains one.
 
 ## Three interface conventions
