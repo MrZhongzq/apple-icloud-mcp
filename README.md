@@ -1,8 +1,8 @@
 # Apple iCloud MCP Server
 
-A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP) and **Calendar** (CalDAV) as tools for AI agents, over the stdio transport. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
+A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP), **Calendar** (CalDAV), and **Reminders** (CalDAV) as tools for AI agents, over the stdio transport. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
 
-**Not supported, and not planned for this approach:** iCloud Notes. Apple provides no standard protocol for Notes (no IMAP/CalDAV equivalent) that works with an App-Specific Password, so there is no way to implement this without reverse-engineering a private, unsupported API. Reminders and Contacts are planned for phase two (they reuse the CalDAV/CardDAV machinery already in place here); they are not available yet.
+**Not supported, and not planned for this approach:** iCloud Notes. Apple provides no standard protocol for Notes (no IMAP/CalDAV equivalent) that works with an App-Specific Password, so there is no way to implement this without reverse-engineering a private, unsupported API. Contacts is planned for a later phase (it reuses the CardDAV machinery already in place here); it is not available yet.
 
 ## Prerequisites
 
@@ -24,6 +24,8 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 | `ALLOW_MAIL_WRITE_1` | no | `false` | Write (send/mark/move/delete) defaults to **off** — must be explicitly `true`. |
 | `ALLOW_CALENDAR_READ_1` | no | `true` | Read defaults to **on**. |
 | `ALLOW_CALENDAR_WRITE_1` | no | `false` | Write (create/update/delete) defaults to **off** — must be explicitly `true`. |
+| `ALLOW_REMINDERS_READ_1` | no | `true` | Read defaults to **on**. |
+| `ALLOW_REMINDERS_WRITE_1` | no | `false` | Write (create/update/delete) defaults to **off** — must be explicitly `true`. |
 | `ICLOUD_ACCOUNT_2` .. `_5`, `ICLOUD_APP_PASSWORD_2` .. `_5`, etc. | no | — | Same fields, repeated per account slot 2–5. |
 | `SESSION_TTL_MINUTES` | no | `30` | A session (from `apple_login`) expires after this many minutes of inactivity. |
 | `IMAP_IDLE_TIMEOUT_SECONDS` | no | `300` | IMAP idle/connection timeout. |
@@ -106,14 +108,14 @@ printf '%s\n' \
   | node dist/bin/stdio.js
 ```
 
-A healthy server answers on stdout with 15 tools (3 session + 7 mail + 5 calendar) and writes only logs to stderr. Eight tools means the mail set was disabled — check the sender-domain notice on stderr.
+A healthy server answers on stdout with 20 tools (3 session + 7 mail + 5 calendar + 5 reminders) and writes only logs to stderr. Thirteen tools means the mail set was disabled — check the sender-domain notice on stderr.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Server exits immediately, stderr says no accounts configured | No `ICLOUD_ACCOUNT_1` reached the process | Check the `env` block in your client config, or that `.env` sits at the repo root. The message names the variables it needs. |
-| Only 8 tools; stderr carries a notice about the sender address | The effective sender is not an iCloud mail domain, so mail was disabled | Set `ICLOUD_SENDER_1` to your `@icloud.com` address. If you have none, that account does not use iCloud Mail — calendar still works. |
+| Only 13 tools; stderr carries a notice about the sender address | The effective sender is not an iCloud mail domain, so mail was disabled | Set `ICLOUD_SENDER_1` to your `@icloud.com` address. If you have none, that account does not use iCloud Mail — calendar and reminders still work. |
 | `AUTH_FAILED` — "iCloud 拒绝了这组凭据" | Wrong, revoked, or mistyped App-Specific Password; or an Apple ID without two-factor authentication | Regenerate the password at appleid.apple.com. Note that if only *mail* fails while calendar works, the password is fine — it is the sender address (row above). |
 | `PERMISSION_DENIED` naming an `ALLOW_…` variable | That capability is off; writes default to off | Set the named variable to `true` and restart the client so the server relaunches. |
 | `PERMISSION_DENIED` with no variable named | iCloud itself refused the write on that calendar — usually a subscribed or shared read-only one | Pass a different `calendar_id` from `calendar_list`. |
@@ -142,6 +144,11 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 | `calendar_create_event` | Create an event from structured fields (no hand-written iCal needed). |
 | `calendar_update_event` | Patch an existing event; only the fields given change. |
 | `calendar_delete_event` | Delete an event (whole series or a single occurrence via `scope`). |
+| `reminders_lists` | List reminder (VTODO) lists with their opaque `list_id` and `writable` status. |
+| `reminders_list` | Query reminders by list, completion state, and due-date range. |
+| `reminders_create` | Create a reminder from structured fields. |
+| `reminders_update` | Patch an existing reminder; only the fields given change. |
+| `reminders_delete` | Delete a reminder. Cannot be undone. |
 
 ## Limitations to know before you rely on this
 
@@ -164,8 +171,8 @@ npm run test:integration # live iCloud tests: requires .env.test, see below
 
 `npm run test:integration` runs `tests/integration/live.test.ts` against a **real** iCloud account, using `vitest.integration.config.ts`. It is skipped entirely — cleanly, with no failure — unless a `.env.test` file exists at the repo root. To run it:
 
-1. Create a dedicated calendar in iCloud for testing (e.g. named `MCP-Test`) — the suite only ever writes to this calendar, never your real ones.
-2. `cp .env.test.example .env.test` and fill in real credentials plus `INTEGRATION_CALENDAR_NAME` matching the calendar you just made.
+1. Create a dedicated calendar and a dedicated reminder list in iCloud for testing (e.g. both named `MCP-Test`) — the suite only ever writes to these, never your real ones. If either is missing, its test fails with a message telling you to create it; it never falls back to writing into another calendar or list.
+2. `cp .env.test.example .env.test` and fill in real credentials plus `INTEGRATION_CALENDAR_NAME` and `INTEGRATION_REMINDER_LIST_NAME` matching what you just created.
 3. `npm run test:integration`.
 
 `.env.test` is gitignored; never commit it.

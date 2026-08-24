@@ -67,6 +67,35 @@ describe('registerAllTools', () => {
     expect(names).toContain('mail_search');
   });
 
+  it('registers reminder tools when only one of several accounts enables reminders', () => {
+    // A single-account fixture can't tell .some() from .every() -- under one account
+    // they agree. This asserts the reminder tools register when account 1 has reminders
+    // off and only account 2 has it on, which .every() would get wrong.
+    const { server, names } = collect();
+    const config = loadConfig({
+      ...base,
+      ALLOW_REMINDERS_READ_1: 'false',
+      ALLOW_REMINDERS_WRITE_1: 'false',
+      ICLOUD_ACCOUNT_2: 'work@icloud.com',
+      ICLOUD_APP_PASSWORD_2: 'abcd-efgh-ijkl-mnop',
+      ALLOW_REMINDERS_READ_2: 'true',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names).toContain('reminders_lists');
+  });
+
+  it('omits reminder tools entirely when every account has reminders disabled', () => {
+    const { server, names } = collect();
+    const config = loadConfig({
+      ...base,
+      ALLOW_REMINDERS_READ_1: 'false',
+      ALLOW_REMINDERS_WRITE_1: 'false',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names.some((n) => n.startsWith('reminders_'))).toBe(false);
+    expect(names).toContain('calendar_list_events');
+  });
+
   it('registers mail tools when account 1 has a non-iCloud sender but account 2 has a valid iCloud sender', () => {
     const { server, names } = collect();
     const config = loadConfig({

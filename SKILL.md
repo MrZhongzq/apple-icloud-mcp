@@ -1,11 +1,11 @@
 ---
 name: apple-icloud-mcp-skill
-description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar over stdio).
+description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders over stdio).
 ---
 
 # Apple iCloud MCP Server — AI Client Contract
 
-This server exposes 15 tools for Apple iCloud Mail and Calendar. Read this before calling any of them.
+This server exposes 20 tools for Apple iCloud Mail, Calendar, and Reminders. Read this before calling any of them.
 
 ## Workflow
 
@@ -14,7 +14,7 @@ This server exposes 15 tools for Apple iCloud Mail and Calendar. Read this befor
 3. **Do the work** — every other tool call requires the `session_id` from step 2, passed as the `session_id` argument.
 4. **`work_done`** — call this once you have completely finished the user's task and no longer need iCloud access. It destroys the session and closes the underlying connections. Do not skip this at the end of a task.
 
-## The 15 tools
+## The 20 tools
 
 ### Session (no `session_id` needed for the first one)
 
@@ -40,9 +40,23 @@ This server exposes 15 tools for Apple iCloud Mail and Calendar. Read this befor
 - `calendar_update_event({ session_id, event_id, patch, scope?, recurrence_id?, expected_etag? })` → the updated `CalendarEvent`. `patch` carries only the fields to change. See "scope and recurrence_id" below.
 - `calendar_delete_event({ session_id, event_id, scope?, recurrence_id?, expected_etag? })` → `{ deleted: true }`. Cannot be undone. Same `scope`/`recurrence_id` rules as update.
 
+### Reminders (all require `session_id`)
+
+- `reminders_lists({ session_id })` → `{ list_id, name, color?, writable }[]`. `list_id` is opaque, for use with the other reminder tools.
+- `reminders_list({ session_id, list_ids?, completed?, due_before?, due_after?, limit? })` → `{ reminders: Reminder[], partial_failures?: { list_id, name, reason }[] }`. Leave `list_ids` empty to query every list. One list failing to read (subscribed/shared list gone stale, 403, timeout) never blocks the rest — that list shows up in `partial_failures` instead, so tell the user which list is broken rather than treating the whole call as failed.
+- `reminders_create({ session_id, list_id?, reminder })` → the created `Reminder`. `list_id` omitted → written to the first writable list. `reminder.priority` and `reminder.due` follow the rules below.
+- `reminders_update({ session_id, reminder_id, patch, expected_etag? })` → the updated `Reminder`. `patch` carries only the fields to change.
+- `reminders_delete({ session_id, reminder_id, expected_etag? })` → `{ deleted: true }`. Cannot be undone.
+
+**`priority` is iCal's 0–9 scale, and it runs backwards from intuition:** smaller numbers are *higher* priority. Apple's own clients use `1` = high, `5` = medium, `9` = low, `0` = unset/none. Do not map "priority 9" to "urgent" — that is exactly reversed. When a user says "high priority," send `1`, not `9`.
+
+**`due` is three-state, not the usual optional field.** Omitting it from `patch` leaves the existing due date untouched; sending an ISO 8601 string sets it; sending `null` explicitly *clears* it (Apple's Reminders lets you remove a due date without deleting the reminder, and `undefined` was already taken to mean "don't touch this field"). `reminders_create`'s `reminder.due` accepts a string or omission (no due date at all); only `reminders_update`'s `patch.due` can be `null`.
+
+**`list_id` and `reminder_id` are opaque strings**, exactly like `calendar_id`/`event_id` — never parsed, constructed, or truncated; always the exact value a previous tool call returned. Same etag rule too: `expected_etag` is an optional optimistic-concurrency input, but neither id ever contains one.
+
 ## Three interface conventions
 
-1. **All ids are opaque strings.** `session_id`, `calendar_id`, `event_id` are not meant to be parsed, constructed, or truncated — always pass through the exact value a previous tool call returned. `calendar_id` and `event_id` are stable identifiers for the resource; they never contain a CalDAV etag (etags are used internally for optimistic-concurrency checks via `expected_etag`, but they never appear as, or inside, an id you handle).
+1. **All ids are opaque strings.** `session_id`, `calendar_id`, `event_id`, `list_id`, `reminder_id` are not meant to be parsed, constructed, or truncated — always pass through the exact value a previous tool call returned. These are stable identifiers for the resource; they never contain a CalDAV etag (etags are used internally for optimistic-concurrency checks via `expected_etag`, but they never appear as, or inside, an id you handle).
 2. **Calendar events are structured objects, not iCal text.** Build/read events through fields (`title`, `start`, `end`, `all_day`, `location`, `description`, `url`, `recurrence`, `alarms`), never by hand-writing `.ics`/VEVENT data. This applies to both `calendar_create_event`'s `event` and `calendar_update_event`'s `patch`.
 3. **Every timestamp is ISO 8601 with an explicit offset**, e.g. `2026-09-10T14:00:00+08:00` or `...Z` for UTC. This applies to `mail_search`'s `since`/`before`, and to `calendar_list_events`'s `start`/`end`, and to event `start`/`end`. Do not send a bare local time with no offset.
 
@@ -79,4 +93,4 @@ Every failed call returns `{ error: { code, message, hint?, retryable } }` with 
 
 ## Not supported
 
-iCloud Notes cannot be accessed by this server — Apple provides no standard protocol for Notes that works with an App-Specific Password. Do not attempt to read them via `mail_*` tools. Attachments cannot be downloaded (`mail_read` reports metadata only) or sent (`mail_send` has no attach parameter). Reminders and Contacts are not available in this phase.
+iCloud Notes cannot be accessed by this server — Apple provides no standard protocol for Notes that works with an App-Specific Password. Do not attempt to read them via `mail_*` tools. Attachments cannot be downloaded (`mail_read` reports metadata only) or sent (`mail_send` has no attach parameter). Contacts is not available in this phase.

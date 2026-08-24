@@ -5,6 +5,7 @@ import { loadConfig } from '../../src/core/config.js';
 import { createProviders } from '../../src/providers/icloud/index.js';
 import { createMailService } from '../../src/modules/mail/service.js';
 import { createCalendarService } from '../../src/modules/calendar/service.js';
+import { createReminderService } from '../../src/modules/reminders/service.js';
 import type { SessionProviders } from '../../src/core/session.js';
 
 const envPath = join(process.cwd(), '.env.test');
@@ -113,5 +114,38 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
     expect(updated.location).toBe('测试地点');
 
     await expect(service.deleteEvent(created.event_id)).resolves.toEqual({ deleted: true });
+  });
+
+  it('detects a VTODO list and round-trips a reminder', async () => {
+    // Same convention as the dedicated test calendar above: writes are confined to a
+    // list the user designated by name, and this test never falls back to any other
+    // list. If it doesn't exist, fail with instructions to create it manually --
+    // writing into a list the user didn't designate would put test data into their
+    // real reminders.
+    const config = loadConfig(env);
+    const service = createReminderService({
+      account: config.accounts[0]!,
+      caldav: providers.caldav,
+    });
+
+    const listName = env.INTEGRATION_REMINDER_LIST_NAME ?? 'MCP-Test';
+    const lists = await service.listLists();
+    const target = lists.find((l) => l.name === listName);
+    if (!target) {
+      throw new Error(`未找到测试提醒列表 ${listName}，请先在 iCloud 提醒事项中手动创建它`);
+    }
+
+    const created = await service.create(
+      { title: 'MCP 集成测试提醒' },
+      target.list_id,
+    );
+    expect(created.title).toBe('MCP 集成测试提醒');
+    expect(created.completed).toBe(false);
+
+    const completed = await service.update(created.reminder_id, { completed: true });
+    expect(completed.completed).toBe(true);
+    expect(completed.completed_at).toBeDefined();
+
+    await expect(service.remove(completed.reminder_id)).resolves.toEqual({ deleted: true });
   });
 });

@@ -1,8 +1,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createMailService } from '../modules/mail/service.js';
 import { createCalendarService } from '../modules/calendar/service.js';
+import { createReminderService } from '../modules/reminders/service.js';
 import { registerMailTools } from '../modules/mail/tools.js';
 import { registerCalendarTools } from '../modules/calendar/tools.js';
+import { registerReminderTools } from '../modules/reminders/tools.js';
 import { registerSessionTools } from '../modules/session/tools.js';
 import type { AppConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
@@ -26,6 +28,9 @@ export function registerAllTools(server: ToolRegistrar, deps: ServerDeps): void 
   const anyCalendar = config.accounts.some(
     (a) => a.capabilities.calendarRead || a.capabilities.calendarWrite,
   );
+  const anyReminders = config.accounts.some(
+    (a) => a.capabilities.remindersRead || a.capabilities.remindersWrite,
+  );
 
   if (anyMail) {
     registerMailTools(server, {
@@ -46,6 +51,15 @@ export function registerAllTools(server: ToolRegistrar, deps: ServerDeps): void 
       logger,
       calendarFor: (session: Session) =>
         createCalendarService({ account: session.account, caldav: session.providers.caldav }),
+    });
+  }
+
+  if (anyReminders) {
+    registerReminderTools(server, {
+      sessions,
+      logger,
+      reminderFor: (session: Session) =>
+        createReminderService({ account: session.account, caldav: session.providers.caldav }),
     });
   }
 }
