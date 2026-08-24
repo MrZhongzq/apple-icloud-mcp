@@ -703,6 +703,14 @@ smartCollectionSyncDetailed(params: { collection: T; method?: 'basic' | 'webdav'
 | 412 | `CONFLICT` | 该联系人已被其他客户端修改，重新读取后再提交 |
 | 5xx / 网络 | `UPSTREAM_ERROR` | `retryable: true` |
 
+### `readOnly` 恒为 false —— 这是有意的，但必须写明理由
+
+CardDAV 这边**不做权限探测**，`AddressBookInfo.readOnly` 直接写死 `false`。这与日历侧不同（`caldav.ts` 有 `hasWritePrivilege` 与 `applyPrivilegeFallback`），所以必须在代码里留注释说明，否则后来者会以为是漏写。
+
+理由：CLAUDE.md 已经记着日历侧的结论——权限探测「fails safe, not closed」，一旦全账号都探测不到可写日历就把全部标成可写，**因为真正的兜底是 `mapCalDavError` 的 403 处理，不是这个 flag**。既然那个 flag 在日历侧都不是真正的守卫，在通讯录侧照抄一套探测逻辑收益很低：iCloud 账号总有至少一个可写通讯簿，且实测账号只有一个通讯簿。403 映射同样是这里的真正兜底。
+
+**要求**：在 `readOnly: false` 那一行上方写注释，说明（a）这里不做权限探测，（b）403 经 `mapCardDavError` 才是真正的兜底，（c）Task 5 服务层的只读检查因此在当前实现下不会触发，但保留它是为了将来真的做探测时不必回头改服务层。Task 7 要把这条写进 README 的限制章节。
+
 - [ ] **Step 1: 写失败测试 `tests/unit/providers/carddav.test.ts`**
 
 ```ts
@@ -713,6 +721,7 @@ import type { AccountConfig } from '../../../src/core/config.js';
 
 const account: AccountConfig = {
   id: 'account_1',
+  label: 'apple-id@gmail.com',
   email: 'apple-id@gmail.com',
   sender: 'alias@icloud.com',
   appPassword: 'xxxx-xxxx-xxxx-xxxx',
@@ -1235,6 +1244,7 @@ const BOOK = 'https://c/1/card/';
 function account(overrides: Partial<AccountConfig['capabilities']> = {}): AccountConfig {
   return {
     id: 'account_1',
+    label: 'a@icloud.com',
     email: 'a@icloud.com',
     sender: 'a@icloud.com',
     appPassword: 'x',
