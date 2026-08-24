@@ -43,6 +43,19 @@ describe('createContactsCache', () => {
     expect(provider.syncSince).toHaveBeenCalledWith('https://c/1/card/', 'tok-1');
   });
 
+  it('forwards the delta token on the refresh after that', async () => {
+    const provider = makeProvider({
+      syncSince: vi.fn().mockResolvedValue({ syncToken: 'tok-2', created: [], updated: [], deleted: [] }),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    await cache.refresh();
+    await cache.refresh();
+    const calls = (provider.syncSince as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0]![1]).toBe('tok-1');
+    expect(calls[1]![1], 'third call must use the token returned by the previous delta').toBe('tok-2');
+  });
+
   it('applies created, updated and deleted from a delta', async () => {
     const provider = makeProvider({
       syncSince: vi.fn().mockResolvedValue({
@@ -94,6 +107,19 @@ describe('createContactsCache', () => {
     expect(provider.syncSince).not.toHaveBeenCalled();
   });
 
+  it('drops the stored token when a delta returns none, forcing a full fetch next time', async () => {
+    const provider = makeProvider({
+      syncSince: vi.fn().mockResolvedValue({ created: [], updated: [], deleted: [] }),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    await cache.refresh();
+    expect(cache.snapshot()[0]!.syncToken).toBeUndefined();
+
+    await cache.refresh();
+    expect(provider.fetchAll, 'losing the token must fall back to a full fetch, not an incremental sync with undefined').toHaveBeenCalledTimes(2);
+  });
+
   it('keeps other address books when one fails', async () => {
     const provider = makeProvider({
       listAddressBooks: vi.fn().mockResolvedValue([
@@ -109,6 +135,24 @@ describe('createContactsCache', () => {
     const books = await cache.refresh();
     expect(books.map((b) => b.name)).toEqual(['好的']);
     expect(cache.size()).toBe(1);
+  });
+
+  it('keeps a previously loaded book when a later refresh fails', async () => {
+    let failNow = false;
+    const provider = makeProvider({
+      syncSince: vi.fn().mockImplementation(async () => {
+        if (failNow) throw new Error('boom');
+        return { syncToken: 'tok-2', created: [], updated: [], deleted: [] };
+      }),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    expect(cache.size()).toBe(1);
+
+    failNow = true;
+    const books = await cache.refresh();
+    expect(books, 'a book that fails does not appear in the return value').toHaveLength(0);
+    expect(cache.size(), 'but the snapshot still holds the last successful data').toBe(1);
   });
 
   it('keeps sibling cards when one card fails to parse', async () => {
@@ -134,6 +178,19 @@ describe('createContactsCache', () => {
     cache.invalidate('https://c/1/card/');
     await cache.refresh();
     expect(provider.fetchAll).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps cached cards usable between invalidate and the next refresh', async () => {
+    // invalidate must only clear the token and keep cards. Replacing it with a
+    // whole-entry delete leaves all other tests green, so this has to observe
+    // the map state after invalidate and before the next refresh.
+    const provider = makeProvider();
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    expect(cache.size()).toBe(1);
+    cache.invalidate('https://c/1/card/');
+    expect(cache.size(), 'invalidate must not discard cards; stale data stays usable after a write').toBe(1);
+    expect(cache.snapshot()[0]!.syncToken, 'invalidate must clear the token').toBeUndefined();
   });
 
   it('returns an empty snapshot before the first refresh, without touching the network', () => {
