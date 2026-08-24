@@ -31,13 +31,23 @@ describe('parseVCard', () => {
   });
 
   it('flattens a structured segment that itself parsed as an array', () => {
-    const c = parseVCard(card('FN:x', 'ADR;type=WORK:;;某路 1 号\\, 5 楼;上海;;200000;中国'), ref);
+    // 裸逗号是 vCard 合法的多值分隔符，ical.js 会把该段解析成数组。
+    // 这是唯一走得到 flattenSegment 的输入形态 —— 转义逗号不会触发它。
+    const c = parseVCard(card('FN:x', 'ADR;type=WORK:;;某路 1 号, 5 楼;上海;;200000;中国'), ref);
     const addr = c.addresses![0]!;
     expect(addr.street).toBe('某路 1 号, 5 楼');
     expect(addr.city).toBe('上海');
     expect(addr.postal_code).toBe('200000');
     expect(addr.country).toBe('中国');
     expect(addr.type).toEqual(['work']);
+  });
+
+  it('keeps an escaped comma literal instead of splitting on it', () => {
+    // 用 String.fromCharCode(92) 构造反斜杠：字面反斜杠会在多层工具链里被折叠，
+    // 这正是这条事实最初被写反的原因。
+    const bs = String.fromCharCode(92);
+    const c = parseVCard(card('FN:x', 'ADR:;;某路 1 号' + bs + ', 5 楼;上海;;200000;中国'), ref);
+    expect(c.addresses![0]!.street).toBe('某路 1 号, 5 楼');
   });
 
   it('splits ORG into organization and department', () => {
