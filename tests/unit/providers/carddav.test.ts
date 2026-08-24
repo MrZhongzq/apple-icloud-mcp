@@ -49,6 +49,9 @@ function providerWith(client: Record<string, unknown>) {
   });
 }
 
+/** 守卫测试用的最小卡片；刻意不含转义序列。 */
+const CARD = 'BEGIN:VCARD';
+
 describe('createCardDavProvider', () => {
   it('authenticates with account.email, never account.sender', async () => {
     const createClient = vi.fn().mockResolvedValue(fakeClient());
@@ -90,13 +93,27 @@ describe('createCardDavProvider', () => {
   it('never asks tsdav to enumerate a collection via fetchVCards without objectUrls', async () => {
     // tsdav 的 fetchVCards 在缺少 objectUrls 时会内部调用 addressBookQuery
     // （tsdav.esm.js:741），而 iCloud 对该 REPORT 返回 400。fetchAll 已经改用
-    // smartCollectionSyncDetailed，不再走 fetchVCards——这里只剩 fetchOne 会
-    // 调用它，约束仍然是"每一次 fetchVCards 调用都必须带 objectUrls"。
-    const fetchVCards = vi.fn().mockResolvedValue([]);
-    const provider = providerWith(fakeClient({ fetchVCards }));
+    // smartCollectionSyncDetailed，不再走 fetchVCards；剩下两个调用点是 fetchOne
+    // 与 create 的 etag 回读，两个都必须带 objectUrls。
+    const fetchVCards = vi.fn().mockResolvedValue([{ url: 'https://c/a.vcf', etag: 'e1', data: CARD }]);
+    const provider = providerWith(
+      fakeClient({
+        fetchVCards,
+        // 不返回 ETag，逼出 create 的回读路径——否则那个调用点根本不会被触发
+        createVCard: vi
+          .fn()
+          .mockResolvedValue({ ok: true, status: 201, headers: new Headers({ Location: 'https://c/a.vcf' }) }),
+      }),
+    );
 
     await provider.fetchOne('https://contacts.icloud.com/1/card/', 'https://c/a.vcf').catch(() => {});
+    await provider
+      .create({ bookUrl: 'https://contacts.icloud.com/1/card/', filename: 'a.vcf', data: CARD })
+      .catch(() => {});
 
+    // 先断言确实调用过：对空的 mock.calls 做循环会零次迭代、静默通过，
+    // 那正是这一轮要根除的「测试不测任何东西」的形态。
+    expect(fetchVCards.mock.calls.length, '两个调用点都没触发，这条守卫等于没跑').toBe(2);
     for (const call of fetchVCards.mock.calls) {
       const params = call[0] as { objectUrls?: string[] };
       expect(params.objectUrls, 'fetchVCards 不带 objectUrls 会触发 addressbook-query').toBeDefined();
