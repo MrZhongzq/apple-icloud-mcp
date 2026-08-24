@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createContactService } from '../../../src/modules/contacts/service.js';
+import { createContactsCache } from '../../../src/modules/contacts/cache.js';
+import { createLogger } from '../../../src/core/logger.js';
 import { encodeRef, encodeUrl } from '../../../src/core/ids.js';
 import { AppError } from '../../../src/core/errors.js';
 import type { AccountConfig } from '../../../src/core/config.js';
@@ -8,6 +10,7 @@ import type { CardDavProvider } from '../../../src/providers/icloud/carddav.js';
 import { parseVCard } from '../../../src/parsers/vcard.js';
 
 const BOOK = 'https://c/1/card/';
+const silentLogger = createLogger('error', () => {});
 
 function account(overrides: Partial<AccountConfig['capabilities']> = {}): AccountConfig {
   return {
@@ -296,6 +299,35 @@ describe('contact search isolation', () => {
     const result = await svc.search({});
     expect(result.partial_failures, '通讯簿同步失败必须让调用方看见').toHaveLength(1);
     expect(result.partial_failures![0]!.name).toBe('另一本');
+    expect(result.partial_failures![0]!.address_book_id).not.toContain('https://');
+  });
+});
+
+describe('cache and service together', () => {
+  it('surfaces a failed book as partial_failures while still searching the healthy one', async () => {
+    // 这条测的是缓存与服务之间的接缝：两边各自的测试都通过、而接缝错位，
+    // 正是本任务修掉的那个缺陷的形态。所以这里两边都用真实实现，只 mock provider。
+    const carddav = makeCardDav({
+      listAddressBooks: vi.fn().mockResolvedValue([
+        { url: 'https://c/1/good/', name: '好的', readOnly: false },
+        { url: 'https://c/1/bad/', name: '坏的', readOnly: false },
+      ]),
+      fetchAll: vi.fn().mockImplementation(async (url: string) => {
+        if (url.includes('bad')) throw new Error('boom');
+        return {
+          objects: [{ url: 'https://c/1/good/a.vcf', etag: 'e1', data: card('张三') }],
+          syncToken: 't',
+        };
+      }),
+    });
+    const cache = createContactsCache({ carddav, logger: silentLogger });
+    const svc = createContactService({ account: account(), carddav, cache });
+
+    const result = await svc.search({ query: '张' });
+
+    expect(result.contacts.map((c) => c.name.full), '健康的通讯簿照常返回结果').toEqual(['张三']);
+    expect(result.partial_failures, '失败的通讯簿必须让调用方看见').toHaveLength(1);
+    expect(result.partial_failures![0]!.name).toBe('坏的');
     expect(result.partial_failures![0]!.address_book_id).not.toContain('https://');
   });
 });

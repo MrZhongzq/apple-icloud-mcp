@@ -120,7 +120,7 @@ describe('createContactsCache', () => {
     expect(provider.fetchAll, 'losing the token must fall back to a full fetch, not an incremental sync with undefined').toHaveBeenCalledTimes(2);
   });
 
-  it('keeps other address books when one fails', async () => {
+  it('reports a failed book instead of dropping it silently, without disturbing the healthy one', async () => {
     const provider = makeProvider({
       listAddressBooks: vi.fn().mockResolvedValue([
         { url: 'https://c/1/bad/', name: '坏的', readOnly: false },
@@ -136,6 +136,7 @@ describe('createContactsCache', () => {
     expect(books.map((b) => b.name)).toEqual(['好的']);
     expect(failures, 'a book that never synced before must not be silently dropped').toHaveLength(1);
     expect(failures[0]!.name).toBe('坏的');
+    expect(failures[0]!.reason).toContain('boom');
     expect(cache.size()).toBe(1);
   });
 
@@ -156,42 +157,6 @@ describe('createContactsCache', () => {
     expect(books, 'stale but still-cached data must be served rather than dropped').toHaveLength(1);
     expect(failures, 'and the caller must still be told this book failed to sync').toHaveLength(1);
     expect(cache.size(), 'the snapshot still holds the last successful data').toBe(1);
-  });
-
-  it('reports a failed book instead of dropping it silently', async () => {
-    const provider = makeProvider({
-      listAddressBooks: vi.fn().mockResolvedValue([
-        { url: 'https://c/1/bad/', name: '坏的', readOnly: false },
-        { url: 'https://c/1/good/', name: '好的', readOnly: false },
-      ]),
-      fetchAll: vi.fn().mockImplementation(async (url: string) => {
-        if (url.includes('bad')) throw new Error('boom');
-        return { objects: [{ url: 'https://c/1/good/a.vcf', etag: 'e1', data: card('张三', 'U1') }], syncToken: 't' };
-      }),
-    });
-    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
-    const { books, failures } = await cache.refresh();
-    expect(books.map((b) => b.name)).toEqual(['好的']);
-    expect(failures).toHaveLength(1);
-    expect(failures[0]!.name).toBe('坏的');
-    expect(failures[0]!.reason).toContain('boom');
-  });
-
-  it('serves a stale copy of a book that fails on a later refresh, and still reports it', async () => {
-    let failNow = false;
-    const provider = makeProvider({
-      syncSince: vi.fn().mockImplementation(async () => {
-        if (failNow) throw new Error('boom');
-        return { syncToken: 'tok-2', created: [], updated: [], deleted: [] };
-      }),
-    });
-    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
-    await cache.refresh();
-
-    failNow = true;
-    const { books, failures } = await cache.refresh();
-    expect(books, '有旧快照就继续供上，不要凭空少一本').toHaveLength(1);
-    expect(failures, '但必须同时告诉调用方这本可能是旧的').toHaveLength(1);
   });
 
   it('keeps sibling cards when one card fails to parse', async () => {
