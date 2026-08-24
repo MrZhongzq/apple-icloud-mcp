@@ -100,6 +100,28 @@ describe('CalendarService.listCalendars', () => {
     });
     expect(calendars[1]!.writable).toBe(false);
   });
+
+  it('excludes a VTODO-only collection from the calendar list', async () => {
+    const caldav = makeCalDav({
+      listCalendars: vi.fn().mockResolvedValue([
+        { url: HOME, name: '个人', readOnly: false, components: ['VEVENT'] },
+        { url: `${HOME}reminders/`, name: '提醒', readOnly: false, components: ['VTODO'] },
+      ]),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    const calendars = await service.listCalendars();
+    expect(calendars.map((c) => c.name)).toEqual(['个人']);
+  });
+
+  it('still includes a collection that declares no components', async () => {
+    const caldav = makeCalDav({
+      listCalendars: vi.fn().mockResolvedValue([
+        { url: HOME, name: '未声明', readOnly: false, components: [] },
+      ]),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    expect(await service.listCalendars()).toHaveLength(1);
+  });
 });
 
 describe('CalendarService.listEvents', () => {
