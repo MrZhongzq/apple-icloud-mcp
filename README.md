@@ -179,5 +179,5 @@ npm run test:integration # live iCloud tests: requires .env.test, see below
 
 ## What's not here yet
 
-- **Reminders and Contacts** (phase two): planned to reuse this server's CalDAV provider and iCal parsing layer (Reminders are VTODO) plus a new CardDAV provider (Contacts).
+- **Contacts** (phase two): planned to reuse this server's authentication/session machinery plus a new CardDAV provider and vCard parsing layer.
 - **Remote HTTP transport with OAuth 2.1** (phase three): this server currently only speaks stdio, for a single local trusted client. A `bin/http.ts` Streamable HTTP transport with a proper authorization server, plus Docker/deployment docs, is planned but not implemented in this repository yet.

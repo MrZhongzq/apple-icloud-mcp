@@ -126,7 +126,7 @@ export function createReminderService(deps: ReminderServiceDeps): ReminderServic
           throw new AppError(
             'NOT_FOUND',
             `以下 list_id 不对应任何提醒列表：${missing.map(encodeUrl).join('、')}`,
-            { hint: '重新调用 reminders_list_lists 获取当前有效的 list_id' },
+            { hint: '重新调用 reminders_lists 获取当前有效的 list_id' },
           );
         }
       }
@@ -212,7 +212,7 @@ export function createReminderService(deps: ReminderServiceDeps): ReminderServic
         const target = lists.find((l) => l.url === decodeUrl(listId));
         if (!target) {
           throw new AppError('NOT_FOUND', '找不到可写入的提醒列表', {
-            hint: '调用 reminders_list_lists 查看可用列表及其 writable 状态',
+            hint: '调用 reminders_lists 查看可用列表及其 writable 状态',
           });
         }
         return writeTo(target);
@@ -222,7 +222,7 @@ export function createReminderService(deps: ReminderServiceDeps): ReminderServic
       const primary = writable[0];
       if (!primary) {
         throw new AppError('NOT_FOUND', '找不到可写入的提醒列表', {
-          hint: '调用 reminders_list_lists 查看可用列表及其 writable 状态',
+          hint: '调用 reminders_lists 查看可用列表及其 writable 状态',
         });
       }
 

@@ -100,20 +100,37 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
       );
     }
 
-    const created = await service.createEvent(
-      {
-        title: 'MCP 集成测试事件',
-        start: '2030-01-01T02:00:00.000Z',
-        end: '2030-01-01T03:00:00.000Z',
-      },
-      target.calendar_id,
-    );
-    expect(created.title).toBe('MCP 集成测试事件');
+    // event_id is tracked outside the try so `finally` can clean up no matter where an
+    // assertion fails; it's cleared the moment deleteEvent() is actually sent (not when
+    // the assertion on its result passes), so a stranded object never lands in the
+    // user's real iCloud calendar and a re-run never piles up duplicates. The cleanup
+    // delete itself is swallowed -- it must never throw over, and mask, the real
+    // assertion failure that's already propagating -- and tolerates the object already
+    // being gone (e.g. the explicit delete below succeeded but a later assertion threw).
+    let eventId: string | undefined;
+    try {
+      const created = await service.createEvent(
+        {
+          title: 'MCP 集成测试事件',
+          start: '2030-01-01T02:00:00.000Z',
+          end: '2030-01-01T03:00:00.000Z',
+        },
+        target.calendar_id,
+      );
+      eventId = created.event_id;
+      expect(created.title).toBe('MCP 集成测试事件');
 
-    const updated = await service.updateEvent(created.event_id, { location: '测试地点' });
-    expect(updated.location).toBe('测试地点');
+      const updated = await service.updateEvent(created.event_id, { location: '测试地点' });
+      expect(updated.location).toBe('测试地点');
 
-    await expect(service.deleteEvent(created.event_id)).resolves.toEqual({ deleted: true });
+      const deleteResult = await service.deleteEvent(created.event_id);
+      eventId = undefined;
+      expect(deleteResult).toEqual({ deleted: true });
+    } finally {
+      if (eventId) {
+        await service.deleteEvent(eventId).catch(() => {});
+      }
+    }
   });
 
   it('detects a VTODO list and round-trips a reminder', async () => {
@@ -135,17 +152,32 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
       throw new Error(`未找到测试提醒列表 ${listName}，请先在 iCloud 提醒事项中手动创建它`);
     }
 
-    const created = await service.create(
-      { title: 'MCP 集成测试提醒' },
-      target.list_id,
-    );
-    expect(created.title).toBe('MCP 集成测试提醒');
-    expect(created.completed).toBe(false);
+    // Same cleanup convention as the calendar test above: reminder_id is tracked outside
+    // the try so `finally` can delete it no matter where an assertion fails, cleared as
+    // soon as the delete is actually sent (not when the assertion on its result passes),
+    // and the cleanup delete itself is swallowed so it can never mask the real failure
+    // or choke on an object that's already gone.
+    let reminderId: string | undefined;
+    try {
+      const created = await service.create(
+        { title: 'MCP 集成测试提醒' },
+        target.list_id,
+      );
+      reminderId = created.reminder_id;
+      expect(created.title).toBe('MCP 集成测试提醒');
+      expect(created.completed).toBe(false);
 
-    const completed = await service.update(created.reminder_id, { completed: true });
-    expect(completed.completed).toBe(true);
-    expect(completed.completed_at).toBeDefined();
+      const completed = await service.update(created.reminder_id, { completed: true });
+      expect(completed.completed).toBe(true);
+      expect(completed.completed_at).toBeDefined();
 
-    await expect(service.remove(completed.reminder_id)).resolves.toEqual({ deleted: true });
+      const removeResult = await service.remove(completed.reminder_id);
+      reminderId = undefined;
+      expect(removeResult).toEqual({ deleted: true });
+    } finally {
+      if (reminderId) {
+        await service.remove(reminderId).catch(() => {});
+      }
+    }
   });
 });
