@@ -340,3 +340,284 @@ export function readContactMeta(text: string): { uid?: string; rev?: string } {
 
   return meta;
 }
+
+// ---------------------------------------------------------------------------
+// 写方向：buildVCard（新建）与 applyContactPatch（原地补丁）。
+//
+// applyContactPatch 必须原地修改已解析的 ICAL.Component，绝不能"解析成模型
+// 再用 buildVCard 重建"——这条规则的血的教训见 parsers/ical.ts 的
+// applyPatchToVevent 与 CLAUDE.md。通讯录风险更大：真实 Apple 卡片带着
+// PHOTO（头像 base64）、X-ABRELATEDNAMES（亲属关系）、X-SOCIALPROFILE、
+// X-APPLE-* 等我们的领域模型根本不表示的属性，尤其 PHOTO——Contact 只暴露
+// has_photo 布尔值，模型里压根没有头像数据，重建必然把它删掉。
+// ---------------------------------------------------------------------------
+
+/** FN 的拼接规则：显式 full 优先，否则按 [family, given] 过滤空值后拼接。 */
+function composeFullName(name: ContactInput['name']): string {
+  const full = name.full?.trim();
+  if (full) return full;
+  return [name.family, name.given].filter((v): v is string => Boolean(v && v.trim())).join(' ');
+}
+
+/** REV 的写入格式，需与 iCloud 一致：不带毫秒的 ISO 8601（UTC）。 */
+function formatRevNow(): string {
+  const now = new Date();
+  const year = String(now.getUTCFullYear()).padStart(4, '0');
+  const month = pad2(now.getUTCMonth() + 1);
+  const day = pad2(now.getUTCDate());
+  const hour = pad2(now.getUTCHours());
+  const minute = pad2(now.getUTCMinutes());
+  const second = pad2(now.getUTCSeconds());
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+}
+
+/**
+ * 扫描卡片上已经使用的 `itemN` 分组编号，返回比现有最大值大 1 的下一个可用
+ * 编号。必须在每次分配前重新扫描（而不是缓存一个全局计数器）：写入方需要
+ * 看到——包括同一次补丁里刚刚为其它字段新增的分组——才能保证不会跟保留下来
+ * 的属性撞号。
+ */
+function nextGroupNumber(root: ICAL.Component): number {
+  let max = 0;
+  for (const prop of root.getAllProperties()) {
+    const group = prop.getParameter('group');
+    if (typeof group !== 'string') continue;
+    const match = /^item(\d+)$/i.exec(group);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max + 1;
+}
+
+/** 基于当前卡片状态创建一个分组编号分配器；每次调用递增，不重新扫描。 */
+function makeGroupAllocator(root: ICAL.Component): () => string {
+  let next = nextGroupNumber(root);
+  return () => `item${next++}`;
+}
+
+/** TYPE 参数的写入：把 type 数组和 primary 合并成一个 TYPE 参数（primary 映射成 pref）。 */
+function assignTypeParams(prop: ICAL.Property, entry: { type?: string[]; primary?: boolean }): void {
+  const types = [...(entry.type ?? [])];
+  if (entry.primary) types.push('pref');
+  if (types.length > 0) prop.setParameter('type', types);
+}
+
+/**
+ * 写入一个可能带自定义标签的可重复属性：先写值和 TYPE，再在需要时分配新的
+ * item 分组并配一条 X-ABLabel。EMAIL/TEL/URL/IMPP/ADR 共用这一实现。
+ */
+function addLabelledProperty(
+  root: ICAL.Component,
+  propName: string,
+  rawValue: string | string[],
+  entry: { type?: string[]; label?: string; primary?: boolean },
+  nextGroup: () => string,
+): void {
+  const prop = root.addPropertyWithValue(propName, rawValue);
+  assignTypeParams(prop, entry);
+  if (entry.label) {
+    const group = nextGroup();
+    prop.setParameter('group', group);
+    const labelProp = root.addPropertyWithValue('x-ablabel', entry.label);
+    labelProp.setParameter('group', group);
+  }
+}
+
+/** ADR 结构化值的 7 段顺序：po_box;extended;street;city;region;postal_code;country。 */
+function addressRawParts(addr: ContactAddress): string[] {
+  return [
+    addr.po_box ?? '',
+    addr.extended ?? '',
+    addr.street ?? '',
+    addr.city ?? '',
+    addr.region ?? '',
+    addr.postal_code ?? '',
+    addr.country ?? '',
+  ];
+}
+
+function writeTypedValues(
+  root: ICAL.Component,
+  propName: string,
+  values: TypedValue[] | undefined,
+  nextGroup: () => string,
+): void {
+  if (!values) return;
+  for (const entry of values) {
+    addLabelledProperty(root, propName, entry.value, entry, nextGroup);
+  }
+}
+
+function writeAddresses(root: ICAL.Component, values: ContactAddress[] | undefined, nextGroup: () => string): void {
+  if (!values) return;
+  for (const addr of values) {
+    addLabelledProperty(root, 'adr', addressRawParts(addr), addr, nextGroup);
+  }
+}
+
+function writeOrg(root: ICAL.Component, organization: string | undefined, department: string | undefined): void {
+  if (!organization && !department) return;
+  if (department) {
+    root.addPropertyWithValue('org', [organization ?? '', department]);
+  } else {
+    root.addPropertyWithValue('org', organization ?? '');
+  }
+}
+
+/**
+ * 从头新建一张 vCard 3.0 卡片。VERSION 必须是卡片的第一个属性——ical.js 的
+ * design-set 探测（`Component#_designSet`）只看 jCal 数组里的第一条属性是
+ * 否是 `version=3.0`，晚写会导致后续属性按错误的 design set（默认的
+ * icalendar，而非 vcard3）解释。
+ */
+export function buildVCard(input: ContactInput): { vcard: string; uid: string } {
+  const fullName = composeFullName(input.name);
+  if (!fullName) {
+    throw new AppError('INVALID_INPUT', '联系人缺少姓名，无法生成 FN');
+  }
+
+  const uid = crypto.randomUUID();
+  const root = new ICAL.Component('vcard');
+  root.addPropertyWithValue('version', '3.0');
+  root.addPropertyWithValue('uid', uid);
+  root.addPropertyWithValue('fn', fullName);
+  root.addPropertyWithValue('n', [
+    input.name.family ?? '',
+    input.name.given ?? '',
+    input.name.middle ?? '',
+    input.name.prefix ?? '',
+    input.name.suffix ?? '',
+  ]);
+
+  if (input.nickname) root.addPropertyWithValue('nickname', input.nickname);
+  writeOrg(root, input.organization ?? undefined, input.department ?? undefined);
+  if (input.title) root.addPropertyWithValue('title', input.title);
+
+  const nextGroup = makeGroupAllocator(root);
+  writeTypedValues(root, 'email', input.emails, nextGroup);
+  writeTypedValues(root, 'tel', input.phones, nextGroup);
+  writeAddresses(root, input.addresses, nextGroup);
+  writeTypedValues(root, 'url', input.urls, nextGroup);
+  writeTypedValues(root, 'impp', input.impp, nextGroup);
+
+  if (input.birthday) root.addPropertyWithValue('bday', input.birthday);
+  if (input.note) root.addPropertyWithValue('note', input.note);
+  root.addPropertyWithValue('rev', formatRevNow());
+
+  return { vcard: root.toString(), uid };
+}
+
+/** 标量字段的"先删后加"写入：patch 里缺省该字段（undefined）则完全不碰；`null` 只删不加。 */
+function setScalar(root: ICAL.Component, name: string, value: string | null | undefined): void {
+  if (value === undefined) return;
+  root.removeAllProperties(name);
+  if (value === null) return;
+  root.addPropertyWithValue(name, value);
+}
+
+/** name 是结构化字段，补丁给出即整体替换 N/FN；省略则完全不碰。 */
+function patchName(root: ICAL.Component, name: ContactInput['name'] | undefined): void {
+  if (name === undefined) return;
+  const fullName = composeFullName(name);
+  if (!fullName) {
+    throw new AppError('INVALID_INPUT', '联系人缺少姓名，无法生成 FN');
+  }
+  root.removeAllProperties('fn');
+  root.addPropertyWithValue('fn', fullName);
+  root.removeAllProperties('n');
+  root.addPropertyWithValue('n', [
+    name.family ?? '',
+    name.given ?? '',
+    name.middle ?? '',
+    name.prefix ?? '',
+    name.suffix ?? '',
+  ]);
+}
+
+/**
+ * ORG 是单条属性里塞了 organization;department 两段，而补丁把它们拆成两个
+ * 独立标量字段——只碰 patch 里出现的那一半，另一半沿用卡片上已有的值，最后
+ * 一起重写整条 ORG（`null` 视作清空那一半）。
+ */
+function patchOrg(root: ICAL.Component, patch: Partial<ContactInput>): void {
+  if (patch.organization === undefined && patch.department === undefined) return;
+  const current = orgFrom(root);
+  const organization = patch.organization === undefined ? current.organization : (patch.organization ?? undefined);
+  const department = patch.department === undefined ? current.department : (patch.department ?? undefined);
+  root.removeAllProperties('org');
+  writeOrg(root, organization, department);
+}
+
+/** 删除即将被替换掉的属性所属分组的 X-ABLabel，避免留下指向不存在属性的孤儿标签。 */
+function removeGroupedLabels(root: ICAL.Component, groups: Set<string>): void {
+  if (groups.size === 0) return;
+  for (const label of root.getAllProperties('x-ablabel')) {
+    const group = label.getParameter('group');
+    if (typeof group === 'string' && groups.has(group)) root.removeProperty(label);
+  }
+}
+
+/**
+ * 可重复字段的整体替换语义：给出数组就把该属性的现有条目全删再按新数组写
+ * 入，省略（undefined）则完全不碰。**顺序不能反**——必须先把待删属性的
+ * group 参数收集进 `groups`，再删除属性本身；删除之后 group 就再也读不到
+ * 了，也就找不到该删哪些 X-ABLabel。
+ */
+function replaceTypedValues(root: ICAL.Component, propName: string, values: TypedValue[] | undefined): void {
+  if (values === undefined) return;
+  const groups = new Set<string>();
+  for (const prop of root.getAllProperties(propName)) {
+    const group = prop.getParameter('group');
+    if (typeof group === 'string') groups.add(group);
+    root.removeProperty(prop);
+  }
+  removeGroupedLabels(root, groups);
+
+  const nextGroup = makeGroupAllocator(root);
+  for (const entry of values) {
+    addLabelledProperty(root, propName, entry.value, entry, nextGroup);
+  }
+}
+
+/** 同 replaceTypedValues，但用于 ADR（结构化的 7 段地址值）。 */
+function replaceAddresses(root: ICAL.Component, values: ContactAddress[] | undefined): void {
+  if (values === undefined) return;
+  const groups = new Set<string>();
+  for (const prop of root.getAllProperties('adr')) {
+    const group = prop.getParameter('group');
+    if (typeof group === 'string') groups.add(group);
+    root.removeProperty(prop);
+  }
+  removeGroupedLabels(root, groups);
+
+  const nextGroup = makeGroupAllocator(root);
+  for (const addr of values) {
+    addLabelledProperty(root, 'adr', addressRawParts(addr), addr, nextGroup);
+  }
+}
+
+/**
+ * 在既有 vCard 上原地施加补丁，只改动 patch 指定的字段——PHOTO、PRODID、
+ * UID 以及任何我们的领域模型没有覆盖的属性（X-ABRELATEDNAMES、
+ * X-SOCIALPROFILE、X-APPLE-* 等）必须原样保留。REV 每次写入都刷新。
+ */
+export function applyContactPatch(text: string, patch: Partial<ContactInput>): string {
+  const root = parseRoot(text);
+
+  patchName(root, patch.name);
+  setScalar(root, 'nickname', patch.nickname);
+  patchOrg(root, patch);
+  setScalar(root, 'title', patch.title);
+  setScalar(root, 'bday', patch.birthday);
+  setScalar(root, 'note', patch.note);
+
+  replaceTypedValues(root, 'email', patch.emails);
+  replaceTypedValues(root, 'tel', patch.phones);
+  replaceAddresses(root, patch.addresses);
+  replaceTypedValues(root, 'url', patch.urls);
+  replaceTypedValues(root, 'impp', patch.impp);
+
+  root.removeAllProperties('rev');
+  root.addPropertyWithValue('rev', formatRevNow());
+
+  return root.toString();
+}
