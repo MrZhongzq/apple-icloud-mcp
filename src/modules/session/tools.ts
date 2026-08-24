@@ -1,10 +1,24 @@
 import { z } from 'zod';
-import { findAccount, type AppConfig } from '../../core/config.js';
+import { findAccount, type AppConfig, type Capabilities } from '../../core/config.js';
 import { wrapTool } from '../../server/wrap.js';
 import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
 
 export interface SessionToolDeps extends ToolDeps {
   config: AppConfig;
+}
+
+/** apple_login / apple_accounts 对外投影的能力字段。 */
+type PublicCapabilities = Omit<Capabilities, 'contactsRead' | 'contactsWrite'>;
+
+/**
+ * contactsRead/contactsWrite 不对外投影：config 已经解析它们（下一阶段要用），但本阶段
+ * 没有任何联系人工具，SKILL.md 也明确写着联系人不可用。原样回显 capabilities 会让每次
+ * 登录都告诉模型 contactsRead: true，而它随后找不到任何能用上这项能力的工具——一个只会
+ * 制造错误计划的假承诺。等联系人模块真的存在时，再把这两个键加回来。
+ */
+function publicCapabilities(capabilities: Capabilities): PublicCapabilities {
+  const { contactsRead: _contactsRead, contactsWrite: _contactsWrite, ...rest } = capabilities;
+  return rest;
 }
 
 export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDeps): void {
@@ -23,7 +37,7 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       config.accounts.map((account) => ({
         email: account.email,
         label: account.label,
-        capabilities: account.capabilities,
+        capabilities: publicCapabilities(account.capabilities),
       })),
     ),
   );
@@ -56,7 +70,7 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
         session_id: session.id,
         account: account.email,
         label: account.label,
-        capabilities: account.capabilities,
+        capabilities: publicCapabilities(account.capabilities),
       };
     }),
   );
