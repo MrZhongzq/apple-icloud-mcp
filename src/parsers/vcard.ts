@@ -464,9 +464,8 @@ function formatRevNow(): string {
 
 /**
  * 扫描卡片上已经使用的 `itemN` 分组编号，返回比现有最大值大 1 的下一个可用
- * 编号。必须在每次分配前重新扫描（而不是缓存一个全局计数器）：写入方需要
- * 看到——包括同一次补丁里刚刚为其它字段新增的分组——才能保证不会跟保留下来
- * 的属性撞号。
+ * 编号。扫描必须看到卡片上所有保留下来的属性，否则新分配的编号会跟它们撞号；
+ * 同一次补丁里的多次分配则由 makeGroupAllocator 递增计数来错开，不需要重扫。
  */
 function nextGroupNumber(root: ICAL.Component): number {
   let max = 0;
