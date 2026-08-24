@@ -229,6 +229,17 @@ class AppError extends Error {
 
 vCard 的解析与生成在 `parsers/vcard.ts`，模型只见结构化字段。
 
+**针对真实 iCloud 账号的实测结论（2026-08-24，1429 个联系人）**，本节的实现据此确定：
+
+- iCloud CardDAV **不支持 `addressbook-query` REPORT**（返回 `400 Bad Request: Didn't understand the report`）。`supported-report-set` 只声明 `sync-collection` 与 `addressbook-multiget`。因此服务端过滤不可用。
+- `contacts_search` 改为：首次全量拉取并记录 `sync-token`（实测 1429 张卡 6.9 秒 / 305 KB），后续带 token 走 `sync-collection` 只取变更集，匹配在会话缓存内完成。缓存随会话生命周期存续，由服务器的变更集保证新鲜度。
+- iCloud 下发的 vCard 版本为 **3.0**（非 4.0）。解析层仍需容忍 4.0，但 fixture 以 3.0 为主。
+- 实际出现的属性集中在 `FN`/`N`/`ORG`/`TEL`/`EMAIL`/`ADR`/`TITLE`/`UID`/`REV`/`PRODID`；单张平均 218 字节，最大 1496 字节。
+- **`PHOTO` 极少但存在**（1429 张中有 2 张）。`contacts_read` 只返回是否存在头像，绝不把 base64 放进响应。
+- 账号下只有一个通讯簿（无 `displayName`，url 尾段为 `card`），但实现不得假设只有一个。
+
+结构化模型在 spec 最小集之外，另含 `url`、`impp`、生日提醒相关字段。与日历一致，**未建模的 vCard 属性在更新时原地保留**，不得按模型重建整张卡片。
+
 ## 6. 解析层
 
 这是旧实现问题最集中的地方，也是测试的重点。
@@ -275,9 +286,13 @@ CI 只跑单测。
 `core` + `providers/icloud/{imap,smtp,caldav}` + `parsers/{mime,ical}` + `modules/{mail,calendar}` + `bin/stdio.ts` + 单测。
 完成标准：在 Claude Code 中配置为 stdio MCP server，能完成"搜索本周未读邮件并读取正文"与"查看下周日程并创建一个带提醒的事件"，中文邮件无乱码，`npm test` 全绿，`npm audit` 无高危。
 
-**阶段二 —— 能力补齐**
-`providers/icloud/carddav` + `parsers/vcard` + `modules/{reminders,contacts}` + 对应单测。
-完成标准：四个模块工具形状一致（不透明 id、结构化 JSON、同一套错误码），提醒的完成状态切换与联系人的增删改可用。
+**阶段二 —— 能力补齐（拆为两次交付）**
+
+*阶段 2a —— 提醒事项*：`modules/reminders` + 对应单测。复用既有 CalDAV provider 与 `parsers/ical.ts`，仅新增 VTODO 字段映射（`STATUS`、`PERCENT-COMPLETE`、`DUE`、`PRIORITY`）与 VTODO 集合的筛选。完成标准：提醒列表、按完成状态/截止日期查询、创建、完成状态切换、删除均可用，且与日历模块共用同一套原地修改语义。
+
+*阶段 2b —— 通讯录*：`providers/icloud/carddav` + `parsers/vcard` + `modules/contacts` + 对应单测。完成标准：搜索走 `sync-collection` 增量同步 + 会话缓存，读取不返回 base64 头像，增删改可用且未建模属性在更新后完好。
+
+两次交付各自独立可用，各自出计划、各自终审。
 
 **阶段三 —— 远程上线**
 `bin/http.ts`（Streamable HTTP，每客户端独立 transport 实例）+ `auth/*`（OAuth 2.1）+ 部署产物。
