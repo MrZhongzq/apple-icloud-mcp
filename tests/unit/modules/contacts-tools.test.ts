@@ -197,3 +197,79 @@ describe('registerContactTools', () => {
     expect(payload.error.hint).toContain('ALLOW_CONTACTS_READ_1');
   });
 });
+
+// 上面那些 handler(...) 直接调用的用例没有经过任何校验：wrapTool 不校验，
+// 所以即使把 contactShape 里的 .nullable() 删干净，它们也照样绿——而真实的 McpServer
+// 会在 handler 跑之前就把 null 退回。下面这组直接对 inputSchema 本体 safeParse，
+// 盯的就是那一层（三态清除与 contactSchema 的 name 必填 refine）。
+describe('contact tool input schemas', () => {
+  const SCALARS = ['nickname', 'organization', 'department', 'title', 'note'] as const;
+  const REPEATABLES = ['emails', 'phones', 'addresses', 'urls', 'impp'] as const;
+
+  function schemaOf(tool: string) {
+    const { server, tools } = collect();
+    registerContactTools(server, depsWith({}));
+    return z.object(tools.get(tool)!.config.inputSchema as Record<string, z.ZodTypeAny>);
+  }
+
+  it('accepts null for every three-state scalar in an update patch', () => {
+    const schema = schemaOf('contacts_update');
+    for (const field of [...SCALARS, 'birthday'] as const) {
+      const result = schema.safeParse({ session_id: 's1', contact_id: 'c1', patch: { [field]: null } });
+      expect(result.success, `patch.${field} 不接受 null，清除语义就断了`).toBe(true);
+    }
+  });
+
+  it('accepts null for every three-state scalar on create', () => {
+    const schema = schemaOf('contacts_create');
+    for (const field of [...SCALARS, 'birthday'] as const) {
+      const result = schema.safeParse({
+        session_id: 's1',
+        contact: { name: { full: '张三' }, [field]: null },
+      });
+      expect(result.success, `contact.${field} 不接受 null`).toBe(true);
+    }
+  });
+
+  it('accepts an empty array for every repeatable field', () => {
+    const update = schemaOf('contacts_update');
+    const create = schemaOf('contacts_create');
+    for (const field of REPEATABLES) {
+      expect(
+        update.safeParse({ session_id: 's1', contact_id: 'c1', patch: { [field]: [] } }).success,
+        `patch.${field} 不接受空数组，清空语义就断了`,
+      ).toBe(true);
+      expect(
+        create.safeParse({ session_id: 's1', contact: { name: { full: '张三' }, [field]: [] } }).success,
+        `contact.${field} 不接受空数组`,
+      ).toBe(true);
+    }
+  });
+
+  it('rejects a nameless contact on create', () => {
+    const schema = schemaOf('contacts_create');
+    expect(schema.safeParse({ session_id: 's1', contact: { name: {} } }).success).toBe(false);
+    expect(schema.safeParse({ session_id: 's1', contact: {} }).success).toBe(false);
+    for (const name of [{ full: '张三' }, { family: '张' }, { given: '三' }]) {
+      expect(schema.safeParse({ session_id: 's1', contact: { name } }).success, JSON.stringify(name)).toBe(true);
+    }
+  });
+
+  // 一个格式非法的生日写进卡片后会让该联系人在本服务里永久失联，
+  // 所以工具边界也要拦一道，不只依赖 parsers/vcard.ts。
+  it('rejects a malformed birthday at the schema boundary', () => {
+    const schema = schemaOf('contacts_update');
+    for (const bad of ['next tuesday', '1990/05/20', '90-05-20', '1990']) {
+      expect(
+        schema.safeParse({ session_id: 's1', contact_id: 'c1', patch: { birthday: bad } }).success,
+        bad,
+      ).toBe(false);
+    }
+    for (const good of ['1990-05-20', '--05-20']) {
+      expect(
+        schema.safeParse({ session_id: 's1', contact_id: 'c1', patch: { birthday: good } }).success,
+        good,
+      ).toBe(true);
+    }
+  });
+});

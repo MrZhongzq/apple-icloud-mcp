@@ -76,6 +76,38 @@ describe('createContactsCache', () => {
     expect(book.syncToken).toBe('tok-2');
   });
 
+  // 服务器不再报告的通讯簿必须从缓存里摘掉，否则搜索会继续命中一本
+  // 已经不存在的通讯簿里的联系人。之前没有用例会在两次 refresh 之间改变
+  // 通讯簿列表，这个循环完全没被覆盖到。
+  it('drops a book the server no longer reports', async () => {
+    const BOOK_A = 'https://c/1/card/';
+    const BOOK_B = 'https://c/2/card/';
+    const listAddressBooks = vi
+      .fn()
+      .mockResolvedValueOnce([
+        { url: BOOK_A, name: '通讯录', readOnly: false },
+        { url: BOOK_B, name: '工作', readOnly: false },
+      ])
+      .mockResolvedValueOnce([{ url: BOOK_A, name: '通讯录', readOnly: false }]);
+    const provider = makeProvider({
+      listAddressBooks,
+      fetchAll: vi.fn().mockImplementation(async (bookUrl: string) => ({
+        objects: [{ url: bookUrl + 'a.vcf', etag: 'e1', data: card('张三', 'U1') }],
+        syncToken: 'tok-1',
+      })),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+
+    const first = await cache.refresh();
+    expect(first.books.map((b) => b.url).sort()).toEqual([BOOK_A, BOOK_B]);
+    expect(cache.size()).toBe(2);
+
+    const second = await cache.refresh();
+    expect(second.books.map((b) => b.url)).toEqual([BOOK_A]);
+    expect(cache.snapshot().map((b) => b.url), '被删除的通讯簿必须从缓存里消失').toEqual([BOOK_A]);
+    expect(cache.size()).toBe(1);
+  });
+
   it('removes a deleted card from the snapshot', async () => {
     const provider = makeProvider({
       syncSince: vi.fn().mockResolvedValue({
