@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildVCard, applyContactPatch, parseVCard } from '../../../src/parsers/vcard.js';
+import { AppError } from '../../../src/core/errors.js';
 
 const ref = {
   collectionUrl: 'https://contacts.icloud.com/123/card/',
@@ -87,6 +88,48 @@ describe('buildVCard', () => {
     expect(back.birthday).toBe('1990-05-20');
     expect(back.note).toBe('备注内容');
   });
+
+  it('writes a structured address and round-trips it', () => {
+    const { vcard } = buildVCard({
+      name: { full: 'x' },
+      addresses: [
+        {
+          type: ['work'],
+          street: '某路 1 号',
+          city: '上海',
+          region: '',
+          postal_code: '200000',
+          country: '中国',
+        },
+      ],
+      urls: [{ value: 'https://example.com', type: ['work'] }],
+      impp: [{ value: 'skype:someone', type: ['home'] }],
+    });
+    const back = parseVCard(vcard, ref);
+    const addr = back.addresses![0]!;
+    expect(addr.street).toBe('某路 1 号');
+    expect(addr.city).toBe('上海');
+    expect(addr.postal_code).toBe('200000');
+    expect(addr.country).toBe('中国');
+    expect(back.urls![0]!.value).toBe('https://example.com');
+    expect(back.impp![0]!.value).toBe('skype:someone');
+  });
+
+  it('refuses to build a card with no usable name', () => {
+    expect(() => buildVCard({ name: {} })).toThrow(AppError);
+    expect(() => buildVCard({ name: { full: '   ' } })).toThrow(AppError);
+  });
+
+  it('allocates distinct groups across two labelled fields in one call', () => {
+    const { vcard } = buildVCard({
+      name: { full: 'x' },
+      emails: [{ value: 'a@example.com', label: '私人邮箱' }],
+      phones: [{ value: '+8613800000000', label: '老家座机' }],
+    });
+    const groupOf = (re: RegExp) =>
+      /^(ITEM\d+)\./i.exec(vcard.split('\r\n').find((l) => re.test(l))!)![1]!;
+    expect(groupOf(/^ITEM\d+\.EMAIL/i).toUpperCase()).not.toBe(groupOf(/^ITEM\d+\.TEL/i).toUpperCase());
+  });
 });
 
 describe('applyContactPatch', () => {
@@ -148,5 +191,27 @@ describe('applyContactPatch', () => {
   it('keeps UID stable across a patch', () => {
     const out = applyContactPatch(richCard, { organization: '新公司' });
     expect(out).toContain('UID:ABCD-1234');
+  });
+
+  it('replaces addresses wholesale and leaves other fields alone', () => {
+    const out = applyContactPatch(richCard, {
+      addresses: [{ type: ['home'], street: '新路 2 号', city: '北京' }],
+    });
+    const back = parseVCard(out, ref);
+    expect(back.addresses).toHaveLength(1);
+    expect(back.addresses![0]!.street).toBe('新路 2 号');
+    expect(back.addresses![0]!.city).toBe('北京');
+    expect(back.name.full).toBe('张三');
+    expect(back.emails![0]!.value).toBe('zhang@example.com');
+  });
+
+  it('does not reuse a group number held by a preserved property', () => {
+    // richCard 里 item1 已被那条带标签的电话占着；替换 email 时分配的组号不得撞上它
+    const out = applyContactPatch(richCard, {
+      emails: [{ value: 'new@example.com', label: '新标签' }],
+    });
+    const back = parseVCard(out, ref);
+    expect(back.emails![0]!.label).toBe('新标签');
+    expect(back.phones![0]!.label).toBe('老家座机');
   });
 });
