@@ -23,7 +23,13 @@ const reminderShape = {
     .nullable()
     .optional()
     .describe('ISO 8601 时间。传 null 表示清除截止日期；省略表示不改动。'),
-  all_day_due: z.boolean().optional(),
+  all_day_due: z
+    .boolean()
+    .optional()
+    .describe(
+      'true 表示 due 只取日期、不取时刻。取的是 due 字符串里那个偏移量下的日历日期：' +
+      '2026-09-01T00:00:00+08:00 与 2026-09-01T23:00:00-05:00 都是 9 月 1 日。',
+    ),
   priority: z
     .number()
     .int()
@@ -31,7 +37,10 @@ const reminderShape = {
     .max(9)
     .optional()
     .describe('iCal 优先级 0-9，数值越小优先级越高：1=高，5=中，9=低，0=未设置（与直觉相反）。'),
-  completed: z.boolean().optional(),
+  completed: z
+    .boolean()
+    .optional()
+    .describe('完成状态。true 标记为已完成，false 标记为未完成——勾选/取消勾选提醒事项就用这个字段。'),
 };
 
 const reminderSchema = z.object(reminderShape);
@@ -60,13 +69,20 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
       title: '查询提醒事项',
       description:
         '按列表、完成状态、截止时间范围查询提醒事项。留空 list_ids 则查询全部列表；' +
+        '结果按 due 升序排列（无截止日期的排在最后），超出 limit 时截断并置 truncated: true；' +
         '某个列表读取失败不影响其它列表的结果，会在 partial_failures 中报告。',
       inputSchema: {
         session_id: sessionId,
         list_ids: z.array(z.string()).optional().describe('留空则查询全部列表'),
-        completed: z.boolean().optional(),
-        due_before: z.string().optional().describe('ISO 8601 时间'),
-        due_after: z.string().optional().describe('ISO 8601 时间'),
+        completed: z.boolean().optional().describe('留空则已完成与未完成都返回'),
+        due_before: z
+          .string()
+          .optional()
+          .describe('ISO 8601 时间，含边界。设置任一 due 边界都会排除所有没有截止日期的提醒。'),
+        due_after: z
+          .string()
+          .optional()
+          .describe('ISO 8601 时间，含边界。设置任一 due 边界都会排除所有没有截止日期的提醒。'),
         limit: z.number().int().min(1).max(1000).optional().describe('默认 100，最大 1000'),
       },
       annotations: { readOnlyHint: true },
