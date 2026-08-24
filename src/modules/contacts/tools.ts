@@ -82,7 +82,7 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
       description:
         '按关键词搜索联系人，匹配范围含姓名、公司、部门、职位、昵称、邮箱、电话（电话额外做去除非数字字符后的子串匹配）、备注。' +
         '搜索命中的是会话内缓存，不是服务端实时查询——iCloud 不支持服务端过滤（addressbook-query）。' +
-        '首次搜索会全量拉取该会话可见的所有联系人（实测约 1429 张卡片耗时约 7 秒），此后的搜索走增量同步、通常在 1 秒以内。' +
+        '首次搜索会全量拉取该会话可见的所有联系人（实测 1429 张卡片约 4.5 秒），此后的搜索走增量同步（无变更时约 0.4 秒）。' +
         '首次调用偏慢是预期行为，不要因此判定失败并重试。' +
         '留空 query 则返回全部联系人（受 limit 截断）。结果按 name.full 升序排列，' +
         '超出 limit 时截断并置 truncated: true；某个通讯簿同步失败不影响其它通讯簿的结果，会在 partial_failures 中报告。',
