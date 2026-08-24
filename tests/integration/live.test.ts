@@ -101,11 +101,13 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
     }
 
     // event_id is tracked outside the try so `finally` can clean up no matter where an
-    // assertion fails; it's cleared the moment deleteEvent() is actually sent (not when
-    // the assertion on its result passes), so a stranded object never lands in the
+    // assertion fails; it's cleared once deleteEvent() has resolved (not when
+    // the assertion on its result passes, and not at send time -- a delete that throws
+    // leaves the id intact so `finally` retries it), so a stranded object never lands in the
     // user's real iCloud calendar and a re-run never piles up duplicates. The cleanup
-    // delete itself is swallowed -- it must never throw over, and mask, the real
-    // assertion failure that's already propagating -- and tolerates the object already
+    // delete never throws -- it must not mask the real assertion failure that's already
+    // propagating -- but it does report to stderr, so a genuinely broken delete path
+    // leaves a trace instead of silently stranding objects run after run -- and tolerates the object already
     // being gone (e.g. the explicit delete below succeeded but a later assertion threw).
     let eventId: string | undefined;
     try {
@@ -128,7 +130,11 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
       expect(deleteResult).toEqual({ deleted: true });
     } finally {
       if (eventId) {
-        await service.deleteEvent(eventId).catch(() => {});
+        await service
+          .deleteEvent(eventId)
+          .catch((err: unknown) =>
+            console.error(`[cleanup] 事件 ${eventId} 删除失败，已残留在 ${env.INTEGRATION_CALENDAR_NAME} 中：`, err),
+          );
       }
     }
   });
@@ -176,7 +182,11 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
       expect(removeResult).toEqual({ deleted: true });
     } finally {
       if (reminderId) {
-        await service.remove(reminderId).catch(() => {});
+        await service
+          .remove(reminderId)
+          .catch((err: unknown) =>
+            console.error(`[cleanup] 提醒 ${reminderId} 删除失败，已残留在 ${listName} 中：`, err),
+          );
       }
     }
   });
