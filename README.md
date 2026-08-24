@@ -1,8 +1,8 @@
 # Apple iCloud MCP Server
 
-A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP), **Calendar** (CalDAV), and **Reminders** (CalDAV) as tools for AI agents, over the stdio transport. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
+A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP), **Calendar** (CalDAV), **Reminders** (CalDAV), and **Contacts** (CardDAV) as tools for AI agents, over the stdio transport. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
 
-**Not supported, and not planned for this approach:** iCloud Notes. Apple provides no standard protocol for Notes (no IMAP/CalDAV equivalent) that works with an App-Specific Password, so there is no way to implement this without reverse-engineering a private, unsupported API. Contacts is planned for a later phase (it reuses the CardDAV machinery already in place here); it is not available yet.
+**Not supported, and not planned for this approach:** iCloud Notes. Apple provides no standard protocol for Notes (no IMAP/CalDAV equivalent) that works with an App-Specific Password, so there is no way to implement this without reverse-engineering a private, unsupported API.
 
 ## Prerequisites
 
@@ -26,6 +26,8 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 | `ALLOW_CALENDAR_WRITE_1` | no | `false` | Write (create/update/delete) defaults to **off** — must be explicitly `true`. |
 | `ALLOW_REMINDERS_READ_1` | no | `true` | Read defaults to **on**. |
 | `ALLOW_REMINDERS_WRITE_1` | no | `false` | Write (create/update/delete) defaults to **off** — must be explicitly `true`. |
+| `ALLOW_CONTACTS_READ_1` | no | `true` | Read defaults to **on**. |
+| `ALLOW_CONTACTS_WRITE_1` | no | `false` | Write (create/update/delete) defaults to **off** — must be explicitly `true`. |
 | `ICLOUD_ACCOUNT_2` .. `_5`, `ICLOUD_APP_PASSWORD_2` .. `_5`, etc. | no | — | Same fields, repeated per account slot 2–5. |
 | `SESSION_TTL_MINUTES` | no | `30` | A session (from `apple_login`) expires after this many minutes of inactivity. |
 | `IMAP_IDLE_TIMEOUT_SECONDS` | no | `300` | IMAP idle/connection timeout. |
@@ -108,14 +110,14 @@ printf '%s\n' \
   | node dist/bin/stdio.js
 ```
 
-A healthy server answers on stdout with 20 tools (3 session + 7 mail + 5 calendar + 5 reminders) and writes only logs to stderr. Thirteen tools means the mail set was disabled — check the sender-domain notice on stderr.
+A healthy server answers on stdout with 25 tools (3 session + 7 mail + 5 calendar + 5 reminders + 5 contacts) and writes only logs to stderr. Eighteen tools means the mail set was disabled — check the sender-domain notice on stderr.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Server exits immediately, stderr says no accounts configured | No `ICLOUD_ACCOUNT_1` reached the process | Check the `env` block in your client config, or that `.env` sits at the repo root. The message names the variables it needs. |
-| Only 13 tools; stderr carries a notice about the sender address | The effective sender is not an iCloud mail domain, so mail was disabled | Set `ICLOUD_SENDER_1` to your `@icloud.com` address. If you have none, that account does not use iCloud Mail — calendar and reminders still work. |
+| Only 18 tools; stderr carries a notice about the sender address | The effective sender is not an iCloud mail domain, so mail was disabled | Set `ICLOUD_SENDER_1` to your `@icloud.com` address. If you have none, that account does not use iCloud Mail — calendar, reminders, and contacts still work. |
 | `AUTH_FAILED` — "iCloud 拒绝了这组凭据" | Wrong, revoked, or mistyped App-Specific Password; or an Apple ID without two-factor authentication | Regenerate the password at appleid.apple.com. Note that if only *mail* fails while calendar works, the password is fine — it is the sender address (row above). |
 | `PERMISSION_DENIED` naming an `ALLOW_…` variable | That capability is off; writes default to off | Set the named variable to `true` and restart the client so the server relaunches. |
 | `PERMISSION_DENIED` with no variable named | iCloud itself refused the write on that calendar — usually a subscribed or shared read-only one | Pass a different `calendar_id` from `calendar_list`. |
@@ -149,6 +151,11 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 | `reminders_create` | Create a reminder from structured fields. |
 | `reminders_update` | Patch an existing reminder; only the fields given change. |
 | `reminders_delete` | Delete a reminder. Cannot be undone. |
+| `contacts_search` | Search contacts by keyword (name, org, email, phone, note, …); paginated. |
+| `contacts_read` | Read one contact's full detail by `contact_id`. |
+| `contacts_create` | Create a contact from structured fields. |
+| `contacts_update` | Patch an existing contact; only the fields given change. |
+| `contacts_delete` | Delete a contact. Cannot be undone. |
 
 ## Limitations to know before you rely on this
 
@@ -160,6 +167,8 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 - **iCloud Notes are unsupported**, and will remain so under this approach — see above.
 - **Mail tools silently disappear for an account whose sender isn't an iCloud address.** Symptom: the `mail_*` tools are missing for that account (or, if you bypass this check by other means, IMAP/SMTP fail with `AUTHENTICATIONFAILED` / `AUTH_FAILED`). Cause: IMAP/SMTP authenticate with the effective sender (`ICLOUD_SENDER_n`, or `ICLOUD_ACCOUNT_n` as a fallback), and Apple's mail servers reject a non-iCloud username outright — a Gmail-based Apple ID is the common case. Fix: set `ICLOUD_SENDER_n` to your actual iCloud mail address (`@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn`); if you don't have one, you don't use iCloud Mail and only calendar is available for that account. Check stderr at startup for the exact notice naming the affected account.
 - Range queries (`calendar_list_events`) use overlap semantics: an event that starts before the window but runs into it is included — this is what "what's on today" should mean for an overnight or multi-day event, and matches RFC 4791.
+- **Contact search matches a session-local cache, not a live server-side query** — iCloud's CardDAV has no `addressbook-query` filtering. The first search in a session pays for a full pull of every address book the account can see (about 4.5s observed for 1,429 contacts); subsequent searches in the same session sync incrementally (about 0.4s with no changes). Expect the first call to be noticeably slower — that is not a failure to retry.
+- **Contact photos are reported as a boolean only.** `has_photo` tells you whether a `PHOTO` property exists on the vCard; no tool returns photo bytes or a URL, and no response ever contains base64 image data.
 
 ## Testing
 
@@ -172,7 +181,7 @@ npm run test:integration # live iCloud tests: requires .env.test, see below
 
 `npm run test:integration` runs `tests/integration/live.test.ts` against a **real** iCloud account, using `vitest.integration.config.ts`. It is skipped entirely — cleanly, with no failure — unless a `.env.test` file exists at the repo root. To run it:
 
-1. Create a dedicated calendar and a dedicated reminder list in iCloud for testing (e.g. both named `MCP-Test`) — the suite only ever writes to these, never your real ones. If either is missing, its test fails with a message telling you to create it; it never falls back to writing into another calendar or list.
+1. Create a dedicated calendar and a dedicated reminder list in iCloud for testing (e.g. both named `MCP-Test`) — the suite only ever writes to these, never your real ones. If either is missing, its test fails with a message telling you to create it; it never falls back to writing into another calendar or list. Contacts have no equivalent "dedicated address book" a real user would create just for testing, so contact writes are isolated by name instead: every contact the suite creates has `FN` starting with `INTEGRATION_CONTACT_PREFIX` (default `MCP-Test-`), and deletion re-checks that prefix before it deletes anything.
 2. `cp .env.test.example .env.test` and fill in real credentials plus `INTEGRATION_CALENDAR_NAME` and `INTEGRATION_REMINDER_LIST_NAME` matching what you just created.
 3. `npm run test:integration`.
 
@@ -180,5 +189,4 @@ npm run test:integration # live iCloud tests: requires .env.test, see below
 
 ## What's not here yet
 
-- **Contacts** (phase two): planned to reuse this server's authentication/session machinery plus a new CardDAV provider and vCard parsing layer.
 - **Remote HTTP transport with OAuth 2.1** (phase three): this server currently only speaks stdio, for a single local trusted client. A `bin/http.ts` Streamable HTTP transport with a proper authorization server, plus Docker/deployment docs, is planned but not implemented in this repository yet.

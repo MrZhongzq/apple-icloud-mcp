@@ -96,6 +96,35 @@ describe('registerAllTools', () => {
     expect(names).toContain('calendar_list_events');
   });
 
+  it('registers contact tools when only one of several accounts enables contacts', () => {
+    // A single-account fixture can't tell .some() from .every() -- under one account
+    // they agree. This asserts the contacts tools register when account 1 has contacts
+    // off and only account 2 has it on, which .every() would get wrong.
+    const { server, names } = collect();
+    const config = loadConfig({
+      ...base,
+      ALLOW_CONTACTS_READ_1: 'false',
+      ALLOW_CONTACTS_WRITE_1: 'false',
+      ICLOUD_ACCOUNT_2: 'work@icloud.com',
+      ICLOUD_APP_PASSWORD_2: 'abcd-efgh-ijkl-mnop',
+      ALLOW_CONTACTS_READ_2: 'true',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names).toContain('contacts_search');
+  });
+
+  it('omits contact tools entirely when every account has contacts disabled', () => {
+    const { server, names } = collect();
+    const config = loadConfig({
+      ...base,
+      ALLOW_CONTACTS_READ_1: 'false',
+      ALLOW_CONTACTS_WRITE_1: 'false',
+    });
+    registerAllTools(server, { config, sessions, logger });
+    expect(names.some((n) => n.startsWith('contacts_'))).toBe(false);
+    expect(names).toContain('calendar_list_events');
+  });
+
   it('registers mail tools when account 1 has a non-iCloud sender but account 2 has a valid iCloud sender', () => {
     const { server, names } = collect();
     const config = loadConfig({

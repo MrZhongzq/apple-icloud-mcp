@@ -6,7 +6,12 @@ import { createProviders } from '../../src/providers/icloud/index.js';
 import { createMailService } from '../../src/modules/mail/service.js';
 import { createCalendarService } from '../../src/modules/calendar/service.js';
 import { createReminderService } from '../../src/modules/reminders/service.js';
+import { createLogger } from '../../src/core/logger.js';
+import { createContactsCache } from '../../src/modules/contacts/cache.js';
+import { createContactService } from '../../src/modules/contacts/service.js';
 import type { SessionProviders } from '../../src/core/session.js';
+
+const silentLogger = createLogger('error', () => {});
 
 const envPath = join(process.cwd(), '.env.test');
 const hasCredentials = existsSync(envPath);
@@ -186,6 +191,113 @@ describe.skipIf(!hasCredentials)('live iCloud integration', () => {
           .remove(reminderId)
           .catch((err: unknown) =>
             console.error(`[cleanup] 提醒 ${reminderId} 删除失败，已残留在 ${listName} 中：`, err),
+          );
+      }
+    }
+  });
+
+  it('syncs the address book and round-trips a contact', async () => {
+    // Contacts have no "dedicated address book" the way the calendar/reminders tests
+    // have a dedicated calendar/list -- a real user won't create one just for testing.
+    // Isolation here is by name prefix instead: every write this test makes stays
+    // inside INTEGRATION_CONTACT_PREFIX, and the cleanup in `finally` re-reads and
+    // re-checks that prefix before deleting -- never deletes by id alone.
+    const config = loadConfig(env);
+    const carddav = providers.carddav;
+    const cache = createContactsCache({ carddav, logger: silentLogger });
+    const service = createContactService({ account: config.accounts[0]!, carddav, cache });
+
+    const prefix = env.INTEGRATION_CONTACT_PREFIX ?? 'MCP-Test-';
+    const fullName = `${prefix}${Date.now()}`;
+
+    // First search establishes the cache; only structure is asserted here, not count --
+    // a real account's contact count is unpredictable.
+    const initial = await service.search({ limit: 5 });
+    expect(Array.isArray(initial.contacts)).toBe(true);
+
+    // contact_id is tracked outside the try so `finally` can clean up no matter where an
+    // assertion fails.
+    let contactId: string | undefined;
+    try {
+      const created = await service.create({
+        name: { full: fullName, family: prefix.replace(/-$/, ''), given: 'Case' },
+        emails: [{ value: 'mcp-test@example.com', type: ['work'] }],
+        organization: '集成测试',
+      });
+      contactId = created.contact_id;
+      expect(created.name.full).toBe(fullName);
+      expect(created.has_photo).toBe(false);
+
+      const read = await service.read(created.contact_id);
+      expect(read.name.full).toBe(fullName);
+      expect(read.emails?.[0]?.value).toBe('mcp-test@example.com');
+      expect(read.organization).toBe('集成测试');
+
+      const updated = await service.update(created.contact_id, { organization: '集成测试-已改' });
+      expect(updated.organization).toBe('集成测试-已改');
+      // The name must not have moved, otherwise the prefix check below is meaningless.
+      expect(updated.name.full).toBe(fullName);
+
+      const deleted = await service.remove(created.contact_id);
+      expect(deleted).toEqual({ deleted: true });
+      contactId = undefined;
+    } finally {
+      if (contactId) {
+        // Re-confirm the prefix before deleting -- never delete by id alone without
+        // re-verifying ownership.
+        await service
+          .read(contactId)
+          .then(async (still) => {
+            if (!still.name.full.startsWith(prefix)) {
+              throw new Error(`拒绝清理：${still.name.full} 不以测试前缀 ${prefix} 开头`);
+            }
+            await service.remove(contactId!);
+          })
+          .catch((err: unknown) =>
+            console.error(`[cleanup] 联系人 ${contactId} 清理失败，可能已残留在通讯录中：`, err),
+          );
+      }
+    }
+  });
+
+  it('preserves an Apple item-group custom label across a round-trip', async () => {
+    // What this pins down can't be settled by reasoning alone: ical.js uppercases
+    // Apple's item-group prefixes on serialization (item1. becomes ITEM1.). RFC 6350
+    // says group names are case-insensitive, but whether Apple's real servers actually
+    // accept that has to be observed against a live account.
+    const config = loadConfig(env);
+    const carddav = providers.carddav;
+    const cache = createContactsCache({ carddav, logger: silentLogger });
+    const service = createContactService({ account: config.accounts[0]!, carddav, cache });
+
+    const prefix = env.INTEGRATION_CONTACT_PREFIX ?? 'MCP-Test-';
+    const fullName = `${prefix}label-${Date.now()}`;
+
+    let contactId: string | undefined;
+    try {
+      const created = await service.create({
+        name: { full: fullName },
+        phones: [{ value: '+8613800000000', label: '老家座机' }],
+      });
+      contactId = created.contact_id;
+
+      const read = await service.read(created.contact_id);
+      expect(read.phones?.[0]?.label).toBe('老家座机');
+
+      await service.remove(created.contact_id);
+      contactId = undefined;
+    } finally {
+      if (contactId) {
+        await service
+          .read(contactId)
+          .then(async (still) => {
+            if (!still.name.full.startsWith(prefix)) {
+              throw new Error(`拒绝清理：${still.name.full} 不以测试前缀 ${prefix} 开头`);
+            }
+            await service.remove(contactId!);
+          })
+          .catch((err: unknown) =>
+            console.error(`[cleanup] 联系人 ${contactId} 清理失败，可能已残留在通讯录中：`, err),
           );
       }
     }

@@ -1,11 +1,11 @@
 ---
 name: apple-icloud-mcp-skill
-description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders over stdio).
+description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts over stdio).
 ---
 
 # Apple iCloud MCP Server — AI Client Contract
 
-This server exposes 20 tools for Apple iCloud Mail, Calendar, and Reminders. Read this before calling any of them.
+This server exposes 25 tools for Apple iCloud Mail, Calendar, Reminders, and Contacts. Read this before calling any of them.
 
 ## Workflow
 
@@ -14,7 +14,7 @@ This server exposes 20 tools for Apple iCloud Mail, Calendar, and Reminders. Rea
 3. **Do the work** — every other tool call requires the `session_id` from step 2, passed as the `session_id` argument.
 4. **`work_done`** — call this once you have completely finished the user's task and no longer need iCloud access. It destroys the session and closes the underlying connections. Do not skip this at the end of a task.
 
-## The 20 tools
+## The 25 tools
 
 ### Session (no `session_id` needed for the first one)
 
@@ -62,9 +62,23 @@ This server exposes 20 tools for Apple iCloud Mail, Calendar, and Reminders. Rea
 
 **`list_id` and `reminder_id` are opaque strings**, exactly like `calendar_id`/`event_id` — never parsed, constructed, or truncated; always the exact value a previous tool call returned. Same etag rule too: `expected_etag` is an optional optimistic-concurrency input, but neither id ever contains one.
 
+### Contacts (all require `session_id`)
+
+- `contacts_search({ session_id, query?, address_book_ids?, limit? })` → `{ contacts: Contact[], truncated?: true, partial_failures?: { address_book_id, name, reason }[] }`. `query` matches name (full/family/given), organization, department, title, nickname, every email, every phone (also matched after stripping non-digit characters, so `13800000000` and `+86 138 0000 0000` match each other), and note — case-insensitively. Leave `query` empty to list every contact (still subject to `limit`). Results are sorted by `name.full` ascending; `limit` defaults to **50** (max 500), and when more contacts matched than `limit`, `truncated: true` is set on the earliest-sorted slice — never answer "there's no contact named X" from a truncated result. One address book failing to sync never blocks the rest — it shows up in `partial_failures` instead. Matching is against a session-local cache, not a live server query (iCloud's CardDAV has no server-side filtering): the first search in a session pays for a full pull of everything visible (observed ~4.5s for 1,429 cards); later searches in the same session sync incrementally (~0.4s with no changes). Expect the first call to be slower — that's expected, not a failure to retry.
+- `contacts_read({ session_id, contact_id })` → the full `Contact`.
+- `contacts_create({ session_id, address_book_id?, contact })` → the created `Contact`. `address_book_id` omitted → written to the first writable address book. `contact.name` needs at least one of `full` or `family`/`given`.
+- `contacts_update({ session_id, contact_id, patch, expected_etag? })` → the updated `Contact`. `patch` carries only the fields to change.
+- `contacts_delete({ session_id, contact_id, expected_etag? })` → `{ deleted: true }`. Cannot be undone.
+
+**`has_photo` is a boolean only — no tool ever returns photo bytes or a URL.** It tells you whether the contact has a `PHOTO` property set, nothing more. Do not call any contacts tool expecting image data back, and never expect base64 image content to appear in a response.
+
+**Clearing rules on `patch` (and on `contacts_create`'s scalar fields) mirror reminders' `due`, extended to two shapes.** Scalar fields (`nickname`, `organization`, `department`, `title`, `birthday`, `note`) are three-state: omit to leave unchanged, send a string to set it, send `null` to clear it. Array fields (`emails`, `phones`, `addresses`, `urls`, `impp`) are whole-value replacement, not append: omit to leave unchanged, send the full new array to replace every existing entry, send `[]` to clear all of them. There is no operation to add or remove a single email/phone/address in place — send the complete array you want.
+
+**`contact_id` and `address_book_id` are opaque strings**, exactly like every other id in this server — never parsed, constructed, or truncated; always the exact value a previous tool call returned. Same etag rule too: `expected_etag` is an optional optimistic-concurrency input, but neither id ever contains one.
+
 ## Three interface conventions
 
-1. **All ids are opaque strings.** `session_id`, `calendar_id`, `event_id`, `list_id`, `reminder_id` are not meant to be parsed, constructed, or truncated — always pass through the exact value a previous tool call returned. These are stable identifiers for the resource; they never contain a CalDAV etag (etags are used internally for optimistic-concurrency checks via `expected_etag`, but they never appear as, or inside, an id you handle).
+1. **All ids are opaque strings.** `session_id`, `calendar_id`, `event_id`, `list_id`, `reminder_id`, `contact_id`, `address_book_id` are not meant to be parsed, constructed, or truncated — always pass through the exact value a previous tool call returned. These are stable identifiers for the resource; they never contain a CalDAV/CardDAV etag (etags are used internally for optimistic-concurrency checks via `expected_etag`, but they never appear as, or inside, an id you handle).
 2. **Calendar events are structured objects, not iCal text.** Build/read events through fields (`title`, `start`, `end`, `all_day`, `location`, `description`, `url`, `recurrence`, `alarms`), never by hand-writing `.ics`/VEVENT data. This applies to both `calendar_create_event`'s `event` and `calendar_update_event`'s `patch`.
 3. **Every timestamp is ISO 8601 with an explicit offset**, e.g. `2026-09-10T14:00:00+08:00` or `...Z` for UTC. This applies to `mail_search`'s `since`/`before`, and to `calendar_list_events`'s `start`/`end`, and to event `start`/`end`, and to reminder `due`. Do not send a bare local time with no offset.
 
@@ -92,15 +106,15 @@ Every failed call returns `{ error: { code, message, hint?, retryable } }` with 
 | Code | Meaning | Recovery |
 |---|---|---|
 | `SESSION_EXPIRED` | `session_id` is invalid, unknown, or has been idle past `SESSION_TTL_MINUTES`. | Call `apple_login` again to get a fresh `session_id`, then retry the failed call with the new id. Do this automatically — don't ask the user first. |
-| `PERMISSION_DENIED` | Two distinct causes, told apart by `hint` — (1) the account's config has the relevant read/write capability turned off entirely (e.g. `ALLOW_CALENDAR_WRITE_1=false`, `ALLOW_REMINDERS_WRITE_1=false`), `hint` names an env var; or (2) iCloud itself refused a write on one specific calendar **or reminder list** (a shared one you can read but not write, or privilege detection guessed wrong), `hint` says to try a different id. | For (1): do not retry. Tell the user which environment variable to set to `true` and that the server must be restarted after. For (2): call `calendar_list` / `reminders_lists` and retry the write against a different `calendar_id` / `list_id` — `calendar_create_event` and `reminders_create` each already do this once automatically when the id was omitted, so seeing this error from them means every writable collection was tried. |
+| `PERMISSION_DENIED` | Two distinct causes, told apart by `hint` — (1) the account's config has the relevant read/write capability turned off entirely (e.g. `ALLOW_CALENDAR_WRITE_1=false`, `ALLOW_REMINDERS_WRITE_1=false`, `ALLOW_CONTACTS_WRITE_1=false`), `hint` names an env var; or (2) iCloud itself refused a write on one specific calendar, reminder list, **or address book** (a shared one you can read but not write, or privilege detection guessed wrong), `hint` says to try a different id. | For (1): do not retry. Tell the user which environment variable to set to `true` (for contacts, check `ALLOW_CONTACTS_WRITE_n`) and that the server must be restarted after. For (2): call `calendar_list` / `reminders_lists` / `contacts_search` and retry the write against a different `calendar_id` / `list_id` / `address_book_id` — `calendar_create_event`, `reminders_create`, and `contacts_create` each already do this once automatically when the id was omitted, so seeing this error from them means every writable collection was tried. |
 | `AUTH_FAILED` | iCloud rejected the App-Specific Password (IMAP/SMTP/CalDAV). | Do not retry blindly. Tell the user their App-Specific Password may be wrong/revoked; a new one must be generated at appleid.apple.com. |
-| `NOT_FOUND` | The `uid`/`event_id`/`calendar_id`/`reminder_id`/`list_id`/folder no longer exists (e.g. deleted elsewhere). From `reminders_list` it specifically means a `list_id` you passed matches no current list — the message names the offending id rather than quietly returning nothing. | Re-fetch the current list (`mail_search`, `calendar_list_events`, `calendar_list`, `reminders_list`, or `reminders_lists`) and use a fresh id. Do not reuse an id from before the failure. |
+| `NOT_FOUND` | The `uid`/`event_id`/`calendar_id`/`reminder_id`/`list_id`/`contact_id`/`address_book_id`/folder no longer exists (e.g. deleted elsewhere). From `reminders_list` it specifically means a `list_id` you passed matches no current list — the message names the offending id rather than quietly returning nothing. | Re-fetch the current state (`mail_search`, `calendar_list_events`, `calendar_list`, `reminders_list`, `reminders_lists`, or `contacts_search`) and use a fresh id. Do not reuse an id from before the failure. |
 | `INVALID_INPUT` | Arguments are malformed — bad timestamp, missing required field, malformed id, `end` not after `start`, etc. | Fix the argument per `message`/`hint` and retry; do not repeat the same call unchanged. |
-| `CONFLICT` | The event or reminder changed on the server since it was last read (etag mismatch), or `expected_etag` was stale. | Re-read it (`calendar_list_events` for an event, `reminders_list` for a reminder) to get the current state, then reapply the intended change and retry. Never resend the old `expected_etag`. |
+| `CONFLICT` | The event, reminder, or contact changed on the server since it was last read (etag mismatch), or `expected_etag` was stale. | Re-read it (`calendar_list_events` for an event, `reminders_list` for a reminder, `contacts_search`/`contacts_read` for a contact) to get the current state, then reapply the intended change and retry. Never resend the old `expected_etag`. |
 | `RATE_LIMITED` | iCloud is throttling requests. | Wait briefly and retry; `retryable` is `true`. Do not tight-loop. |
 | `UPSTREAM_ERROR` | iCloud itself is unavailable or returned an unexpected error. | If `retryable` is `true`, retry once after a short delay; otherwise report the failure to the user. |
 | `INTERNAL` | Unexpected server-side failure. | Do not retry more than once. Report the failure; details are intentionally not exposed here (they're in the server's stderr log). |
 
 ## Not supported
 
-iCloud Notes cannot be accessed by this server — Apple provides no standard protocol for Notes that works with an App-Specific Password. Do not attempt to read them via `mail_*` tools. Attachments cannot be downloaded (`mail_read` reports metadata only) or sent (`mail_send` has no attach parameter). Contacts is not available in this phase.
+iCloud Notes cannot be accessed by this server — Apple provides no standard protocol for Notes that works with an App-Specific Password. Do not attempt to read them via `mail_*` tools. Attachments cannot be downloaded (`mail_read` reports metadata only) or sent (`mail_send` has no attach parameter). Contact photos cannot be retrieved — `has_photo` only reports whether one exists.

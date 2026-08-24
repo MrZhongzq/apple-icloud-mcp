@@ -65,26 +65,27 @@ describe('apple_accounts', () => {
     expect(Object.keys(shape)).toHaveLength(0);
 
     const result = await tools.get('apple_accounts')!.handler({});
-    const { contactsRead: _r, contactsWrite: _w, ...expected } = config.accounts[0]!.capabilities;
     expect(JSON.parse(result.content[0]!.text)).toEqual([
       {
         email: 'me@icloud.com',
         label: 'personal',
-        capabilities: expected,
+        capabilities: config.accounts[0]!.capabilities,
       },
     ]);
   });
 
-  // config 会解析 ALLOW_CONTACTS_* 供下一阶段使用，但本阶段一个联系人工具都没有注册，
-  // SKILL.md 也写明联系人不可用：原样回显会让模型拿到一个用不上的 contactsRead: true。
-  it('does not advertise contacts capabilities while no contacts tool exists', async () => {
+  // Contacts tools are now registered (phase 2b), so apple_accounts must advertise the
+  // full capability set again -- including contactsRead/contactsWrite -- rather than
+  // projecting them out.
+  it('advertises contacts capabilities now that contacts tools exist', async () => {
     const { server, tools } = collect();
     const { store } = makeSessions(healthyProviders());
     registerSessionTools(server, { sessions: store, logger: silentLogger, config });
     const result = await tools.get('apple_accounts')!.handler({});
     const [entry] = JSON.parse(result.content[0]!.text) as Array<{ capabilities: Record<string, boolean> }>;
     expect(Object.keys(entry!.capabilities).sort()).toEqual([
-      'calendarRead', 'calendarWrite', 'mailRead', 'mailWrite', 'remindersRead', 'remindersWrite',
+      'calendarRead', 'calendarWrite', 'contactsRead', 'contactsWrite',
+      'mailRead', 'mailWrite', 'remindersRead', 'remindersWrite',
     ]);
   });
 
@@ -113,8 +114,8 @@ describe('apple_login', () => {
     expect(payload.account).toBe('me@icloud.com');
     expect(payload.label).toBe('personal');
     expect(payload.capabilities.mailWrite).toBe(true);
-    expect(payload.capabilities).not.toHaveProperty('contactsRead');
-    expect(payload.capabilities).not.toHaveProperty('contactsWrite');
+    expect(payload.capabilities).toHaveProperty('contactsRead');
+    expect(payload.capabilities).toHaveProperty('contactsWrite');
   });
 
   it('destroys the session and reports AUTH_FAILED when verification fails', async () => {
