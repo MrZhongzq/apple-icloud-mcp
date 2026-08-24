@@ -123,10 +123,19 @@ export function createContactService(deps: ContactServiceDeps): ContactService {
       // 任何一个 id 解不开都要在触网之前就失败，而不是悄悄跳过。
       const wantedUrls = params.address_book_ids?.map(decodeUrl);
 
-      const books = await cache.refresh();
+      const { books, failures } = await cache.refresh();
       const selected = wantedUrls ? books.filter((book) => wantedUrls.includes(book.url)) : books;
 
-      // 跨通讯簿 Promise.allSettled：一本通讯簿在匹配阶段出问题不能拖垮其它通讯簿的结果。
+      // 缓存层同步失败的通讯簿是 partial_failures 真正的来源：cache.refresh() 已经把
+      // 失败原因带出来了，这里只需要转换成对外 id 形状。如果调用方按 address_book_ids
+      // 过滤了范围，失败列表也按同样的范围过滤，不去报告调用方根本没问的那些通讯簿。
+      const partial_failures: PartialFailure[] = failures
+        .filter((failure) => wantedUrls === undefined || wantedUrls.includes(failure.url))
+        .map((failure) => ({ address_book_id: encodeUrl(failure.url), name: failure.name, reason: failure.reason }));
+
+      // 跨通讯簿 Promise.allSettled：这是缓存层隔离之外的第二道防线——纵深防御，
+      // 不指望它在今天的实现下真的会触发（cache.refresh() 返回的都是已解析好的
+      // Contact[]，匹配阶段几乎不会抛），但成本为零，留着以防匹配逻辑将来出错。
       const settled = await Promise.allSettled(
         selected.map(async (book: CachedBook) => {
           const matched: Contact[] = [];
@@ -145,7 +154,6 @@ export function createContactService(deps: ContactServiceDeps): ContactService {
       );
 
       const contacts: Contact[] = [];
-      const partial_failures: PartialFailure[] = [];
       settled.forEach((outcome, index) => {
         const book = selected[index]!;
         if (outcome.status === 'fulfilled') {

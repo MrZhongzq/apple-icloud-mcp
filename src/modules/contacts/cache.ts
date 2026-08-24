@@ -12,9 +12,22 @@ export interface CachedBook {
   loadedAt: number;
 }
 
+/** 一本通讯簿本次 refresh 同步失败时的描述；url/name 取自 listAddressBooks 的原始条目。 */
+export interface BookFailure {
+  url: string;
+  name: string;
+  reason: string;
+}
+
 export interface ContactsCache {
-  /** 首次调用做全量拉取；之后带 token 走增量。返回刷新后的全部通讯簿。 */
-  refresh(): Promise<CachedBook[]>;
+  /**
+   * 首次调用做全量拉取；之后带 token 走增量。
+   * `books`：本次能供上的全部通讯簿——包括同步失败但有旧快照可用的那些（旧数据总比没有数据好，
+   * 只要调用方能看到 `failures` 里的说明）；从未同步成功过的通讯簿不出现在这里。
+   * `failures`：本次同步失败的通讯簿列表，绝不能被静默吞掉——调用方必须能分辨"这本通讯簿没有
+   * 匹配项"和"这本通讯簿根本没读到"，否则会把后者误判成前者。
+   */
+  refresh(): Promise<{ books: CachedBook[]; failures: BookFailure[] }>;
   /** 只读当前快照，不触网。缓存未建立时返回空数组。 */
   snapshot(): CachedBook[];
   /** 写操作之后让某个通讯簿失效，下次 refresh 会重新同步它。 */
@@ -105,6 +118,7 @@ export function createContactsCache(deps: { carddav: CardDavProvider; logger: Lo
       );
 
       const refreshed: CachedBook[] = [];
+      const failures: BookFailure[] = [];
       const currentUrls = new Set(infos.map((info) => info.url));
       settled.forEach((outcome, index) => {
         const info = infos[index]!;
@@ -112,12 +126,16 @@ export function createContactsCache(deps: { carddav: CardDavProvider; logger: Lo
           books.set(info.url, outcome.value);
           refreshed.push(outcome.value);
         } else {
-          logger.error('通讯簿同步失败，已跳过', {
-            bookUrl: info.url,
-            error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason),
-          });
-          // 单个通讯簿同步失败不得拖垮其余通讯簿；保留旧快照（如果有）供搜索继续使用，
-          // 但不计入本次 refresh 的返回值。
+          const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+          logger.error('通讯簿同步失败，已跳过', { bookUrl: info.url, error: reason });
+          // 单个通讯簿同步失败不得拖垮其余通讯簿，也绝不能被静默吞掉——原来这里只记日志、
+          // 不进返回值，导致调用方（contacts 服务层的 partial_failures）永远拿不到失败信息，
+          // 一本同步失败的通讯簿会悄悄从结果里消失，模型会把"没读到"误判成"没有匹配项"。
+          failures.push({ url: info.url, name: info.name, reason });
+          // 旧数据总比没有数据好：如果这本通讯簿之前成功同步过，继续把那份旧快照供上，
+          // 只要 failures 里同时说明了它可能已经过期。从未同步成功过的则没有旧数据可供。
+          const stale = books.get(info.url);
+          if (stale) refreshed.push(stale);
         }
       });
 
@@ -126,7 +144,7 @@ export function createContactsCache(deps: { carddav: CardDavProvider; logger: Lo
         if (!currentUrls.has(url)) books.delete(url);
       }
 
-      return refreshed;
+      return { books: refreshed, failures };
     },
 
     snapshot() {

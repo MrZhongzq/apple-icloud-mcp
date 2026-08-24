@@ -44,7 +44,7 @@ function cachedBook(entries: [string, string][], readOnly = false): CachedBook {
 
 function makeCache(books: CachedBook[]): ContactsCache {
   return {
-    refresh: vi.fn().mockResolvedValue(books),
+    refresh: vi.fn().mockResolvedValue({ books, failures: [] }),
     snapshot: vi.fn().mockReturnValue(books),
     invalidate: vi.fn(),
     size: vi.fn().mockReturnValue(books.reduce((n, b) => n + b.cards.size, 0)),
@@ -275,7 +275,7 @@ describe('contact search isolation', () => {
   it('returns other books results when one book failed to load', async () => {
     const good = cachedBook([[BOOK + 'a.vcf', card('张三')]]);
     const cache: ContactsCache = {
-      refresh: vi.fn().mockResolvedValue([good]),
+      refresh: vi.fn().mockResolvedValue({ books: [good], failures: [] }),
       snapshot: vi.fn().mockReturnValue([good]),
       invalidate: vi.fn(),
       size: vi.fn().mockReturnValue(1),
@@ -283,5 +283,19 @@ describe('contact search isolation', () => {
     const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });
     const result = await svc.search({});
     expect(result.contacts).toHaveLength(1);
+  });
+
+  it('surfaces a failed address book as partial_failures', async () => {
+    const book = cachedBook([[BOOK + 'a.vcf', card('张三')]]);
+    const cache = makeCache([book]);
+    (cache.refresh as ReturnType<typeof vi.fn>).mockResolvedValue({
+      books: [book],
+      failures: [{ url: 'https://c/1/other/', name: '另一本', reason: 'boom' }],
+    });
+    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });
+    const result = await svc.search({});
+    expect(result.partial_failures, '通讯簿同步失败必须让调用方看见').toHaveLength(1);
+    expect(result.partial_failures![0]!.name).toBe('另一本');
+    expect(result.partial_failures![0]!.address_book_id).not.toContain('https://');
   });
 });
