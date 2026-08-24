@@ -189,6 +189,44 @@ describe('CalendarService.listEvents', () => {
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
+  // 与 reminders_list / contacts_search 一致：被截断的结果必须带上信号。没有它，
+  // "这段时间里有没有 X" 会得到一个来自任意窗口的、自信的"没有"。
+  it('flags truncation when more than 1000 events match, keeping the earliest', async () => {
+    const CRLF = String.fromCharCode(13, 10);
+    const objects = Array.from({ length: 1001 }, (_, i) => {
+      const day = String((i % 28) + 1).padStart(2, '0');
+      const minute = String(i % 60).padStart(2, '0');
+      return {
+        collectionUrl: HOME,
+        url: `${HOME}bulk-${i}.ics`,
+        etag: `etag-${i}`,
+        data: [
+          'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//test//EN', 'BEGIN:VEVENT', `UID:bulk-${i}`,
+          'DTSTAMP:20260801T000000Z', `SUMMARY:批量${i}`, `DTSTART:202608${day}T09${minute}00Z`,
+          `DTEND:202608${day}T10${minute}00Z`, 'END:VEVENT', 'END:VCALENDAR',
+        ].join(CRLF),
+      };
+    });
+    const caldav = makeCalDav({
+      listCalendars: vi
+        .fn()
+        .mockResolvedValue([{ url: HOME, name: '个人', readOnly: false, components: ['VEVENT'] }]),
+      fetchObjects: vi.fn().mockResolvedValue(objects),
+    });
+    const service = createCalendarService({ account: makeAccount(), caldav });
+    const result = await service.listEvents(range);
+
+    expect(result.events).toHaveLength(1000);
+    expect(result.truncated).toBe(true);
+    const starts = result.events.map((e) => e.start);
+    expect(starts, '截断前必须先排序，否则切出来的是任意子集').toEqual([...starts].sort());
+  });
+
+  it('does not flag truncation when everything fits', async () => {
+    const service = createCalendarService({ account: makeAccount(), caldav: makeCalDav() });
+    expect((await service.listEvents(range)).truncated).toBeUndefined();
+  });
+
   it('isolates a single unparseable object within a calendar: the other event still returns, and the calendar is reported in partial_failures (R2)', async () => {
     const caldav = makeCalDav({
       listCalendars: vi

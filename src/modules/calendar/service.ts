@@ -39,6 +39,12 @@ export interface PartialFailure {
 
 export interface ListEventsResult {
   events: CalendarEvent[];
+  /**
+   * 命中条数超过 MAX_EVENTS、结果被截断时为 true，否则不出现。
+   * 与 reminders/contacts 一致：没有这个信号，"这段时间里有没有 X"会得到一个来自
+   * 任意窗口的、自信的"没有"——尤其是展开重复事件后，一个每日日程就能吃掉一大截名额。
+   */
+  truncated?: true;
   /** 单个日历读取失败时出现；其余日历的结果仍然完整返回（I1）。 */
   partial_failures?: PartialFailure[];
 }
@@ -262,9 +268,9 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
         }
       });
 
-      const result: ListEventsResult = {
-        events: events.sort((a, b) => a.start.localeCompare(b.start)).slice(0, MAX_EVENTS),
-      };
+      const sorted = events.sort((a, b) => a.start.localeCompare(b.start));
+      const result: ListEventsResult = { events: sorted.slice(0, MAX_EVENTS) };
+      if (sorted.length > MAX_EVENTS) result.truncated = true;
       if (partial_failures.length > 0) result.partial_failures = partial_failures;
       return result;
     },

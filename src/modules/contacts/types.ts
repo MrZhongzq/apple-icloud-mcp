@@ -16,8 +16,8 @@ export interface SearchContactsParams {
 export interface SearchContactsResult {
   /** 按 name.full 的 localeCompare 升序排列，再截断到 limit。 */
   contacts: Contact[];
-  /** 命中数超过 limit 时为 true。 */
-  truncated?: boolean;
+  /** 命中数超过 limit 时为 true，否则不出现（与 reminders/calendar 一致，SKILL.md 也是这么写的）。 */
+  truncated?: true;
   /** 某个通讯簿读取失败时出现；其余通讯簿的结果仍然完整返回。 */
   partial_failures?: PartialFailure[];
 }

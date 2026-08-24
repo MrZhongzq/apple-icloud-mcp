@@ -70,7 +70,9 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
     {
       title: '查询日程',
       description:
-        '按时间范围查询日程，返回结构化事件。重复事件默认展开为具体发生实例，每个实例带 recurrence_id。',
+        '按时间范围查询日程，返回结构化事件。重复事件默认展开为具体发生实例，每个实例带 recurrence_id。' +
+        '结果按开始时间升序排列，最多返回 1000 条，超出时截断并置 truncated: true；' +
+        '被截断的结果不能用来回答"这段时间里没有 X"，请缩小时间范围或用 calendar_ids 缩小范围后重查。',
       inputSchema: {
         session_id: sessionId,
         start: z.string().describe('范围起点，ISO 8601'),
