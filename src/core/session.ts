@@ -4,11 +4,13 @@ import type { AccountConfig } from './config.js';
 import type { ImapProvider } from '../providers/icloud/imap.js';
 import type { SmtpProvider } from '../providers/icloud/smtp.js';
 import type { CalDavProvider } from '../providers/icloud/caldav.js';
+import type { CardDavProvider } from '../providers/icloud/carddav.js';
 
 export interface SessionProviders {
   imap: ImapProvider;
   smtp: SmtpProvider;
   caldav: CalDavProvider;
+  carddav: CardDavProvider;
 }
 
 export type ProviderFactory = (account: AccountConfig) => SessionProviders;

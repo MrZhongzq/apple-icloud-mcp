@@ -1,6 +1,7 @@
 import { createImapProvider } from './imap.js';
 import { createSmtpProvider } from './smtp.js';
 import { createCalDavProvider } from './caldav.js';
+import { createCardDavProvider } from './carddav.js';
 import type { AccountConfig } from '../../core/config.js';
 import type { Logger } from '../../core/logger.js';
 import type { SessionProviders } from '../../core/session.js';
@@ -17,5 +18,6 @@ export function createProviders(account: AccountConfig, options: CreateProviders
     imap: createImapProvider(account, { logger: options.logger, idleTimeoutMs: options.imapIdleTimeoutMs }),
     smtp: createSmtpProvider(account),
     caldav: createCalDavProvider(account),
+    carddav: createCardDavProvider({ account }),
   };
 }
