@@ -212,7 +212,9 @@ export function decodeUrl(id: string): string
 
 1. `new ICAL.Component(ICAL.parse(text))` 的 `.name` 是 `'vcard'`。
 2. 结构化值以数组返回：`N` → `[family, given, middle, prefix, suffix]`；`ORG` → `[org, unit...]`；`ADR` → `[po_box, extended, street, city, region, postal, country]`。
-3. **结构化值的某一段可能本身是数组。** `ADR;type=WORK:;;某路 1 号\, 5 楼;上海;;200000;中国` 解析出的 street 段是 `["某路 1 号"," 5 楼"]`，因为转义逗号被当成了子分隔符。**每一段都必须先扁平化再用**，否则会渗出 `[object Object]` 这类脏数据。
+3. **结构化值的某一段可能本身是数组。** 触发条件是**未转义的裸逗号**——它在 vCard 里是合法的多值分隔符（RFC 6350 允许 ADR 等结构化组件带多个值）。`ADR;type=WORK:;;某路 1 号, 5 楼;上海;;200000;中国` 解析出的 street 段是 `["某路 1 号"," 5 楼"]`。反过来，**转义逗号（反斜杠加逗号）保持字面量**，ical.js 的 `unescapedIndexOf` 会跳过它，得到字符串 `"某路 1 号, 5 楼"`。**每一段都必须先扁平化再用**，否则多值组件会渗出 `[object Object]` 这类脏数据。
+
+   > 这一条最初写反了（说成「转义逗号触发拆分」）。改正来自 Task 1 的实现者：它读了 `ical.js` 的 `lib/ical/helpers.js`，并用 `String.fromCharCode(92)` 构造反斜杠绕开转义歧义做了对照实验。我最初的探针被自己工具链的反斜杠折叠骗了——以为传进去的是转义逗号，实际到达解析器的是裸逗号。**任何关于转义行为的断言，都必须用 `String.fromCharCode(92)` 而非字面反斜杠来验证。**
 4. **Apple 的分组前缀以 jCal 参数 `group` 暴露。** 用 `prop.getParameter('group')` 取，返回如 `'item1'`。`prop.group` 是 `undefined`，不要用它。自定义标签是同 group 下那条 `X-ABLabel` 的值。
 5. `BDAY` 经 `getFirstPropertyValue` 返回的是 `ICAL.Time` 形状的对象（`{year, month, day, ...}`），不是字符串。
 6. `PHOTO` 的参数形如 `{encoding: 'b', type: 'JPEG'}`，值是 base64。
@@ -257,13 +259,23 @@ describe('parseVCard', () => {
   });
 
   it('flattens a structured segment that itself parsed as an array', () => {
-    const c = parseVCard(card('FN:x', 'ADR;type=WORK:;;某路 1 号\\, 5 楼;上海;;200000;中国'), ref);
+    // 裸逗号是 vCard 合法的多值分隔符，ical.js 会把该段解析成数组。
+    // 这是唯一走得到 flattenSegment 的输入形态 —— 转义逗号不会触发它。
+    const c = parseVCard(card('FN:x', 'ADR;type=WORK:;;某路 1 号, 5 楼;上海;;200000;中国'), ref);
     const addr = c.addresses![0]!;
     expect(addr.street).toBe('某路 1 号, 5 楼');
     expect(addr.city).toBe('上海');
     expect(addr.postal_code).toBe('200000');
     expect(addr.country).toBe('中国');
     expect(addr.type).toEqual(['work']);
+  });
+
+  it('keeps an escaped comma literal instead of splitting on it', () => {
+    // 用 String.fromCharCode(92) 构造反斜杠：字面反斜杠会在多层工具链里被折叠，
+    // 这正是计划里这条事实最初被写反的原因。
+    const bs = String.fromCharCode(92);
+    const c = parseVCard(card('FN:x', 'ADR:;;某路 1 号' + bs + ', 5 楼;上海;;200000;中国'), ref);
+    expect(c.addresses![0]!.street).toBe('某路 1 号, 5 楼');
   });
 
   it('splits ORG into organization and department', () => {
@@ -371,7 +383,7 @@ describe('readContactMeta', () => {
 **鉴别性实验（必做，贴两次输出）**：
 
 1. 把 `has_photo` 的实现改成恒 `false`，确认**只有** photo 那条用例失败，再改回。守的是「base64 绝不外泄」这条硬要求。
-2. 把扁平化那一步去掉（结构化段直接取原值），确认**只有** ADR 那条失败，再改回。守的是真实 Apple 数据里出现过的嵌套结构值。
+2. 把扁平化那一步去掉（结构化段直接取原值），确认**只有** `flattens a structured segment` 那条失败，再改回。**注意**：这条实验只有在 ADR 用**裸逗号**时才成立。用转义逗号的话解析结果本来就是字符串，去不去扁平化都一样绿，实验会假性通过——计划最初就踩了这个坑。
 
 - [ ] **Step 2: 运行确认失败**
 
