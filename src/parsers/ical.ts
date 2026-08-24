@@ -480,6 +480,18 @@ interface ApplyPatchOptions {
 }
 
 /**
+ * "先删后加" 的属性写入方式：既清掉旧值（含参数），也避免同名属性重复出现。
+ * `applyPatchToVevent` 与 `applyPatchToVtodo` 共用这一个实现（以及下面的
+ * `bumpSequence`/`refreshDtstamp`）——阶段一为 applyEventPatch/upsertOverride
+ * 专门要求过这一点，VTODO 侧没有理由重新复制一份。
+ */
+function setValue(component: ICAL.Component, name: string, value: string | undefined): void {
+  if (value === undefined) return;
+  component.removeAllProperties(name);
+  component.addPropertyWithValue(name, value);
+}
+
+/**
  * 把 patch 中给出的字段原地写入一个 VEVENT 组件，未给出的字段保持不动。
  * 这是 applyEventPatch（整条序列）与 upsertOverride（单次覆盖）共用的唯一
  * 实现——两处都必须保留调用方数据模型未覆盖的属性（ATTENDEE、ORGANIZER、
@@ -497,16 +509,10 @@ function applyPatchToVevent(
     patch.all_day ??
     (vevent.getFirstProperty('dtstart')?.getFirstValue() as ICAL.Time | undefined)?.isDate === true;
 
-  const setValue = (name: string, value: string | undefined): void => {
-    if (value === undefined) return;
-    vevent.removeAllProperties(name);
-    vevent.addPropertyWithValue(name, value);
-  };
-
-  setValue('summary', patch.title);
-  setValue('location', patch.location);
-  setValue('description', patch.description);
-  setValue('url', patch.url);
+  setValue(vevent, 'summary', patch.title);
+  setValue(vevent, 'location', patch.location);
+  setValue(vevent, 'description', patch.description);
+  setValue(vevent, 'url', patch.url);
 
   if (patch.start !== undefined) {
     vevent.removeAllProperties('dtstart');
@@ -534,16 +540,17 @@ function applyPatchToVevent(
   }
 }
 
-function refreshDtstamp(vevent: ICAL.Component): void {
-  vevent.removeAllProperties('dtstamp');
-  vevent.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+/** VEVENT 与 VTODO 共用：DTSTAMP 刷新为当前时刻。 */
+function refreshDtstamp(component: ICAL.Component): void {
+  component.removeAllProperties('dtstamp');
+  component.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
 }
 
-/** 序列的整体补丁语义：SEQUENCE 递增。 */
-function bumpSequence(vevent: ICAL.Component): void {
-  const sequence = Number(vevent.getFirstPropertyValue('sequence') ?? 0);
-  vevent.removeAllProperties('sequence');
-  vevent.addPropertyWithValue('sequence', String(sequence + 1));
+/** VEVENT 与 VTODO 共用：整体补丁语义下 SEQUENCE 递增。 */
+function bumpSequence(component: ICAL.Component): void {
+  const sequence = Number(component.getFirstPropertyValue('sequence') ?? 0);
+  component.removeAllProperties('sequence');
+  component.addPropertyWithValue('sequence', String(sequence + 1));
 }
 
 /** 新建覆盖事件的语义：SEQUENCE 从 0 起算。 */
@@ -786,4 +793,125 @@ export function parseTodoObject(icsText: string, ref: ResourceRef): Reminder[] {
 
     return reminder;
   });
+}
+
+/**
+ * `due` is intentionally three-state (`string | null | undefined`), unlike every other
+ * optional field here: `undefined` means "leave the existing DUE alone" (the same
+ * "not present in patch" reading every other field gets), but a reminder's due date is
+ * also a property a caller must be able to *remove* outright (Apple's Reminders lets you
+ * clear a due date without deleting the reminder) -- and `undefined` already means "don't
+ * touch", so clearing needs a distinct value. `null` is that value. Do not collapse this
+ * to two states; see the phase brief for why.
+ */
+export interface ReminderInput {
+  title: string;
+  notes?: string;
+  due?: string | null;
+  all_day_due?: boolean;
+  priority?: number;
+  completed?: boolean;
+}
+
+/**
+ * 完成状态必须成对写入/清除（STATUS + COMPLETED + PERCENT-COMPLETE），
+ * VEVENT 侧没有等价物，所以这段逻辑不复用 applyPatchToVevent 的任何辅助，
+ * 但仍然通过 setValue 走"先删后加"的写入方式，保持替换语义一致。
+ */
+function writeCompletionState(vtodo: ICAL.Component, completed: boolean): void {
+  setValue(vtodo, 'status', completed ? 'COMPLETED' : 'NEEDS-ACTION');
+  vtodo.removeAllProperties('completed');
+  vtodo.removeAllProperties('percent-complete');
+  if (completed) {
+    vtodo.addPropertyWithValue('completed', ICAL.Time.fromJSDate(new Date(), true));
+    vtodo.addPropertyWithValue('percent-complete', '100');
+  }
+}
+
+export function buildTodoObject(
+  input: ReminderInput,
+  existing?: { uid: string; sequence: number },
+): { ics: string; uid: string } {
+  const uid = existing?.uid ?? randomUUID();
+  const allDay = input.all_day_due === true;
+
+  const calendar = new ICAL.Component(['vcalendar', [], []]);
+  calendar.addPropertyWithValue('version', '2.0');
+  calendar.addPropertyWithValue('prodid', PRODID);
+
+  const vtodo = new ICAL.Component(['vtodo', [], []]);
+  vtodo.addPropertyWithValue('uid', uid);
+  vtodo.addPropertyWithValue('dtstamp', ICAL.Time.fromJSDate(new Date(), true));
+  vtodo.addPropertyWithValue('sequence', String((existing?.sequence ?? -1) + 1));
+  vtodo.addPropertyWithValue('summary', input.title);
+
+  if (input.notes) vtodo.addPropertyWithValue('description', input.notes);
+  if (input.due) vtodo.addPropertyWithValue('due', toIcalTime(input.due, allDay));
+  if (input.priority !== undefined) vtodo.addPropertyWithValue('priority', String(input.priority));
+
+  writeCompletionState(vtodo, input.completed === true);
+
+  calendar.addSubcomponent(vtodo);
+  return { ics: calendar.toString(), uid };
+}
+
+/**
+ * 与 applyPatchToVevent 字段映射不同（SUMMARY/DESCRIPTION/DUE/PRIORITY 而非
+ * SUMMARY/LOCATION/DESCRIPTION/URL/DTSTART/DTEND/RRULE/VALARM），且完成状态
+ * 是 VTODO 独有的三属性联动，VEVENT 没有对应概念——因此没有抽出一个跨两者
+ * 的"applyPatchToXxx"。真正共享的部分（setValue、bumpSequence、refreshDtstamp）
+ * 已提取为独立函数，两侧都调用同一实现。
+ */
+function applyPatchToVtodo(vtodo: ICAL.Component, patch: Partial<ReminderInput>): void {
+  const allDay =
+    patch.all_day_due ??
+    (vtodo.getFirstProperty('due')?.getFirstValue() as ICAL.Time | undefined)?.isDate === true;
+
+  setValue(vtodo, 'summary', patch.title);
+  setValue(vtodo, 'description', patch.notes);
+  if (patch.priority !== undefined) setValue(vtodo, 'priority', String(patch.priority));
+
+  if (patch.due === null) {
+    vtodo.removeAllProperties('due');
+  } else if (patch.due !== undefined) {
+    vtodo.removeAllProperties('due');
+    vtodo.addPropertyWithValue('due', toIcalTime(patch.due, allDay));
+  }
+
+  if (patch.completed !== undefined) writeCompletionState(vtodo, patch.completed);
+}
+
+/**
+ * 在既有 VTODO 上原地施加补丁，只改动 patch 指定的属性——与 applyEventPatch
+ * 同理：按模型重建会静默丢弃 CATEGORIES、RELATED-TO、X-APPLE-SORT-ORDER、
+ * VALARM 等我们数据模型未覆盖的属性，而这些是写在用户真实提醒事项上的数据。
+ */
+export function applyTodoPatch(icsText: string, patch: Partial<ReminderInput>): string {
+  const root = parseRoot(icsText);
+  registerTimezones(root);
+
+  const vtodo = root.getAllSubcomponents('vtodo')[0];
+  if (!vtodo) {
+    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的待办');
+  }
+
+  applyPatchToVtodo(vtodo, patch);
+  bumpSequence(vtodo);
+  refreshDtstamp(vtodo);
+
+  return root.toString();
+}
+
+export function readTodoMeta(icsText: string): { uid: string; sequence: number } {
+  const root = parseRoot(icsText);
+  const vtodo = root.getAllSubcomponents('vtodo')[0];
+  if (!vtodo) {
+    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的待办');
+  }
+  const uid = vtodo.getFirstPropertyValue('uid');
+  const sequence = vtodo.getFirstPropertyValue('sequence');
+  return {
+    uid: String(uid ?? ''),
+    sequence: Number(sequence ?? 0),
+  };
 }
