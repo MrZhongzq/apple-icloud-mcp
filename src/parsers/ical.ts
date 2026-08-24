@@ -393,6 +393,9 @@ export function parseCalendarObject(
   return occurrences;
 }
 
+/** ISO 8601 串开头的日历日期部分——这三个字段已经写在调用方给出的偏移量里。 */
+const CALENDAR_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})/;
+
 function toIcalTime(iso: string, allDay: boolean): ICAL.Time {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) {
@@ -400,16 +403,28 @@ function toIcalTime(iso: string, allDay: boolean): ICAL.Time {
       hint: '请使用 ISO 8601 格式，例如 2026-09-10T14:00:00+08:00',
     });
   }
-  const time = ICAL.Time.fromJSDate(date, true);
   if (allDay) {
-    return ICAL.Time.fromData({
-      year: time.year,
-      month: time.month,
-      day: time.day,
-      isDate: true,
-    });
+    // 全天值是"日历日期"而不是"瞬时时间"：它必须等于调用方在自己给出的偏移量里写下的
+    // 那个年月日。先把字符串折算成 Date 再按 UTC（或按宿主机时区）渲染出 Y/M/D，会让任何
+    // 跨越午夜的偏移量整整错开一天——2026-09-01T00:00:00+08:00 在 UTC 里是 8-31，
+    // 2026-09-01T23:00:00-05:00 在 UTC 里是 9-2。而 SKILL.md 恰恰要求调用方带显式偏移量，
+    // 所以这是常规入参形态，不是边角情况。
+    // 因此直接从 ISO 串自己的日期字段取值，不经过 Date 往返，结果与宿主机时区无关。
+    const match = CALENDAR_DATE_RE.exec(iso.trim());
+    if (match) {
+      return ICAL.Time.fromData({
+        year: Number(match[1]),
+        month: Number(match[2]),
+        day: Number(match[3]),
+        isDate: true,
+      });
+    }
+    // 兜底：不是 YYYY-MM-DD 开头但 Date 仍能解析的写法（非 ISO 8601，已被 SKILL.md 排除）,
+    // 退回按 UTC 取日期，至少保持旧行为而不是抛错。
+    const utc = ICAL.Time.fromJSDate(date, true);
+    return ICAL.Time.fromData({ year: utc.year, month: utc.month, day: utc.day, isDate: true });
   }
-  return time;
+  return ICAL.Time.fromJSDate(date, true);
 }
 
 function recurrenceToString(rule: RecurrenceRule): string {

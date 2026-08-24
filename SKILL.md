@@ -58,7 +58,9 @@ This server exposes 20 tools for Apple iCloud Mail, Calendar, and Reminders. Rea
 
 1. **All ids are opaque strings.** `session_id`, `calendar_id`, `event_id`, `list_id`, `reminder_id` are not meant to be parsed, constructed, or truncated — always pass through the exact value a previous tool call returned. These are stable identifiers for the resource; they never contain a CalDAV etag (etags are used internally for optimistic-concurrency checks via `expected_etag`, but they never appear as, or inside, an id you handle).
 2. **Calendar events are structured objects, not iCal text.** Build/read events through fields (`title`, `start`, `end`, `all_day`, `location`, `description`, `url`, `recurrence`, `alarms`), never by hand-writing `.ics`/VEVENT data. This applies to both `calendar_create_event`'s `event` and `calendar_update_event`'s `patch`.
-3. **Every timestamp is ISO 8601 with an explicit offset**, e.g. `2026-09-10T14:00:00+08:00` or `...Z` for UTC. This applies to `mail_search`'s `since`/`before`, and to `calendar_list_events`'s `start`/`end`, and to event `start`/`end`. Do not send a bare local time with no offset.
+3. **Every timestamp is ISO 8601 with an explicit offset**, e.g. `2026-09-10T14:00:00+08:00` or `...Z` for UTC. This applies to `mail_search`'s `since`/`before`, and to `calendar_list_events`'s `start`/`end`, and to event `start`/`end`, and to reminder `due`. Do not send a bare local time with no offset.
+
+**All-day values use the calendar date in the offset you supply.** With `all_day: true` (events) or `all_day_due: true` (reminders), only the date part of the timestamp is kept, read in the offset written on that timestamp — not converted to UTC first. So `2026-09-01T00:00:00+08:00` is September 1, and so is `2026-09-01T23:00:00-05:00`; neither slides to August 31 or September 2. To make an all-day item for a given day, send that day's date with the user's own offset and any time of day.
 
 ## scope and recurrence_id, for recurring events
 
