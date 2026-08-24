@@ -123,6 +123,34 @@ describe('parseVCard', () => {
     expect(parseVCard(card('FN:x', 'BDAY:--05-20'), ref).birthday).toBe('--05-20');
   });
 
+  // Apple 给"不记得年份"的生日写的是 X-APPLE-OMIT-YEAR + 一个占位年份 1604；
+  // 原样输出会让模型报告一个 1604 年的出生年份。
+  it('reads an Apple omit-year birthday as the no-year form', () => {
+    const c = parseVCard(card('FN:x', 'BDAY;X-APPLE-OMIT-YEAR=1604:1604-05-20'), ref);
+    expect(c.birthday).toBe('--05-20');
+  });
+
+  it('drops a year-only birthday instead of inventing month and day', () => {
+    // BDAY:1990 解析出 month/day 为空，旧实现会输出 "1990-00-00" 这种不存在的日期。
+    expect(parseVCard(card('FN:x', 'BDAY:1990'), ref).birthday).toBeUndefined();
+  });
+
+  it('drops a birthday outside the calendar range', () => {
+    expect(parseVCard(card('FN:x', 'BDAY:1990-13-45'), ref).birthday).toBeUndefined();
+    expect(parseVCard(card('FN:x', 'BDAY:1990-02-30'), ref).birthday).toBeUndefined();
+  });
+
+  // 这一条是最要紧的：卡片可能是任何客户端写的。读方向一旦抛错，异常会穿过
+  // parseRoot 的 try/catch 变成 INTERNAL，而 modules/contacts/cache.ts 会在每次
+  // 同步时跳过整张卡——一个字段格式不对，整个联系人就永远搜不到、也就再也拿不到
+  // contact_id 去读/改/删了。所以无法格式化的 BDAY 只能让字段缺席，绝不能抛。
+  it('still parses a card whose BDAY some other client wrote unparseably', () => {
+    const c = parseVCard(card('FN:王五', 'N:王;五;;;', 'BDAY:next tuesday', 'EMAIL:w@example.com'), ref);
+    expect(c.birthday).toBeUndefined();
+    expect(c.name.full).toBe('王五');
+    expect(c.emails![0]!.value).toBe('w@example.com');
+  });
+
   it('tolerates vCard 4.0 as well as 3.0', () => {
     const v4 = [
       'BEGIN:VCARD',

@@ -31,6 +31,9 @@ const addressSchema = z.object({
   country: z.string().optional(),
 });
 
+/** 与 parsers/vcard.ts 接受的两种生日写法一致：YYYY-MM-DD 与无年份的 --MM-DD。 */
+const BIRTHDAY_RE = /^(\d{4}-\d{2}-\d{2}|--\d{2}-\d{2})$/;
+
 const nameSchema = z.object({
   full: z.string().optional(),
   family: z.string().optional(),
@@ -54,11 +57,14 @@ const contactShape = {
   addresses: z.array(addressSchema).optional().describe('地址列表，整体替换：传空数组清空，省略不改动。'),
   urls: z.array(typedValueSchema).optional().describe('网址列表，整体替换：传空数组清空，省略不改动。'),
   impp: z.array(typedValueSchema).optional().describe('即时通讯账号列表，整体替换：传空数组清空，省略不改动。'),
+  // 形状校验在工具边界就做掉，日历范围（13 月、2 月 30 日）交给 parsers/vcard.ts 的
+  // validateBirthday——一个格式非法的 BDAY 写进卡片后会让该联系人在本服务里永久失联。
   birthday: z
     .string()
+    .regex(BIRTHDAY_RE, '生日只接受 YYYY-MM-DD（例如 1990-05-20）或 --MM-DD（例如 --05-20）')
     .nullable()
     .optional()
-    .describe('生日，YYYY-MM-DD（无年份用 --MM-DD）。传 null 清除；省略不改动。'),
+    .describe('生日，YYYY-MM-DD（例如 1990-05-20）；无年份用 --MM-DD（例如 --05-20）。传 null 清除；省略不改动。'),
   note: z.string().nullable().optional().describe('备注。传 null 清除；省略不改动。'),
 };
 

@@ -248,21 +248,111 @@ function orgFrom(root: ICAL.Component): { organization?: string; department?: st
 
 const pad2 = (n: number): string => String(n).padStart(2, '0');
 
+const MONTH_LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function isLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+/** year 为 undefined（无年份生日）时按闰年计算，好让 2 月 29 日这种生日合法。 */
+function daysInMonth(year: number | undefined, month: number): number {
+  const base = MONTH_LENGTHS[month - 1];
+  if (base === undefined) return 0;
+  if (month === 2 && (year === undefined || isLeapYear(year))) return 29;
+  return base;
+}
+
+/** 真正的日历范围校验，不只是"两位数字"：13 月、2 月 30 日都要被判为非法。 */
+function isValidMonthDay(year: number | undefined, month: number, day: number): boolean {
+  if (!Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (month < 1 || month > 12) return false;
+  return day >= 1 && day <= daysInMonth(year, month);
+}
+
+const BIRTHDAY_FULL_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const BIRTHDAY_NO_YEAR_RE = /^--(\d{2})-(\d{2})$/;
+
+const BIRTHDAY_HINT = '只接受 YYYY-MM-DD（例如 1990-05-20）与无年份的 --MM-DD（例如 --05-20）两种写法';
+
 /**
- * BDAY 经 getFirstPropertyValue 返回的是 ICAL.Time 形状的对象
- * （`{year, month, day, ...}`），不是字符串（实测事实 5）。年份缺失或为 0
- * 时按无年份生日输出 `--MM-DD`。
+ * 生日必须在写进卡片之前校验，理由和 parsers/ical.ts::toIcalTime 一样，但后果更重：
+ * 一个像 `BDAY:next tuesday` 这样的值 ical.js 写得进去、却读不回来（getFirstValue
+ * 直接抛错），而服务层是"先在服务器上建卡、再解析回显"的顺序——卡片已经落到用户真实
+ * 通讯录里了，搜索缓存又会在每次同步时跳过这张解析失败的卡，于是这张卡再也拿不到
+ * contact_id，读不了、改不了、删不了。所以这里必须在写入前就拒绝，而不是写完再说。
+ */
+function validateBirthday(raw: string): string {
+  const value = raw.trim();
+
+  const full = BIRTHDAY_FULL_RE.exec(value);
+  if (full) {
+    const year = Number(full[1]);
+    if (year >= 1 && isValidMonthDay(year, Number(full[2]), Number(full[3]))) return value;
+  }
+
+  const noYear = BIRTHDAY_NO_YEAR_RE.exec(value);
+  if (noYear && isValidMonthDay(undefined, Number(noYear[1]), Number(noYear[2]))) return value;
+
+  throw new AppError('INVALID_INPUT', `生日格式无法识别：${raw}`, { hint: BIRTHDAY_HINT });
+}
+
+/** 字符串形态的 BDAY（少见，取决于 ical.js 的取值分支）也要按同样两种形状收敛。 */
+function formatBirthdayString(value: string, omitYear: boolean): string | undefined {
+  const trimmed = value.trim();
+
+  const full = BIRTHDAY_FULL_RE.exec(trimmed);
+  if (full) {
+    const year = Number(full[1]);
+    const month = Number(full[2]);
+    const day = Number(full[3]);
+    if (!isValidMonthDay(year, month, day)) return undefined;
+    return omitYear || year < 1 ? `--${pad2(month)}-${pad2(day)}` : trimmed;
+  }
+
+  const noYear = BIRTHDAY_NO_YEAR_RE.exec(trimmed);
+  if (noYear && isValidMonthDay(undefined, Number(noYear[1]), Number(noYear[2]))) return trimmed;
+
+  return undefined;
+}
+
+/**
+ * BDAY 经 getFirstValue 返回的是 ICAL.Time 形状的对象（`{year, month, day, ...}`），
+ * 不是字符串（实测事实 5）。
+ *
+ * **读方向永远不抛错。** 卡片可能是任何客户端写的：`BDAY:next tuesday` 会让
+ * getFirstValue 直接抛一个原始 Error（不是 AppError），而这个异常会一路穿过
+ * parseRoot 的 try/catch 变成 INTERNAL，还会让 modules/contacts/cache.ts 在每次
+ * 同步时跳过整张卡片——一个字段格式不对，整个联系人就从搜索里消失了。所以任何
+ * 无法格式化的值一律返回 undefined，只是 birthday 字段不出现而已。
+ *
+ * 无年份生日有两种写法要归一到文档承诺的 `--MM-DD`：ical.js 解析出 year 为
+ * 空的 `BDAY:--05-20`，以及 Apple 的 `BDAY;X-APPLE-OMIT-YEAR=1604:1604-05-20`
+ * ——后者若原样输出会让模型报出一个 1604 年的出生年份。只有年份的 `BDAY:1990`
+ * 解析出 month/day 为空，格式化不出合法日期，返回 undefined。
  */
 function formatBirthday(root: ICAL.Component): string | undefined {
-  const value = root.getFirstPropertyValue('bday');
+  const prop = root.getFirstProperty('bday');
+  if (!prop) return undefined;
+
+  const omitYear = prop.getParameter('x-apple-omit-year') !== undefined;
+
+  let value: unknown;
+  try {
+    value = prop.getFirstValue();
+  } catch {
+    return undefined;
+  }
   if (value === null || value === undefined) return undefined;
-  if (typeof value === 'string') return value || undefined;
+  if (typeof value === 'string') return formatBirthdayString(value, omitYear);
+
   const time = value as ICAL.Time;
-  const month = pad2(Number(time.month));
-  const day = pad2(Number(time.day));
+  const month = Number(time.month);
+  const day = Number(time.day);
   const year = Number(time.year);
-  if (!year) return `--${month}-${day}`;
-  return `${String(year).padStart(4, '0')}-${month}-${day}`;
+  const hasYear = !omitYear && Number.isInteger(year) && year >= 1;
+  if (!isValidMonthDay(hasYear ? year : undefined, month, day)) return undefined;
+  if (!hasYear) return `--${pad2(month)}-${pad2(day)}`;
+  return `${String(year).padStart(4, '0')}-${pad2(month)}-${pad2(day)}`;
 }
 
 /** REV 同样是 ICAL.Time 形状的对象；格式化成不带毫秒的 ISO 8601（UTC）字符串。 */
@@ -500,7 +590,7 @@ export function buildVCard(input: ContactInput): { vcard: string; uid: string } 
   writeTypedValues(root, 'url', input.urls, nextGroup);
   writeTypedValues(root, 'impp', input.impp, nextGroup);
 
-  if (input.birthday) root.addPropertyWithValue('bday', input.birthday);
+  if (input.birthday) root.addPropertyWithValue('bday', validateBirthday(input.birthday));
   if (input.note) root.addPropertyWithValue('note', input.note);
   root.addPropertyWithValue('rev', formatRevNow());
 
@@ -604,11 +694,15 @@ function replaceAddresses(root: ICAL.Component, values: ContactAddress[] | undef
 export function applyContactPatch(text: string, patch: Partial<ContactInput>): string {
   const root = parseRoot(text);
 
+  // 校验放在任何改动之前：一张写坏的卡片会让该联系人在本服务里永久失联（见 validateBirthday）。
+  const birthday =
+    patch.birthday === undefined || patch.birthday === null ? patch.birthday : validateBirthday(patch.birthday);
+
   patchName(root, patch.name);
   setScalar(root, 'nickname', patch.nickname);
   patchOrg(root, patch);
   setScalar(root, 'title', patch.title);
-  setScalar(root, 'bday', patch.birthday);
+  setScalar(root, 'bday', birthday);
   setScalar(root, 'note', patch.note);
 
   replaceTypedValues(root, 'email', patch.emails);

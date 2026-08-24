@@ -120,6 +120,33 @@ describe('buildVCard', () => {
     expect(() => buildVCard({ name: { full: '   ' } })).toThrow(AppError);
   });
 
+  // 写方向必须在触网之前拒绝非法生日：服务层是"先在服务器上建卡、再解析回显"的顺序，
+  // 一张 BDAY 写坏的卡片会让该联系人在本服务里永久失联（搜不到 → 拿不到 contact_id）。
+  it('rejects a birthday that is not one of the two accepted forms', () => {
+    for (const bad of ['next tuesday', '1990-13-45', '1990', '1990/05/20', '90-05-20', '--13-01', '1990-02-30']) {
+      expect(() => buildVCard({ name: { full: 'x' }, birthday: bad }), bad).toThrow(AppError);
+    }
+  });
+
+  it('names both accepted birthday forms in the error hint', () => {
+    try {
+      buildVCard({ name: { full: 'x' }, birthday: 'next tuesday' });
+      expect.unreachable('buildVCard should have rejected the birthday');
+    } catch (err) {
+      const error = err as AppError;
+      expect(error.code).toBe('INVALID_INPUT');
+      expect(error.hint).toContain('YYYY-MM-DD');
+      expect(error.hint).toContain('--MM-DD');
+    }
+  });
+
+  it('accepts both birthday forms, including a leap day with no year', () => {
+    for (const good of ['1990-05-20', '--05-20', '2000-02-29', '--02-29']) {
+      const { vcard } = buildVCard({ name: { full: 'x' }, birthday: good });
+      expect(parseVCard(vcard, ref).birthday, good).toBe(good);
+    }
+  });
+
   it('allocates distinct groups across two labelled fields in one call', () => {
     const { vcard } = buildVCard({
       name: { full: 'x' },
@@ -203,6 +230,79 @@ describe('applyContactPatch', () => {
     expect(back.addresses![0]!.city).toBe('北京');
     expect(back.name.full).toBe('张三');
     expect(back.emails![0]!.value).toBe('zhang@example.com');
+  });
+
+  // 同 buildVCard：一个非法生日经 update 写进去，会把一个原本健康的联系人变成失联卡片。
+  it('rejects a birthday that is not one of the two accepted forms', () => {
+    for (const bad of ['next tuesday', '1990-13-45', '1990', '--13-01']) {
+      expect(() => applyContactPatch(richCard, { birthday: bad }), bad).toThrow(AppError);
+    }
+    // 校验必须发生在任何改动之前：抛错时原卡片一个字节都不该被改（同一个入参对象再走一次仍等价）
+    expect(() => applyContactPatch(richCard, { birthday: 'next tuesday', note: '新备注' })).toThrow(AppError);
+    expect(parseVCard(richCard, ref).note).toBe('原有备注');
+  });
+
+  it('accepts both birthday forms and clears with null', () => {
+    expect(parseVCard(applyContactPatch(richCard, { birthday: '1990-05-20' }), ref).birthday).toBe('1990-05-20');
+    expect(parseVCard(applyContactPatch(richCard, { birthday: '--05-20' }), ref).birthday).toBe('--05-20');
+    const withBday = applyContactPatch(richCard, { birthday: '1990-05-20' });
+    expect(parseVCard(applyContactPatch(withBday, { birthday: null }), ref).birthday).toBeUndefined();
+  });
+
+  // ORG 是一条属性里的两段，补丁却把它拆成两个独立标量：只改一半时，另一半必须从
+  // 卡片上读回来一起重写，否则用户的部门会被静默删掉（richCard 的 ORG 是 某某科技;研发部）。
+  it('preserves the untouched half of ORG', () => {
+    const orgOnly = parseVCard(applyContactPatch(richCard, { organization: '新公司' }), ref);
+    expect(orgOnly.organization).toBe('新公司');
+    expect(orgOnly.department, 'ORG 的部门段在只改公司名时必须保留').toBe('研发部');
+
+    const deptOnly = parseVCard(applyContactPatch(richCard, { department: '平台部' }), ref);
+    expect(deptOnly.organization, 'ORG 的公司段在只改部门时必须保留').toBe('某某科技');
+    expect(deptOnly.department).toBe('平台部');
+  });
+
+  it('clears only the named half of ORG when it is null', () => {
+    const noDept = parseVCard(applyContactPatch(richCard, { department: null }), ref);
+    expect(noDept.organization).toBe('某某科技');
+    expect(noDept.department).toBeUndefined();
+
+    const noOrg = parseVCard(applyContactPatch(richCard, { organization: null }), ref);
+    expect(noOrg.organization).toBeUndefined();
+    expect(noOrg.department).toBe('研发部');
+  });
+
+  it('leaves ORG untouched when neither half is in the patch', () => {
+    const back = parseVCard(applyContactPatch(richCard, { title: '架构师' }), ref);
+    expect(back.organization).toBe('某某科技');
+    expect(back.department).toBe('研发部');
+  });
+
+  it('replaces FN and N together when the patch carries a name', () => {
+    const out = applyContactPatch(richCard, { name: { family: '李', given: '四' } });
+    const back = parseVCard(out, ref);
+    expect(back.name.full).toBe('李 四');
+    expect(back.name.family).toBe('李');
+    expect(back.name.given).toBe('四');
+    // 旧的 N/FN 不得残留成第二条同名属性
+    expect(out.split('\r\n').filter((l) => l.startsWith('FN:'))).toHaveLength(1);
+    expect(out.split('\r\n').filter((l) => l.startsWith('N:'))).toHaveLength(1);
+    expect(out).not.toContain('FN:张三');
+  });
+
+  it('prefers an explicit full name in a name patch and leaves the card alone without one', () => {
+    const explicit = parseVCard(applyContactPatch(richCard, { name: { full: '张三丰', family: '张' } }), ref);
+    expect(explicit.name.full).toBe('张三丰');
+    expect(explicit.name.family).toBe('张');
+
+    const untouched = parseVCard(applyContactPatch(richCard, { title: '架构师' }), ref);
+    expect(untouched.name.full).toBe('张三');
+    expect(untouched.name.family).toBe('张');
+    expect(untouched.name.given).toBe('三');
+  });
+
+  it('refuses a name patch that produces no FN', () => {
+    expect(() => applyContactPatch(richCard, { name: {} })).toThrow(AppError);
+    expect(() => applyContactPatch(richCard, { name: { full: '   ' } })).toThrow(AppError);
   });
 
   it('does not reuse a group number held by a preserved property', () => {
