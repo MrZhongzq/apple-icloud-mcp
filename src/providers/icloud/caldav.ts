@@ -29,12 +29,18 @@ export interface CalDavProvider {
   remove(object: { url: string; etag: string }): Promise<void>;
 }
 
+/**
+ * 措辞必须是领域中立的（资源 / 集合，而不是日历 / 事件）：这一层同时服务日历和提醒，
+ * 而它无从知道当前配置注册了哪些工具——一个账号完全可以关掉日历只留提醒，此时一句
+ * "重新调用 calendar_list_events" 指向的是一个根本不存在的工具。需要给恢复提示时就把
+ * 两个列举类工具都点名，让模型用手上有的那个。
+ */
 export function mapCalDavError(err: unknown): AppError {
   if (err instanceof AppError) return err;
   const status = (err as { status?: number }).status;
 
   if (status === 401) {
-    return new AppError('AUTH_FAILED', 'iCloud 拒绝了日历访问凭据', {
+    return new AppError('AUTH_FAILED', 'iCloud 拒绝了 CalDAV 访问凭据', {
       hint: '确认 App 专用密码有效，且 ICLOUD_ACCOUNT 是 Apple ID 邮箱',
       cause: err,
     });
@@ -42,30 +48,30 @@ export function mapCalDavError(err: unknown): AppError {
   if (status === 403) {
     // Distinct from the service layer's PERMISSION_DENIED for a disabled capability (which
     // hints at an env var to flip) -- this is iCloud itself refusing the write on this one
-    // calendar (e.g. a shared calendar the account can read but not write, or privilege
-    // discovery having fallen back to reporting it writable). SKILL.md's recovery table
-    // distinguishes the two meanings by this hint.
-    return new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该日历的写入', {
-      hint: '换用 calendar_list 返回的另一个 calendar_id 重试，而不是重试同一个日历',
+    // collection (e.g. a shared calendar/list the account can read but not write, or
+    // privilege discovery having fallen back to reporting it writable). SKILL.md's recovery
+    // table distinguishes the two meanings by this hint.
+    return new AppError('PERMISSION_DENIED', 'iCloud 拒绝了对该集合的写入', {
+      hint: '换用 calendar_list 或 reminders_lists 返回的另一个 id 重试，而不是重试同一个集合',
       cause: err,
     });
   }
   if (status === 404) {
-    return new AppError('NOT_FOUND', '日历资源不存在或已被删除', {
-      hint: '重新调用 calendar_list_events 获取最新的 event_id',
+    return new AppError('NOT_FOUND', '该 CalDAV 资源不存在或已被删除', {
+      hint: '重新调用 calendar_list_events 或 reminders_list 获取最新的 id',
       cause: err,
     });
   }
   if (status === 412) {
-    return new AppError('CONFLICT', '该事件已被其他客户端修改', {
-      hint: '重新读取事件后再提交修改',
+    return new AppError('CONFLICT', '该资源已被其他客户端修改', {
+      hint: '重新读取该资源后再提交修改',
       cause: err,
     });
   }
   if (status !== undefined && status >= 500) {
-    return new AppError('UPSTREAM_ERROR', 'iCloud 日历服务暂时不可用', { retryable: true, cause: err });
+    return new AppError('UPSTREAM_ERROR', 'iCloud CalDAV 服务暂时不可用', { retryable: true, cause: err });
   }
-  return new AppError('UPSTREAM_ERROR', '日历操作失败', { retryable: true, cause: err });
+  return new AppError('UPSTREAM_ERROR', 'CalDAV 操作失败', { retryable: true, cause: err });
 }
 
 /**
@@ -194,8 +200,8 @@ export function createCalDavProvider(account: AccountConfig): CalDavProvider {
         });
         const found = objects[0];
         if (!found) {
-          throw new AppError('NOT_FOUND', '日历事件不存在或已被删除', {
-            hint: '重新调用 calendar_list_events 获取最新的 event_id',
+          throw new AppError('NOT_FOUND', '该 CalDAV 资源不存在或已被删除', {
+            hint: '重新调用 calendar_list_events 或 reminders_list 获取最新的 id',
           });
         }
         return toObject(collectionUrl, found);

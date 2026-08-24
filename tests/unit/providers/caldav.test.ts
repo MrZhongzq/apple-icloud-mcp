@@ -11,18 +11,30 @@ describe('mapCalDavError', () => {
   it('maps 403 to PERMISSION_DENIED with a hint distinct from the env-var-capability hint (I6)', () => {
     // The service layer uses the same PERMISSION_DENIED code for a disabled capability,
     // with a hint naming an env var -- that advice is wrong for a server-side 403 on one
-    // particular calendar. The CalDAV 403 needs its own hint pointing at calendar_list.
+    // particular collection. The CalDAV 403 needs its own hint pointing at the listing tools.
     const mapped = mapCalDavError({ status: 403 });
     expect(mapped.code).toBe('PERMISSION_DENIED');
     expect(mapped.hint).toBeTruthy();
     expect(mapped.hint).not.toContain('ALLOW_CALENDAR_WRITE');
     expect(mapped.hint).toContain('calendar_list');
+    expect(mapped.hint).toContain('reminders_lists');
   });
 
   it('maps 404 to NOT_FOUND with a recovery hint', () => {
     const mapped = mapCalDavError({ status: 404 });
     expect(mapped.code).toBe('NOT_FOUND');
     expect(mapped.hint).toContain('calendar_list_events');
+    expect(mapped.hint).toContain('reminders_list');
+  });
+
+  // 这一层同时服务日历和提醒，且无从知道当前注册了哪些工具：一个只开提醒的账号
+  // 收到"日历"字样的报错，只会被引向根本不存在的日历工具。
+  it('keeps every mapped message free of calendar-only vocabulary', () => {
+    for (const status of [401, 403, 404, 412, 503, 400]) {
+      const mapped = mapCalDavError({ status });
+      expect(mapped.message).not.toContain('日历');
+      expect(mapped.message).not.toContain('事件');
+    }
   });
 
   it('maps 412 precondition failure to CONFLICT', () => {

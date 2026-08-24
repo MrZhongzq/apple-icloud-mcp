@@ -33,11 +33,16 @@ export function encodeUrl(url: string): string {
   return Buffer.from(url, 'utf8').toString('base64url');
 }
 
+/**
+ * 集合 id（calendar_id / list_id）的解码。措辞与 decodeRef 一样保持领域中立：
+ * 日历和提醒两侧都调用这里，而这一层无从知道当前注册了哪些工具——一个只开提醒的
+ * 账号收到"请使用 calendar_list 返回的值"就是被指向了一个不存在的工具。
+ */
 export function decodeUrl(id: string): string {
   const decoded = Buffer.from(id, 'base64url').toString('utf8');
   if (!decoded.startsWith('http')) {
-    throw new AppError('INVALID_INPUT', 'calendar_id 格式不正确', {
-      hint: '请使用 calendar_list 返回的 calendar_id 原值',
+    throw new AppError('INVALID_INPUT', '集合 ID 格式不正确', {
+      hint: '请使用 calendar_list 或 reminders_lists 返回的 id 原值，不要自行构造或截断',
     });
   }
   return decoded;

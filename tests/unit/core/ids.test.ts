@@ -36,4 +36,19 @@ describe('calendar url ids', () => {
   it('rejects an id that does not decode to a url', () => {
     expect(() => decodeUrl(Buffer.from('nope').toString('base64url'))).toThrowError(AppError);
   });
+
+  // 提醒侧的 list_ids 与 create 的 listId 都走 decodeUrl：报错不能只说日历，
+  // 也不能把模型指向一个可能没被注册的日历工具。
+  it('reports a malformed id in domain-neutral terms naming both listing tools', () => {
+    try {
+      decodeUrl(Buffer.from('nope').toString('base64url'));
+      expect.unreachable('decodeUrl should have thrown');
+    } catch (err) {
+      const error = err as AppError;
+      expect(error.message).not.toContain('calendar_id');
+      expect(error.message).not.toContain('日历');
+      expect(error.hint).toContain('calendar_list');
+      expect(error.hint).toContain('reminders_lists');
+    }
+  });
 });
