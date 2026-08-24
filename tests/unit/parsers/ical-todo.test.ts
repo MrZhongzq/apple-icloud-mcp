@@ -43,4 +43,23 @@ describe('parseTodoObject', () => {
   it('returns an empty array when the object holds no VTODO', () => {
     expect(parseTodoObject(fixture('all-day.ics'), ref)).toEqual([]);
   });
+
+  it("treats STATUS:COMPLETED alone as completed", () => {
+    const [todo] = parseTodoObject(fixture("todo-completed-status-only.ics"), ref);
+    expect(todo!.completed).toBe(true);
+    expect(todo!.completed_at).toBeUndefined();
+  });
+
+  it("treats PERCENT-COMPLETE:100 alone as completed", () => {
+    const [todo] = parseTodoObject(fixture("todo-completed-percent-only.ics"), ref);
+    expect(todo!.completed).toBe(true);
+  });
+
+  it("keeps an explicit PERCENT-COMPLETE:0 distinct from an absent one", () => {
+    const zeroed = readFileSync(join(process.cwd(), "tests/fixtures/calendar", "todo-basic.ics"), "utf8")
+      .replace("PRIORITY:1", "PRIORITY:1\r\nPERCENT-COMPLETE:0");
+    const [todo] = parseTodoObject(zeroed, ref);
+    expect(todo!.completed).toBe(false);
+    expect(todo!.percent_complete).toBe(0);
+  });
 });
