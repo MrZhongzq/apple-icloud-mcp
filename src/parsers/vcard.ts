@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import ICAL from 'ical.js';
 import { AppError } from '../core/errors.js';
 import { encodeRef, encodeUrl, type ResourceRef } from '../core/ids.js';
@@ -475,7 +476,7 @@ export function buildVCard(input: ContactInput): { vcard: string; uid: string } 
     throw new AppError('INVALID_INPUT', '联系人缺少姓名，无法生成 FN');
   }
 
-  const uid = crypto.randomUUID();
+  const uid = randomUUID();
   const root = new ICAL.Component('vcard');
   root.addPropertyWithValue('version', '3.0');
   root.addPropertyWithValue('uid', uid);
