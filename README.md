@@ -35,25 +35,35 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 
 **Legacy (v1) variable names still work**, mapped automatically with a deprecation warning on stderr: `icloud_account`, `icloud_app_pass`, `icloud_sender`, and the multi-account forms with the digit inside the name (`icloud_account2`, `allow_mail2_read`, `allow_calendar3_write`, …). `multiple_account_enable` is now a no-op — accounts 2–5 are detected by presence of `ICLOUD_ACCOUNT_n`, not by an enable flag.
 
-## Install and run
+## Install
 
 ```bash
 npm install
-npm run build
-npm run serve      # runs the compiled dist/bin/stdio.js
+npm run build      # compiles TypeScript to dist/ — required before an MCP client can launch it
 ```
 
-For development, run the TypeScript source directly without a build step:
+That is the whole install. **Do not run the server yourself.** This is a stdio MCP server: it speaks JSON-RPC over stdin/stdout and is launched *by* your MCP client as a child process. Running `npm run serve` in a terminal is not an error, but it will appear to hang — it is waiting for a client to speak to it on stdin.
+
+`npm start` runs the same server from TypeScript source via `tsx`, skipping the build. Useful while developing; point your client at `npm run build` output for normal use.
+
+## Register it with Claude Code
+
+Two equivalent ways. Both need `npm run build` to have run first, so `dist/bin/stdio.js` exists.
+
+### With the CLI
 
 ```bash
-npm start           # tsx src/bin/stdio.ts
+claude mcp add apple-icloud \
+  -e ICLOUD_ACCOUNT_1=your-apple-id@example.com \
+  -e ICLOUD_SENDER_1=your-name@icloud.com \
+  -e ICLOUD_APP_PASSWORD_1=abcd-efgh-ijkl-mnop \
+  -e ALLOW_CALENDAR_WRITE_1=true \
+  -- node /absolute/path/to/apple_mcp/dist/bin/stdio.js
 ```
 
-The server communicates over **stdio** only in this phase. If it starts with no accounts configured, or with an invalid `.env`, it exits non-zero and writes an actionable error to stderr (never to stdout, which belongs to the MCP protocol).
+Add `-s user` to make it available in every project, or `-s project` to write a shared `.mcp.json` into the current repo. The default scope is `local` — this project only, private to you. Note the `--` separator: everything after it is the command Claude Code runs.
 
-## Using it with Claude Code (stdio MCP server)
-
-Register it in your MCP client config with an absolute path to the built entrypoint:
+### With a config file
 
 ```json
 {
@@ -62,7 +72,8 @@ Register it in your MCP client config with an absolute path to the built entrypo
       "command": "node",
       "args": ["/absolute/path/to/apple_mcp/dist/bin/stdio.js"],
       "env": {
-        "ICLOUD_ACCOUNT_1": "your-name@icloud.com",
+        "ICLOUD_ACCOUNT_1": "your-apple-id@example.com",
+        "ICLOUD_SENDER_1": "your-name@icloud.com",
         "ICLOUD_APP_PASSWORD_1": "abcd-efgh-ijkl-mnop",
         "ALLOW_CALENDAR_WRITE_1": "true"
       }
@@ -71,7 +82,44 @@ Register it in your MCP client config with an absolute path to the built entrypo
 }
 ```
 
-Run `npm run build` first so `dist/bin/stdio.js` exists. `SKILL.md` in this repo is the usage contract an AI client should read: it documents the login → call-with-`session_id` → `work_done` flow, all 15 tools, and how to recover from each error code.
+**On Windows**, JSON strings escape backslashes, so write the path as `"C:\Users\you\apple_mcp\dist\bin\stdio.js"` or use forward slashes (`C:/Users/you/apple_mcp/dist/bin/stdio.js`), which Node accepts.
+
+**Set `ICLOUD_SENDER_1`** unless your Apple ID is itself an `@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn` address. If your Apple ID is a Gmail or other third-party address — common for older accounts — the mail tools are disabled without it. See the mail-domain note above.
+
+You can also drop the credentials in a `.env` file at the repo root instead of putting them in the client config; the server loads it at startup. Keep `.env` out of version control — the shipped `.gitignore` already excludes it.
+
+### Verify the registration
+
+```bash
+claude mcp list
+```
+
+`apple-icloud` should appear as connected. Inside a session, ask Claude to call `apple_accounts` — it takes no arguments, needs no login, and returns the accounts the server actually parsed along with the capabilities each one has. That is the fastest way to confirm your environment variables arrived intact.
+
+To check the server without any client at all, pipe a handshake into it directly:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | node dist/bin/stdio.js
+```
+
+A healthy server answers on stdout with 15 tools (3 session + 7 mail + 5 calendar) and writes only logs to stderr. Eight tools means the mail set was disabled — check the sender-domain notice on stderr.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Server exits immediately, stderr says no accounts configured | No `ICLOUD_ACCOUNT_1` reached the process | Check the `env` block in your client config, or that `.env` sits at the repo root. The message names the variables it needs. |
+| Only 8 tools; stderr carries a notice about the sender address | The effective sender is not an iCloud mail domain, so mail was disabled | Set `ICLOUD_SENDER_1` to your `@icloud.com` address. If you have none, that account does not use iCloud Mail — calendar still works. |
+| `AUTH_FAILED` — "iCloud 拒绝了这组凭据" | Wrong, revoked, or mistyped App-Specific Password; or an Apple ID without two-factor authentication | Regenerate the password at appleid.apple.com. Note that if only *mail* fails while calendar works, the password is fine — it is the sender address (row above). |
+| `PERMISSION_DENIED` naming an `ALLOW_…` variable | That capability is off; writes default to off | Set the named variable to `true` and restart the client so the server relaunches. |
+| `PERMISSION_DENIED` with no variable named | iCloud itself refused the write on that calendar — usually a subscribed or shared read-only one | Pass a different `calendar_id` from `calendar_list`. |
+| `SESSION_EXPIRED` | Sessions expire after `SESSION_TTL_MINUTES` of inactivity | The model should call `apple_login` again; the error hint says so. Raise the TTL if it happens constantly. |
+| Client shows the server as failed, with no useful error | Something wrote to stdout and corrupted the JSON-RPC stream | This should not happen — all logging is on stderr by design. If it does, capture stderr and file it as a bug. |
+| Calendar events come back an hour off after a DST change | Recurring events created by this server are UTC-anchored | Known phase-one limitation, documented under Limitations. Events created in the Apple UI are unaffected. |
 
 ## Tools
 
