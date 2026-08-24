@@ -133,6 +133,11 @@ export function createCardDavProvider(deps: {
           const info: AddressBookInfo = {
             url: book.url,
             name: addressBookName(book),
+            // 这里不做权限探测（不像 CalDAV 的 current-user-privilege-set /
+            // applyPrivilegeFallback），永远报 false：真正的把关在写操作触发的
+            // 403 走 mapCardDavError 那条路上。这意味着 Task 5 服务层的只读
+            // 检查在当前实现下永远不会触发——保留那个检查是为了将来补上探测时
+            // 服务层不需要改动，不是遗漏。
             readOnly: false,
           };
           if (typeof book.syncToken === 'string') info.syncToken = book.syncToken;
@@ -146,16 +151,23 @@ export function createCardDavProvider(deps: {
     async fetchAll(bookUrl) {
       const client = await getClient();
       try {
-        // 绝不调用 addressBookQuery——iCloud 的 supported-report-set 只声明
-        // sync-collection 与 addressbook-multiget，addressbook-query 会被 400 拒绝。
-        const books = await client.fetchAddressBooks();
-        const book = books.find((b) => b.url === bookUrl) ?? ({ url: bookUrl } as DAVAddressBook);
-        const vcards = await client.fetchVCards({ addressBook: book });
-        const result: { objects: CardObject[]; syncToken?: string } = {
-          objects: vcards.map(toCardObject),
+        // 绝不能让 tsdav 替我们枚举整个集合：fetchVCards 在缺少 objectUrls 时
+        // 内部会调用 addressBookQuery（tsdav.esm.js 里 vcardUrls 的兜底分支），
+        // 而 iCloud 对 addressbook-query REPORT 一律返回 400。改用不带 syncToken
+        // 的 sync-collection——按 RFC 6578，无 token 的 sync-collection REPORT
+        // 会把整个集合当作"created"返回，外加一个新 token，一次往返内完成，
+        // 和 syncSince 用的是同一条通路（同样要求 method: 'webdav'，否则
+        // smartCollectionSyncDetailed 在 collection.reports 未填充时会默认
+        // 退回 'basic'）。
+        const result = await client.smartCollectionSyncDetailed({
+          collection: { url: bookUrl } as DAVAddressBook,
+          method: 'webdav',
+        });
+        const out: { objects: CardObject[]; syncToken?: string } = {
+          objects: result.objects.created.map(toCardObject),
         };
-        if (typeof book.syncToken === 'string') result.syncToken = book.syncToken;
-        return result;
+        if (typeof result.syncToken === 'string') out.syncToken = result.syncToken;
+        return out;
       } catch (err) {
         throw mapCardDavError(err);
       }

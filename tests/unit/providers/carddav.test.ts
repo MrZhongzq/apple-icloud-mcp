@@ -86,11 +86,20 @@ describe('createCardDavProvider', () => {
     expect(books.map((b) => b.name)).toEqual(['个人', '工作']);
   });
 
-  it('never calls addressBookQuery, which iCloud rejects', async () => {
-    const addressBookQuery = vi.fn();
-    const provider = providerWith(fakeClient({ addressBookQuery }));
+  it('never asks tsdav to enumerate a collection for us', async () => {
+    // tsdav 的 fetchVCards 在缺少 objectUrls 时会内部调用 addressBookQuery
+    // （tsdav.esm.js:741），而 iCloud 对该 REPORT 返回 400。所以约束不是
+    // "不要直接调用 addressBookQuery"，而是"每一次 fetchVCards 都必须带 objectUrls"。
+    const fetchVCards = vi.fn().mockResolvedValue([]);
+    const provider = providerWith(fakeClient({ fetchVCards }));
+
     await provider.fetchAll('https://contacts.icloud.com/1/card/');
-    expect(addressBookQuery).not.toHaveBeenCalled();
+    await provider.fetchOne('https://contacts.icloud.com/1/card/', 'https://c/a.vcf').catch(() => {});
+
+    for (const call of fetchVCards.mock.calls) {
+      const params = call[0] as { objectUrls?: string[] };
+      expect(params.objectUrls, 'fetchVCards 不带 objectUrls 会触发 addressbook-query').toBeDefined();
+    }
   });
 
   it('returns created, updated and deleted urls from an incremental sync', async () => {
@@ -135,6 +144,25 @@ describe('createCardDavProvider', () => {
     });
     expect(created.url).toBeTruthy();
     expect(fetchVCards).toHaveBeenCalled();
+  });
+
+  it('throws UPSTREAM_ERROR when both the create response and the readback lack an etag', async () => {
+    const provider = providerWith(
+      fakeClient({
+        createVCard: vi.fn().mockResolvedValue({
+          ok: true,
+          status: 201,
+          headers: new Headers({ Location: 'https://c/no-etag.vcf' }),
+        }),
+        fetchVCards: vi
+          .fn()
+          .mockResolvedValue([{ url: 'https://c/no-etag.vcf', data: 'BEGIN:VCARD\r\nEND:VCARD' }]),
+      }),
+    );
+    const err = await provider
+      .create({ bookUrl: 'https://contacts.icloud.com/1/card/', filename: 'no-etag.vcf', data: 'BEGIN:VCARD\r\nEND:VCARD' })
+      .catch((e: unknown) => e as AppError);
+    expect((err as AppError).code).toBe('UPSTREAM_ERROR');
   });
 
   it('maps a 412 to CONFLICT', async () => {
