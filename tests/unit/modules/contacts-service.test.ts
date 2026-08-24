@@ -171,10 +171,12 @@ describe('contact search', () => {
   });
 
   it('rejects an address_book_id that cannot be decoded', async () => {
-    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache: makeCache([book]) });
+    const cache = makeCache([book]);
+    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });
     await expect(svc.search({ address_book_ids: ['not-a-real-id'] })).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });
+    expect(cache.refresh, '解码必须先于任何触网').not.toHaveBeenCalled();
   });
 
   it('never returns photo bytes', async () => {
@@ -249,10 +251,12 @@ describe('contact writes', () => {
 
   it('creates into the named address book', async () => {
     const carddav = makeCardDav();
-    const svc = createContactService({ account: account(), carddav, cache: makeCache([book]) });
+    const cache = makeCache([book]);
+    const svc = createContactService({ account: account(), carddav, cache });
     await svc.create({ name: { full: '新人' } }, encodeUrl(BOOK));
     const args = (carddav.create as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { bookUrl: string };
     expect(args.bookUrl).toBe(BOOK);
+    expect(cache.invalidate).toHaveBeenCalledWith(BOOK);
   });
 
   it('refuses to create into a read-only address book', async () => {
@@ -267,27 +271,16 @@ describe('contact writes', () => {
 
   it('deletes with the freshly read etag', async () => {
     const carddav = makeCardDav();
-    const svc = createContactService({ account: account(), carddav, cache: makeCache([book]) });
+    const cache = makeCache([book]);
+    const svc = createContactService({ account: account(), carddav, cache });
     expect(await svc.remove(idOf(BOOK + 'a.vcf'))).toEqual({ deleted: true });
     const args = (carddav.remove as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { etag: string };
     expect(args.etag).toBe('etag-fresh');
+    expect(cache.invalidate).toHaveBeenCalledWith(BOOK);
   });
 });
 
 describe('contact search isolation', () => {
-  it('returns other books results when one book failed to load', async () => {
-    const good = cachedBook([[BOOK + 'a.vcf', card('张三')]]);
-    const cache: ContactsCache = {
-      refresh: vi.fn().mockResolvedValue({ books: [good], failures: [] }),
-      snapshot: vi.fn().mockReturnValue([good]),
-      invalidate: vi.fn(),
-      size: vi.fn().mockReturnValue(1),
-    };
-    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });
-    const result = await svc.search({});
-    expect(result.contacts).toHaveLength(1);
-  });
-
   it('surfaces a failed address book as partial_failures', async () => {
     const book = cachedBook([[BOOK + 'a.vcf', card('张三')]]);
     const cache = makeCache([book]);
@@ -329,5 +322,34 @@ describe('cache and service together', () => {
     expect(result.partial_failures, '失败的通讯簿必须让调用方看见').toHaveLength(1);
     expect(result.partial_failures![0]!.name).toBe('坏的');
     expect(result.partial_failures![0]!.address_book_id).not.toContain('https://');
+  });
+
+  it('still searches a stale book that failed to re-sync, while reporting it', async () => {
+    // Fix round 2 的接缝测试只覆盖了「从未同步成功过」的失败分支——那种书只会出现在
+    // failures 里，不会出现在 books 里。Fix round 1 引入的另一半行为——有旧快照的书
+    // 同步失败时，books 和 failures 里都要有它——从未被接缝测试覆盖过。一个把
+    // 「按 failures 过滤掉 selected 里的书」当成合理简化的错误改动，会让这条分支
+    // 悄悄失效而所有测试仍然全绿。
+    let failNow = false;
+    const carddav = makeCardDav({
+      listAddressBooks: vi.fn().mockResolvedValue([{ url: BOOK, name: '通讯录', readOnly: false }]),
+      fetchAll: vi.fn().mockResolvedValue({
+        objects: [{ url: BOOK + 'a.vcf', etag: 'e1', data: card('张三') }],
+        syncToken: 'tok-1',
+      }),
+      syncSince: vi.fn().mockImplementation(async () => {
+        if (failNow) throw new Error('boom');
+        return { syncToken: 'tok-2', created: [], updated: [], deleted: [] };
+      }),
+    });
+    const cache = createContactsCache({ carddav, logger: silentLogger });
+    const svc = createContactService({ account: account(), carddav, cache });
+
+    await svc.search({});          // 第一次成功，缓存里留下张三
+    failNow = true;
+    const result = await svc.search({ query: '张' });
+
+    expect(result.contacts.map((c) => c.name.full), '旧数据仍要能搜到，而不是凭空少一本').toEqual(['张三']);
+    expect(result.partial_failures, '同时必须告诉调用方这本可能是旧的').toHaveLength(1);
   });
 });
