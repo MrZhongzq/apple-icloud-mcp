@@ -756,7 +756,6 @@ export function upsertOverride(icsText: string, recurrenceId: string, input: Eve
 export interface Reminder {
   reminder_id: string;
   list_id: string;
-  uid: string;
   title: string;
   notes?: string;
   due?: string;
@@ -780,7 +779,6 @@ export function parseTodoObject(icsText: string, ref: ResourceRef): Reminder[] {
     const reminder: Reminder = {
       reminder_id: encodeRef(ref),
       list_id: encodeUrl(ref.collectionUrl),
-      uid: String(vtodo.getFirstPropertyValue('uid') ?? ''),
       title: String(vtodo.getFirstPropertyValue('summary') ?? ''),
       completed: status === 'COMPLETED' || Number(percent ?? 0) === 100,
     };

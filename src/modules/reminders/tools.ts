@@ -125,7 +125,10 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
         patch: patchSchema,
         expected_etag: z.string().optional().describe('乐观锁，可留空'),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+      // idempotentHint 故意不设（与 calendar_update_event 一致）：这次写入不是幂等的，
+      // bumpSequence 每次都会把 SEQUENCE 加一，writeCompletionState 也会把 COMPLETED
+      // 重写成当前时间——重复同一次调用会产生不同的结果。
+      annotations: { readOnlyHint: false, destructiveHint: false },
     },
     wrapTool(
       logger,

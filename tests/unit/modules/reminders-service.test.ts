@@ -300,11 +300,20 @@ describe('ReminderService.update', () => {
     expect(written).toContain('BEGIN:VALARM');
   });
 
+  // 这里必须不传 expected_etag，测试才有鉴别力（与日历侧同名用例的做法一致）：传一个
+  // 与服务端不同的值会先被乐观锁拦成 CONFLICT，传一个相同的值则让"用读回的 etag"和
+  // "用传入的 etag"两种实现给出完全一样的结果，断言恒真。不传时，任何直接使用
+  // options.expected_etag 的实现都会写出 undefined，从而被这条断言抓住。
+  // （expected_etag 与服务端不一致的情形由下面的 CONFLICT 用例覆盖。）
   it('writes with the freshly read etag, not the supplied one', async () => {
-    const caldav = makeCalDav();
+    const caldav = makeCalDav({
+      fetchOne: vi.fn().mockResolvedValue({
+        collectionUrl: LIST, url: TODO_URL, etag: 'etag-fresh-from-server', data: basic,
+      }),
+    });
     const service = createReminderService({ account: makeAccount(), caldav });
-    await service.update(reminderId, { title: 'x' }, { expected_etag: 'etag-1' });
-    expect((caldav.update as ReturnType<typeof vi.fn>).mock.calls[0]![0].etag).toBe('etag-1');
+    await service.update(reminderId, { title: 'x' });
+    expect((caldav.update as ReturnType<typeof vi.fn>).mock.calls[0]![0].etag).toBe('etag-fresh-from-server');
   });
 
   it('raises CONFLICT when expected_etag does not match, without writing', async () => {

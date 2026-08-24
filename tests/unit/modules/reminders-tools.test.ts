@@ -49,7 +49,10 @@ describe('registerReminderTools', () => {
     expect(tools.get('reminders_lists')!.config.annotations?.readOnlyHint).toBe(true);
     expect(tools.get('reminders_list')!.config.annotations?.readOnlyHint).toBe(true);
     expect(tools.get('reminders_create')!.config.annotations?.destructiveHint).toBe(false);
-    expect(tools.get('reminders_update')!.config.annotations?.idempotentHint).toBe(true);
+    expect(tools.get('reminders_update')!.config.annotations?.destructiveHint).toBe(false);
+    // 与 calendar_update_event 对称，且这次写入本来就不幂等（SEQUENCE 自增、
+    // COMPLETED 每次重写成当前时间）。
+    expect(tools.get('reminders_update')!.config.annotations?.idempotentHint).toBeUndefined();
     expect(tools.get('reminders_delete')!.config.annotations?.destructiveHint).toBe(true);
   });
 

@@ -32,7 +32,14 @@ describe('parseTodoObject', () => {
   it('gives the reminder an opaque id derived from its ref', () => {
     const [todo] = parseTodoObject(fixture('todo-basic.ics'), ref);
     expect(todo!.reminder_id).toBe(encodeRef(ref));
-    expect(todo!.uid).toBe('todo-001');
+  });
+
+  // 原始 iCal UID 不进响应：它长得像个可用的 id，但任何提醒工具都不接受它。
+  // 日历侧把等价字段改名成 series_id 并写明用途，提醒侧本阶段没有对应用途。
+  it('does not surface the raw iCal UID as a response field', () => {
+    const [todo] = parseTodoObject(fixture('todo-basic.ics'), ref);
+    expect(Object.keys(todo!)).not.toContain('uid');
+    expect(JSON.stringify(todo)).not.toContain('todo-001');
   });
 
   it('handles a DATE-valued due without shifting it by the host timezone', () => {
