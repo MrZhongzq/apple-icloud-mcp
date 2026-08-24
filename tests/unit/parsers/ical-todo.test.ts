@@ -132,6 +132,27 @@ describe('applyTodoPatch', () => {
     const updated = applyTodoPatch(fixture('todo-basic.ics'), { due: null as never });
     expect(updated).not.toMatch(/^DUE/m);
   });
+
+  it('keeps an all-day due as DATE when the patch omits all_day_due', () => {
+    const updated = applyTodoPatch(fixture('todo-with-extras.ics'), { due: '2026-10-01T00:00:00.000Z' });
+    expect(updated).toContain('DUE;VALUE=DATE:20261001');
+    expect(updated).not.toMatch(/^DUE:20261001T/m);
+  });
+
+  it('keeps a timestamped due as DATE-TIME when the patch omits all_day_due', () => {
+    const updated = applyTodoPatch(fixture('todo-basic.ics'), { due: '2026-10-01T09:00:00.000Z' });
+    expect(updated).toContain('DUE:20261001T090000Z');
+    expect(updated).not.toContain('DUE;VALUE=DATE');
+  });
+
+  it('un-completing a never-completed reminder is a no-op beyond STATUS', () => {
+    const updated = applyTodoPatch(fixture('todo-basic.ics'), { completed: false });
+    expect(updated).toContain('STATUS:NEEDS-ACTION');
+    expect(updated).not.toMatch(/^COMPLETED:/m);
+    expect(updated).not.toContain('PERCENT-COMPLETE');
+    const [todo] = parseTodoObject(updated, ref);
+    expect(todo!.completed).toBe(false);
+  });
 });
 
 describe('readTodoMeta', () => {
