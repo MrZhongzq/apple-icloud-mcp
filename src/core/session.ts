@@ -5,6 +5,7 @@ import type { ImapProvider } from '../providers/icloud/imap.js';
 import type { SmtpProvider } from '../providers/icloud/smtp.js';
 import type { CalDavProvider } from '../providers/icloud/caldav.js';
 import type { CardDavProvider } from '../providers/icloud/carddav.js';
+import type { ContactsCache } from '../modules/contacts/cache.js';
 
 export interface SessionProviders {
   imap: ImapProvider;
@@ -21,6 +22,8 @@ export interface Session {
   createdAt: number;
   lastActiveAt: number;
   providers: SessionProviders;
+  /** 通讯录搜索缓存，首次搜索时才创建；随会话销毁而消失。 */
+  contactsCache?: ContactsCache;
 }
 
 export interface SessionStore {
