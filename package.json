@@ -4,8 +4,12 @@
   "description": "MCP server for Apple iCloud Mail, Calendar, Reminders and Contacts",
   "type": "module",
   "main": "dist/bin/stdio.js",
-  "bin": { "apple-icloud-mcp": "dist/bin/stdio.js" },
-  "engines": { "node": ">=20" },
+  "bin": {
+    "apple-icloud-mcp": "dist/bin/stdio.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
@@ -29,7 +33,7 @@
     "@types/mailparser": "3.4.6",
     "@types/node": "22.10.2",
     "@types/nodemailer": "6.4.17",
-    "tsx": "4.19.2",
+    "tsx": "4.23.12",
     "typescript": "5.7.3",
     "vitest": "4.1.11"
   },
