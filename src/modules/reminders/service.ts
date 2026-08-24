@@ -187,7 +187,21 @@ export function createReminderService(deps: ReminderServiceDeps): ReminderServic
         });
       }
 
-      const result: ListRemindersResult = { reminders: filtered.slice(0, limit) };
+      // 排序必须在截断之前：否则 limit 切出来的是一个没有任何顺序保证的任意子集，
+      // 模型据此回答"我有没有关于 X 的提醒"就会给出一个自信的错误答案。
+      // 无 due 的排在最后（"没有截止日期"不是"很早就到期"），同 due 用 title 兜底，
+      // 保证同一批数据每次调用返回同一个顺序。
+      const sorted = [...filtered].sort((a, b) => {
+        if (a.due !== b.due) {
+          if (!a.due) return 1;
+          if (!b.due) return -1;
+          return a.due < b.due ? -1 : 1;
+        }
+        return a.title.localeCompare(b.title);
+      });
+
+      const result: ListRemindersResult = { reminders: sorted.slice(0, limit) };
+      if (sorted.length > limit) result.truncated = true;
       if (partial_failures.length > 0) result.partial_failures = partial_failures;
       return result;
     },

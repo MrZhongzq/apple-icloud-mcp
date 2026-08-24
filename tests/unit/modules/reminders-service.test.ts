@@ -167,6 +167,52 @@ describe('ReminderService.list', () => {
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
+  it('sorts by due ascending, undated last, title as tiebreak', async () => {
+    const todo = (uid: string, summary: string, due?: string): string =>
+      [
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VTODO',
+        `UID:${uid}`, 'DTSTAMP:20260801T000000Z', `SUMMARY:${summary}`,
+        ...(due ? [`DUE:${due}`] : []),
+        'STATUS:NEEDS-ACTION', 'END:VTODO', 'END:VCALENDAR',
+      ].join('\r\n');
+    // 故意打乱投喂顺序：排序必须来自服务端，而不是碰巧等于 CalDAV 的返回顺序。
+    const caldav = makeCalDav({
+      fetchObjects: vi.fn().mockResolvedValue([
+        { collectionUrl: LIST, url: `${LIST}a.ics`, etag: 'e1', data: todo('a', 'zeta', '20260910T090000Z') },
+        { collectionUrl: LIST, url: `${LIST}b.ics`, etag: 'e2', data: todo('b', 'beta') },
+        { collectionUrl: LIST, url: `${LIST}c.ics`, etag: 'e3', data: todo('c', 'alpha', '20260901T090000Z') },
+        { collectionUrl: LIST, url: `${LIST}d.ics`, etag: 'e4', data: todo('d', 'alpha') },
+        { collectionUrl: LIST, url: `${LIST}e.ics`, etag: 'e5', data: todo('e', 'omega', '20260901T090000Z') },
+      ]),
+    });
+    const service = createReminderService({ account: makeAccount(), caldav });
+    const result = await service.list({});
+    expect(result.reminders.map((r) => r.title)).toEqual(['alpha', 'omega', 'zeta', 'alpha', 'beta']);
+    expect(result.truncated).toBeUndefined();
+  });
+
+  it('keeps the earliest reminders when limit truncates, and says so', async () => {
+    const objects = Array.from({ length: 5 }, (_, i) => ({
+      collectionUrl: LIST,
+      url: `${LIST}t${i}.ics`,
+      etag: `e${i}`,
+      data: [
+        'BEGIN:VCALENDAR', 'VERSION:2.0', 'BEGIN:VTODO', `UID:t${i}`, 'DTSTAMP:20260801T000000Z',
+        `SUMMARY:任务${i}`, `DUE:2026090${5 - i}T090000Z`, 'STATUS:NEEDS-ACTION', 'END:VTODO', 'END:VCALENDAR',
+      ].join('\r\n'),
+    }));
+    const caldav = makeCalDav({ fetchObjects: vi.fn().mockResolvedValue(objects) });
+    const service = createReminderService({ account: makeAccount(), caldav });
+    const result = await service.list({ limit: 2 });
+    expect(result.reminders.map((r) => r.title)).toEqual(['任务4', '任务3']);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('does not flag truncation when the result exactly fills the limit', async () => {
+    const service = createReminderService({ account: makeAccount(), caldav: makeCalDav() });
+    expect((await service.list({ limit: 1 })).truncated).toBeUndefined();
+  });
+
   it('rejects a limit outside the allowed range', async () => {
     const service = createReminderService({ account: makeAccount(), caldav: makeCalDav() });
     await expect(service.list({ limit: 0 })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
