@@ -170,6 +170,36 @@ describe('contact search', () => {
     expect(result.contacts.length).toBeGreaterThan(0);
   });
 
+  // 一个已删除/改名的通讯簿 id 不能降级成一句自信的"你没有叫 X 的联系人"——
+  // 与 calendar_list_events / reminders_list 一致，明确点出那个 id 并报 NOT_FOUND。
+  it('reports NOT_FOUND for an address book the server no longer has', async () => {
+    const goneId = encodeUrl('https://c/1/deleted/');
+    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache: makeCache([book]) });
+    const err = await svc.search({ address_book_ids: [goneId] }).catch((e: unknown) => e as AppError);
+    expect((err as AppError).code).toBe('NOT_FOUND');
+    expect((err as AppError).message).toContain(goneId);
+    expect((err as AppError).hint).toContain('contacts_search');
+  });
+
+  // 但"这次同步失败"不是"不存在"：那本通讯簿仍要走 partial_failures，而不是 NOT_FOUND。
+  it('does not report NOT_FOUND for an address book that merely failed to sync', async () => {
+    const failedUrl = 'https://c/1/broken/';
+    const cache: ContactsCache = {
+      refresh: vi
+        .fn()
+        .mockResolvedValue({ books: [book], failures: [{ url: failedUrl, name: '坏掉的', reason: '403' }] }),
+      snapshot: vi.fn().mockReturnValue([book]),
+      invalidate: vi.fn(),
+      size: vi.fn().mockReturnValue(book.cards.size),
+    };
+    const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });
+    const result = await svc.search({ address_book_ids: [encodeUrl(failedUrl)] });
+    expect(result.contacts).toEqual([]);
+    expect(result.partial_failures).toEqual([
+      { address_book_id: encodeUrl(failedUrl), name: '坏掉的', reason: '403' },
+    ]);
+  });
+
   it('rejects an address_book_id that cannot be decoded', async () => {
     const cache = makeCache([book]);
     const svc = createContactService({ account: account(), carddav: makeCardDav(), cache });

@@ -121,9 +121,24 @@ export function createContactService(deps: ContactServiceDeps): ContactService {
       // address_book_ids 是不透明 id，必须先解码成真实 url 再和 CachedBook.url 比对；
       // 直接拿不透明串去比较会静默匹配为空——不报错、不提示，只是返回零条。
       // 任何一个 id 解不开都要在触网之前就失败，而不是悄悄跳过。
+      // 能解开但已经不存在的 id 同样不能静默降级成"这个人你没有"：与
+      // calendar/service.ts 和 reminders/service.ts 一致，明确点出那个 id 并报 NOT_FOUND。
       const wantedUrls = params.address_book_ids?.map(decodeUrl);
 
       const { books, failures } = await cache.refresh();
+
+      if (wantedUrls) {
+        // 判断"存在"要把本次同步失败的通讯簿也算上（failures）：它确实存在，只是这次没读到，
+        // 那属于 partial_failures 要报告的情况，不是"通讯簿不存在"。
+        const known = new Set([...books.map((book) => book.url), ...failures.map((failure) => failure.url)]);
+        const missing = wantedUrls.filter((url) => !known.has(url));
+        if (missing.length > 0) {
+          throw new AppError('NOT_FOUND', `以下 address_book_id 不对应任何通讯簿：${missing.map(encodeUrl).join('、')}`, {
+            hint: '重新调用 contacts_search（不带 address_book_ids）获取当前有效的 address_book_id',
+          });
+        }
+      }
+
       const selected = wantedUrls ? books.filter((book) => wantedUrls.includes(book.url)) : books;
 
       // 缓存层同步失败的通讯簿是 partial_failures 真正的来源：cache.refresh() 已经把
