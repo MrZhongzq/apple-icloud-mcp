@@ -158,9 +158,14 @@ export function createCardDavProvider(deps: {
         // 会把整个集合当作"created"返回，外加一个新 token，一次往返内完成，
         // 和 syncSince 用的是同一条通路（同样要求 method: 'webdav'，否则
         // smartCollectionSyncDetailed 在 collection.reports 未填充时会默认
-        // 退回 'basic'）。
+        // 退回 'basic'）。collection 必须带 objectMultiGet：tsdav 内部一旦发现
+        // 有变更对象且集合没有这个函数就直接抛异常（实测账号已验证：缺了它，
+        // 增量同步只要一有变更就炸，token-less 的全量同步反而不受影响，因为它
+        // 走的是"全部当 created"分支——但仍然按官方要求补全，不留隐患）。
+        const books = await client.fetchAddressBooks();
+        const book = books.find((b) => b.url === bookUrl) ?? { url: bookUrl };
         const result = await client.smartCollectionSyncDetailed({
-          collection: { url: bookUrl } as DAVAddressBook,
+          collection: { ...book, syncToken: undefined, objectMultiGet: client.addressBookMultiGet },
           method: 'webdav',
         });
         const out: { objects: CardObject[]; syncToken?: string } = {
@@ -176,8 +181,11 @@ export function createCardDavProvider(deps: {
     async syncSince(bookUrl, syncToken) {
       const client = await getClient();
       try {
+        // objectMultiGet 同样不可省：一旦这次增量同步真的带回变更对象，
+        // tsdav 会在没有它时直接抛"collection.objectMultiGet is required"——
+        // 这条路径在没有变更时不会触发，容易被无变更的测试/首次运行掩盖。
         const result = await client.smartCollectionSyncDetailed({
-          collection: { url: bookUrl, syncToken } as DAVAddressBook,
+          collection: { url: bookUrl, syncToken, objectMultiGet: client.addressBookMultiGet },
           method: 'webdav',
         });
         const delta: SyncDelta = {

@@ -29,6 +29,7 @@ function fakeClient(overrides: Record<string, unknown> = {}) {
     fetchVCards: vi.fn().mockResolvedValue([
       { url: 'https://contacts.icloud.com/1/card/a.vcf', etag: 'e1', data: 'BEGIN:VCARD\r\nEND:VCARD' },
     ]),
+    addressBookMultiGet: vi.fn().mockResolvedValue([]),
     createVCard: vi.fn().mockResolvedValue({ ok: true, status: 201, headers: new Headers({ ETag: 'e-new' }) }),
     updateVCard: vi.fn().mockResolvedValue({ ok: true, status: 204, headers: new Headers() }),
     deleteVCard: vi.fn().mockResolvedValue({ ok: true, status: 204, headers: new Headers() }),
@@ -86,19 +87,41 @@ describe('createCardDavProvider', () => {
     expect(books.map((b) => b.name)).toEqual(['个人', '工作']);
   });
 
-  it('never asks tsdav to enumerate a collection for us', async () => {
+  it('never asks tsdav to enumerate a collection via fetchVCards without objectUrls', async () => {
     // tsdav 的 fetchVCards 在缺少 objectUrls 时会内部调用 addressBookQuery
-    // （tsdav.esm.js:741），而 iCloud 对该 REPORT 返回 400。所以约束不是
-    // "不要直接调用 addressBookQuery"，而是"每一次 fetchVCards 都必须带 objectUrls"。
+    // （tsdav.esm.js:741），而 iCloud 对该 REPORT 返回 400。fetchAll 已经改用
+    // smartCollectionSyncDetailed，不再走 fetchVCards——这里只剩 fetchOne 会
+    // 调用它，约束仍然是"每一次 fetchVCards 调用都必须带 objectUrls"。
     const fetchVCards = vi.fn().mockResolvedValue([]);
     const provider = providerWith(fakeClient({ fetchVCards }));
 
-    await provider.fetchAll('https://contacts.icloud.com/1/card/');
     await provider.fetchOne('https://contacts.icloud.com/1/card/', 'https://c/a.vcf').catch(() => {});
 
     for (const call of fetchVCards.mock.calls) {
       const params = call[0] as { objectUrls?: string[] };
       expect(params.objectUrls, 'fetchVCards 不带 objectUrls 会触发 addressbook-query').toBeDefined();
+    }
+  });
+
+  it('always supplies objectMultiGet when syncing, as tsdav requires', async () => {
+    // tsdav.esm.js:544-546 —— 缺少 objectMultiGet 时，只要有变更对象就抛
+    // "collection.objectMultiGet is required for webdav sync changes"。
+    // 增量同步在无变更时不会触发，所以这条只能靠结构断言守，不能靠 mock 的返回值。
+    const smartCollectionSyncDetailed = vi.fn().mockResolvedValue({
+      url: 'https://c/1/card/',
+      syncToken: 'tok-2',
+      objects: { created: [], updated: [], deleted: [] },
+    });
+    const provider = providerWith(fakeClient({ smartCollectionSyncDetailed }));
+
+    await provider.fetchAll('https://contacts.icloud.com/1/card/');
+    await provider.syncSince('https://contacts.icloud.com/1/card/', 'tok-1');
+
+    expect(smartCollectionSyncDetailed).toHaveBeenCalledTimes(2);
+    for (const call of smartCollectionSyncDetailed.mock.calls) {
+      const params = call[0] as { collection: { objectMultiGet?: unknown }; method?: string };
+      expect(params.collection.objectMultiGet, '缺少 objectMultiGet，真实账号上一有变更就会抛').toBeTypeOf('function');
+      expect(params.method).toBe('webdav');
     }
   });
 
