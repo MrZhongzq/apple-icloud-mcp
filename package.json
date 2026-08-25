@@ -17,11 +17,14 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "start": "tsx src/bin/stdio.ts",
-    "serve": "node dist/bin/stdio.js"
+    "serve": "node dist/bin/stdio.js",
+    "start:http": "tsx src/bin/http.ts",
+    "serve:http": "node dist/bin/http.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "dotenv": "17.4.2",
+    "express": "5.2.1",
     "ical.js": "2.2.1",
     "imapflow": "1.7.2",
     "mailparser": "3.9.15",

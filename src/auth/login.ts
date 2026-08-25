@@ -119,7 +119,7 @@ export function renderLoginPage(params: { requestId: string; error?: string }): 
     '<body>' +
     '<h1>管理员登录</h1>' +
     errorHtml +
-    '<form method="post" action="/authorize">' +
+    '<form method="post" action="/admin-login">' +
     '<input type="hidden" name="request_id" value="' + requestId + '">' +
     '<label for="password">口令</label>' +
     '<input type="password" id="password" name="password" autocomplete="current-password" required autofocus>' +
