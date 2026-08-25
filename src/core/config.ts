@@ -1,5 +1,7 @@
+import path from 'node:path';
 import { z } from 'zod';
 import { AppError } from './errors.js';
+import { parseEncryptionKey } from '../auth/crypto.js';
 import type { LogLevel } from './logger.js';
 
 export interface Capabilities {
@@ -200,6 +202,94 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     logLevel: level.data,
     deprecations,
     notices,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 入口专属配置。只有 src/bin/http.ts（远程 Streamable HTTP + OAuth 传输）
+// 会调用 loadHttpConfig；stdio 入口（loadConfig/AppConfig）完全不依赖它，
+// 本地用户不会因为这里新增的变量而突然需要设置 PUBLIC_URL 才能启动。
+// ---------------------------------------------------------------------------
+
+export interface HttpConfig {
+  port: number;
+  publicUrl: URL;
+  adminPasswordHash: string;
+  tokenStorePath: string;
+  encryptionKey: Buffer;
+}
+
+const DEFAULT_HTTP_PORT = 17733;
+/** OAuth 元数据要求 issuer 是 https，但本地开发没有证书，所以这两个 host 豁免。 */
+const HTTPS_EXEMPT_HOSTS = new Set(['localhost', '127.0.0.1']);
+
+function requireHttpEnv(env: NodeJS.ProcessEnv, key: string, hint: string): string {
+  const value = clean(env[key]);
+  if (value === undefined) {
+    throw new AppError('INVALID_INPUT', `缺少必需的环境变量 ${key}`, { hint });
+  }
+  return value;
+}
+
+function parsePublicUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new AppError('INVALID_INPUT', `PUBLIC_URL 不是合法的 URL：${raw}`, {
+      hint: 'PUBLIC_URL 必须是完整 URL，例如 https://mcp.example.com',
+    });
+  }
+  const isExempt = HTTPS_EXEMPT_HOSTS.has(url.hostname);
+  if (url.protocol !== 'https:' && !isExempt) {
+    throw new AppError('INVALID_INPUT', 'PUBLIC_URL 必须使用 https', {
+      hint: 'OAuth 元数据要求 issuer 是 https；仅 localhost/127.0.0.1 可以用 http 做本地开发',
+    });
+  }
+  return url;
+}
+
+function readHttpPort(env: NodeJS.ProcessEnv): number {
+  const raw = clean(env.PORT);
+  if (raw === undefined) return DEFAULT_HTTP_PORT;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new AppError('INVALID_INPUT', `环境变量 PORT 必须是 1-65535 之间的整数，实际是：${raw}`, {
+      hint: 'PORT 留空则默认 17733',
+    });
+  }
+  return value;
+}
+
+/** 只有 HTTP 入口调用；缺少任一必填项即抛 AppError，绝不使用默认值兜底。 */
+export function loadHttpConfig(env: NodeJS.ProcessEnv): HttpConfig {
+  const publicUrlRaw = requireHttpEnv(
+    env,
+    'PUBLIC_URL',
+    'PUBLIC_URL 用作 OAuth issuer 与回调地址，例如 https://mcp.example.com',
+  );
+  const adminPasswordHash = requireHttpEnv(
+    env,
+    'ADMIN_PASSWORD_HASH',
+    '用 hashPassword() 为管理员口令生成 scrypt 哈希（形如 scrypt$32768$8$1$<salt>$<hash>）后设置为 ADMIN_PASSWORD_HASH，参见 README 的 HTTP 部署说明',
+  );
+  const tokenEncryptionKeyRaw = requireHttpEnv(
+    env,
+    'TOKEN_ENCRYPTION_KEY',
+    '设置 TOKEN_ENCRYPTION_KEY 为 32 字节密钥的 base64 编码，可用 openssl rand -base64 32 生成',
+  );
+
+  const publicUrl = parsePublicUrl(publicUrlRaw);
+  const encryptionKey = parseEncryptionKey(tokenEncryptionKeyRaw);
+  const port = readHttpPort(env);
+  const tokenStorePath = clean(env.TOKEN_STORE_PATH) ?? path.join(process.cwd(), 'data', 'tokens.json.enc');
+
+  return {
+    port,
+    publicUrl,
+    adminPasswordHash,
+    tokenStorePath,
+    encryptionKey,
   };
 }
 
