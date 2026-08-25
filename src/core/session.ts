@@ -24,12 +24,18 @@ export interface Session {
   providers: SessionProviders;
   /** 通讯录搜索缓存，首次搜索时才创建；随会话销毁而消失。 */
   contactsCache?: ContactsCache;
+  /** 建立会话时所属的 OAuth 令牌家族；stdio 入口不传，值为 undefined。
+   *  令牌被吊销时，`destroyByToken` 靠这个字段找到该家族名下的全部会话。 */
+  tokenFamilyId?: string;
 }
 
 export interface SessionStore {
-  create(account: AccountConfig): Session;
+  /** stdio 入口不传第二参数，行为与今天完全一致。 */
+  create(account: AccountConfig, tokenFamilyId?: string): Session;
   get(id: string): Session;
   destroy(id: string): Promise<boolean>;
+  /** 吊销令牌时调用：销毁该家族名下全部会话（逐个走 destroy，关闭底层连接），返回销毁数量。 */
+  destroyByToken(tokenFamilyId: string): Promise<number>;
   destroyAll(): Promise<void>;
   sweep(): Promise<number>;
   size(): number;
@@ -64,8 +70,16 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
     }
   };
 
+  const destroyById = async (id: string): Promise<boolean> => {
+    const session = sessions.get(id);
+    if (!session) return false;
+    sessions.delete(id);
+    await closeQuietly(session);
+    return true;
+  };
+
   return {
-    create(account) {
+    create(account, tokenFamilyId) {
       const timestamp = now();
       const session: Session = {
         id: randomUUID(),
@@ -73,6 +87,7 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
         createdAt: timestamp,
         lastActiveAt: timestamp,
         providers: options.providerFactory(account),
+        tokenFamilyId,
       };
       sessions.set(session.id, session);
       return session;
@@ -93,12 +108,19 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
       return session;
     },
 
-    async destroy(id) {
-      const session = sessions.get(id);
-      if (!session) return false;
-      sessions.delete(id);
-      await closeQuietly(session);
-      return true;
+    destroy(id) {
+      return destroyById(id);
+    },
+
+    async destroyByToken(tokenFamilyId) {
+      const matches = [...sessions.values()].filter((s) => s.tokenFamilyId === tokenFamilyId);
+      // 逐个走 destroyById：那条路径已经会关闭 IMAP/SMTP 连接，不能只从 Map 里删除——
+      // 否则会留下一条仍连着用户 iCloud 邮箱的活跃连接，而这正是吊销要阻止的事。
+      let count = 0;
+      for (const session of matches) {
+        if (await destroyById(session.id)) count += 1;
+      }
+      return count;
     },
 
     async destroyAll() {

@@ -86,12 +86,38 @@ function parseRoot(icsText: string): ICAL.Component {
   }
 }
 
-/** iCloud 下发的 VTIMEZONE 必须先注册，TZID 才能解析成正确的瞬时时间。 */
-function registerTimezones(root: ICAL.Component): void {
+/**
+ * iCloud 下发的 VTIMEZONE 必须先注册，TZID 才能解析成正确的瞬时时间。返回本次调用
+ * 实际注册（而非因为已存在而跳过）的 TZID 列表，供调用方精确摘除——跳过的那些不是
+ * 本次调用注册的，不能动。
+ */
+function registerTimezones(root: ICAL.Component): string[] {
+  const registered: string[] = [];
   for (const vtimezone of root.getAllSubcomponents('vtimezone')) {
     const tzid = vtimezone.getFirstPropertyValue('tzid');
     if (typeof tzid !== 'string' || ICAL.TimezoneService.has(tzid)) continue;
     ICAL.TimezoneService.register(new ICAL.Timezone(vtimezone), tzid);
+    registered.push(tzid);
+  }
+  return registered;
+}
+
+/**
+ * `ICAL.TimezoneService` is a single process-wide registry keyed only on the TZID
+ * string. Under concurrent tenants, two calendars that each carry a VTIMEZONE for the
+ * same TZID would otherwise have the first one's definition silently govern the
+ * second's parsing -- wrong, and wrong in a way that leaves no trace. Register-and-
+ * remove around each parse/patch call is the only isolation available without forking
+ * ical.js: it consults this global table from inside its own parsing path, so there is
+ * nothing to intercept. `try/finally` so a malformed calendar that throws mid-parse
+ * still gets cleaned up, rather than leaving a permanent squatter in the global table.
+ */
+function withTimezones<T>(root: ICAL.Component, fn: () => T): T {
+  const registered = registerTimezones(root);
+  try {
+    return fn();
+  } finally {
+    for (const tzid of registered) ICAL.TimezoneService.remove(tzid);
   }
 }
 
@@ -306,8 +332,14 @@ export function parseCalendarObject(
   options: ParseOptions = {},
 ): CalendarEvent[] {
   const root = parseRoot(icsText);
-  registerTimezones(root);
+  return withTimezones(root, () => parseCalendarObjectBody(root, ref, options));
+}
 
+function parseCalendarObjectBody(
+  root: ICAL.Component,
+  ref: ResourceRef,
+  options: ParseOptions,
+): CalendarEvent[] {
   const vevents = root.getAllSubcomponents('vevent');
   const master = vevents.find((c) => !c.hasProperty('recurrence-id'));
   if (!master) return [];
@@ -582,20 +614,20 @@ function resetSequence(vevent: ICAL.Component): void {
  */
 export function applyEventPatch(icsText: string, patch: Partial<EventInput>): string {
   const root = parseRoot(icsText);
-  registerTimezones(root);
+  return withTimezones(root, () => {
+    const vevent = root
+      .getAllSubcomponents('vevent')
+      .find((c) => !c.hasProperty('recurrence-id'));
+    if (!vevent) {
+      throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
+    }
 
-  const vevent = root
-    .getAllSubcomponents('vevent')
-    .find((c) => !c.hasProperty('recurrence-id'));
-  if (!vevent) {
-    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的事件');
-  }
+    applyPatchToVevent(vevent, patch);
+    bumpSequence(vevent);
+    refreshDtstamp(vevent);
 
-  applyPatchToVevent(vevent, patch);
-  bumpSequence(vevent);
-  refreshDtstamp(vevent);
-
-  return root.toString();
+    return root.toString();
+  });
 }
 
 export function readEventMeta(icsText: string): { uid: string; sequence: number } {
@@ -679,22 +711,23 @@ function addAnchoredProperty(component: ICAL.Component, name: string, anchored: 
  *  否则客户端各自独立渲染覆盖组件时，"已删除"的那次发生仍会出现（见 I2）。 */
 export function addExdate(icsText: string, recurrenceId: string): string {
   const root = parseRoot(icsText);
-  registerTimezones(root);
-  const master = findMaster(root);
-  const masterTzid = timezoneOf(master);
+  return withTimezones(root, () => {
+    const master = findMaster(root);
+    const masterTzid = timezoneOf(master);
 
-  const already = master
-    .getAllProperties('exdate')
-    .some((p) => sameInstant(p.getFirstValue() as ICAL.Time, recurrenceId, masterTzid));
+    const already = master
+      .getAllProperties('exdate')
+      .some((p) => sameInstant(p.getFirstValue() as ICAL.Time, recurrenceId, masterTzid));
 
-  const orphan = findOverride(root, recurrenceId, masterTzid);
-  if (orphan) root.removeSubcomponent(orphan);
+    const orphan = findOverride(root, recurrenceId, masterTzid);
+    if (orphan) root.removeSubcomponent(orphan);
 
-  if (!already) {
-    addAnchoredProperty(master, 'exdate', anchorToMaster(master, recurrenceId));
-  }
+    if (!already) {
+      addAnchoredProperty(master, 'exdate', anchorToMaster(master, recurrenceId));
+    }
 
-  return root.toString();
+    return root.toString();
+  });
 }
 
 // R1: recurrenceId is an absolute UTC instant, but a candidate's own RECURRENCE-ID
@@ -728,29 +761,30 @@ function findOverride(root: ICAL.Component, recurrenceId: string, tzid?: string)
  */
 export function upsertOverride(icsText: string, recurrenceId: string, input: EventInput): string {
   const root = parseRoot(icsText);
-  registerTimezones(root);
-  const master = findMaster(root);
-  const masterTzid = timezoneOf(master);
+  return withTimezones(root, () => {
+    const master = findMaster(root);
+    const masterTzid = timezoneOf(master);
 
-  const existingOverride = findOverride(root, recurrenceId, masterTzid);
-  if (existingOverride) {
-    applyPatchToVevent(existingOverride, input, { allowRecurrence: false });
-    bumpSequence(existingOverride);
-    refreshDtstamp(existingOverride);
+    const existingOverride = findOverride(root, recurrenceId, masterTzid);
+    if (existingOverride) {
+      applyPatchToVevent(existingOverride, input, { allowRecurrence: false });
+      bumpSequence(existingOverride);
+      refreshDtstamp(existingOverride);
+      return root.toString();
+    }
+
+    const override = new ICAL.Component(JSON.parse(JSON.stringify(master.jCal)) as unknown[]);
+    override.removeAllProperties('rrule');
+    override.removeAllProperties('exdate');
+    override.removeAllProperties('rdate');
+    addAnchoredProperty(override, 'recurrence-id', anchorToMaster(master, recurrenceId));
+    resetSequence(override);
+    refreshDtstamp(override);
+    applyPatchToVevent(override, input, { allowRecurrence: false });
+
+    root.addSubcomponent(override);
     return root.toString();
-  }
-
-  const override = new ICAL.Component(JSON.parse(JSON.stringify(master.jCal)) as unknown[]);
-  override.removeAllProperties('rrule');
-  override.removeAllProperties('exdate');
-  override.removeAllProperties('rdate');
-  addAnchoredProperty(override, 'recurrence-id', anchorToMaster(master, recurrenceId));
-  resetSequence(override);
-  refreshDtstamp(override);
-  applyPatchToVevent(override, input, { allowRecurrence: false });
-
-  root.addSubcomponent(override);
-  return root.toString();
+  });
 }
 
 export interface Reminder {
@@ -769,9 +803,7 @@ export interface Reminder {
 
 export function parseTodoObject(icsText: string, ref: ResourceRef): Reminder[] {
   const root = parseRoot(icsText);
-  registerTimezones(root);
-
-  return root.getAllSubcomponents('vtodo').map((vtodo) => {
+  return withTimezones(root, () => root.getAllSubcomponents('vtodo').map((vtodo) => {
     const status = String(vtodo.getFirstPropertyValue('status') ?? '').toUpperCase();
     const completedAt = vtodo.getFirstPropertyValue('completed');
     const percent = vtodo.getFirstPropertyValue('percent-complete');
@@ -805,7 +837,7 @@ export function parseTodoObject(icsText: string, ref: ResourceRef): Reminder[] {
     }
 
     return reminder;
-  });
+  }));
 }
 
 /**
@@ -901,18 +933,18 @@ function applyPatchToVtodo(vtodo: ICAL.Component, patch: Partial<ReminderInput>)
  */
 export function applyTodoPatch(icsText: string, patch: Partial<ReminderInput>): string {
   const root = parseRoot(icsText);
-  registerTimezones(root);
+  return withTimezones(root, () => {
+    const vtodo = root.getAllSubcomponents('vtodo')[0];
+    if (!vtodo) {
+      throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的待办');
+    }
 
-  const vtodo = root.getAllSubcomponents('vtodo')[0];
-  if (!vtodo) {
-    throw new AppError('UPSTREAM_ERROR', '日历数据中没有可识别的待办');
-  }
+    applyPatchToVtodo(vtodo, patch);
+    bumpSequence(vtodo);
+    refreshDtstamp(vtodo);
 
-  applyPatchToVtodo(vtodo, patch);
-  bumpSequence(vtodo);
-  refreshDtstamp(vtodo);
-
-  return root.toString();
+    return root.toString();
+  });
 }
 
 export function readTodoMeta(icsText: string): { uid: string; sequence: number } {
