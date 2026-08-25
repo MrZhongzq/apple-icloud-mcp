@@ -1658,12 +1658,20 @@ v1 用一个模块级 `transport` 变量承载连接，**第二个客户端接�
 ### 路由与中间件顺序
 
 ```
-app.use(cors(...))                         // 允许的来源见下
+app.use(cors(...))                              // 允许的来源见下
+app.post('/admin-login', rateLimit, 登录表单处理)  // 必须在 mcpAuthRouter 之前
 app.use(mcpAuthRouter({ provider, issuerUrl }))   // /.well-known/*、/authorize、/token、/register、/revoke
-app.post('/login', rateLimit, handleLoginSubmit 的 express 包装)
-app.get('/health', ...)                    // 不需要认证
+app.get('/health', ...)                         // 不需要认证
 app.all('/mcp', requireBearerAuth({ verifier: provider }), mcpHandler)
 ```
+
+### 登录表单不能用 `POST /authorize`
+
+Task 4 的登录页最初把表单 action 定为 `/authorize`。**那会和 SDK 撞车**：`mcpAuthRouter` 的授权处理器声明了 `allowedMethods(['GET', 'POST'])`，并且在 `POST` 时把请求体当成 OAuth 授权参数解析（`req.method === 'POST' ? req.body : req.query`，见 `handlers/authorize.js:79,123`）。于是登录表单提交会被它当作一个缺少 `client_id`／`code_challenge` 的授权请求直接拒掉，而报错信息完全指不到真正的原因。
+
+**表单 action 改为 `/admin-login`**，字段名 `request_id` 与 `password` 保持不变。同时改掉 `src/auth/login.ts` 中 `renderLoginPage` 里的 `action="/authorize"`——那一处是唯一的真相来源，改完要 grep 确认没有别处硬编码这个路径。
+
+路由注册顺序也要求 `/admin-login` 在 `mcpAuthRouter` **之前**：express 的 `router.use(path)` 是前缀匹配，先注册的先命中，把自己的路由放在后面容易被意外吞掉。
 
 **`/health` 必须在认证之前，且不得泄露任何信息**——只返回 `{ status: 'ok' }` 与进程启动时间。不要返回版本号、账号数、会话数：健康检查端点是公开的，它说的每一句话都是在对扫描者说。
 
