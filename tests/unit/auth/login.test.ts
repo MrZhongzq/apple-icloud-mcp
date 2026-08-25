@@ -48,7 +48,7 @@ describe('pending authorization store', () => {
   });
 
   it('expires a pending request', () => {
-    const store = createPendingStore(1);
+    const store = createPendingStore();
     const id = store.put({
       client_id: 'client-1',
       redirect_uri: REDIRECT,

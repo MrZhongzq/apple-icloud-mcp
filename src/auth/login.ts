@@ -33,16 +33,15 @@ export type PendingStore = {
 };
 
 const REQUEST_ID_BYTES = 32;
-/** 默认给 `createPendingStore()` 用；实际过期判断始终以 `PendingAuthorization.expires_at`
- *  为准（见上），这个常量只在调用方没传时兜底，不参与 store 内部的任何比较。 */
-const DEFAULT_PENDING_TTL_MS = 10 * 60_000;
 
 /**
- * 待授权请求的内存暂存区。`take()` 取出即删除——一次登录尝试要么成功换成授权码，要么失败
- * 后由 `handleLoginSubmit` 把同一个 `requestId` 原样放回去，让管理员能用同一张登录页重试。
+ * 待授权请求的内存暂存区。
+ *
+ * 刻意不接受 TTL 参数：过期时刻由存入方（`authorize()`）算好写在 `PendingAuthorization.expires_at`
+ * 里，store 只按那个字段判断。给它再加一个自己的 TTL，就等于让同一件事有两个真相来源——
+ * 两者一旦不一致，谁也说不清哪个说了算。
  */
-export function createPendingStore(ttlMs: number = DEFAULT_PENDING_TTL_MS): PendingStore {
-  void ttlMs;
+export function createPendingStore(): PendingStore {
   const pending = new Map<string, PendingAuthorization>();
 
   function isLive(entry: PendingAuthorization, now: number): boolean {
