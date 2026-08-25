@@ -150,12 +150,18 @@ export function createOAuthProvider(deps: {
   }
 
   async function challengeForAuthorizationCode(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     authorizationCode: string,
   ): Promise<string> {
     const pending = pendingCodes.get(hashToken(authorizationCode));
     if (!pending || pending.expires_at <= Date.now()) {
       throw new InvalidGrantError('授权码不存在或已过期');
+    }
+    // 目前这个返回值只在 SDK 内部做哈希比对，从不回显，且 exchangeAuthorizationCode 会在
+    // 签发令牌前再核对一次归属——但检查的价值不只在于挡住了什么，也在于下一个读者不必
+    // 自己重建这三步论证来确认「不检查也安全」。那个论证现在成立，不代表它会一直成立。
+    if (pending.client_id !== client.client_id) {
+      throw new InvalidGrantError('授权码不属于该客户端');
     }
     return pending.code_challenge;
   }
@@ -181,7 +187,10 @@ export function createOAuthProvider(deps: {
     if (pending.client_id !== client.client_id) {
       throw new InvalidGrantError('授权码不属于该客户端');
     }
-    if (redirectUri !== undefined && pending.redirect_uri !== redirectUri) {
+    // redirectUri 在 SDK 的 token schema 里是 optional 字段——调用方可以整个不发。
+    // 签发时 issueAuthorizationCode 总是记录一个具体的 redirect_uri，所以「没发」
+    // 和「发的不一样」都算不一致：RFC 6749 §4.1.3 要求无条件回比，不能因为字段缺席就放行。
+    if (pending.redirect_uri !== redirectUri) {
       throw new InvalidGrantError('redirect_uri 与签发时不一致');
     }
 

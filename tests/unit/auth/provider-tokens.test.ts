@@ -8,6 +8,7 @@ import { createAuthStore } from '../../../src/auth/store.js';
 import { createLogger } from '../../../src/core/logger.js';
 import type { SessionStore } from '../../../src/core/session.js';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { expectNoSecretLeak } from '../../helpers/no-secret-leak.js';
 
 const logger = createLogger('error', () => {});
 const REDIRECT = 'https://claude.ai/api/mcp/auth_callback';
@@ -110,6 +111,19 @@ describe('authorization codes', () => {
     ).rejects.toThrow();
   });
 
+  it('refuses a code when the token request omits redirect_uri entirely', async () => {
+    const { provider } = await makeProvider();
+    const code = provider.issueAuthorizationCode({
+      clientId: 'client-1',
+      redirectUri: REDIRECT,
+      codeChallenge: 'challenge-abc',
+      scopes: ['mcp'],
+    });
+    // SDK 的 token schema 把 redirect_uri 标为 optional，所以「不发」是客户端能做到的事，
+    // 而签发时总是记录了具体的 redirect_uri —— RFC 6749 §4.1.3 要求必须回比。
+    await expect(provider.exchangeAuthorizationCode(client, code, undefined, undefined)).rejects.toThrow();
+  });
+
   it('expires a code that is older than its ttl', async () => {
     const { provider } = await makeProvider({ authCodeTtlMs: 1 });
     const code = provider.issueAuthorizationCode({
@@ -139,6 +153,25 @@ describe('authorization codes', () => {
       provider.skipLocalPkceValidation ?? false,
       'true 会把 PKCE 校验推给上游，而这里没有上游',
     ).toBe(false);
+  });
+
+  it('never carries a token, code or hash in an error', async () => {
+    const { provider } = await makeProvider();
+    const code = provider.issueAuthorizationCode({
+      clientId: 'client-1',
+      redirectUri: REDIRECT,
+      codeChallenge: 'challenge-abc',
+      scopes: ['mcp'],
+    });
+    const { tokens } = await authorizeOnce(provider);
+
+    const codeErr = await provider
+      .exchangeAuthorizationCode(client, code, undefined, 'https://evil.example/cb')
+      .catch((e: unknown) => e);
+    expectNoSecretLeak(codeErr, [code]);
+
+    const tokenErr = await provider.verifyAccessToken('made-up-token').catch((e: unknown) => e);
+    expectNoSecretLeak(tokenErr, ['made-up-token', tokens.access_token, tokens.refresh_token!]);
   });
 });
 
