@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { loadHttpConfig } from '../../../src/core/config.js';
 import { AppError } from '../../../src/core/errors.js';
+import { expectNoSecretLeak } from '../../helpers/no-secret-leak.js';
 import { hashPassword, verifyPassword } from '../../../src/auth/crypto.js';
 import { randomBytes } from 'node:crypto';
 
@@ -119,8 +120,16 @@ describe('loadHttpConfig', () => {
         return e as AppError;
       }
     })();
-    const blob = JSON.stringify(err);
-    expect(blob).not.toContain(goodKey);
-    expect(blob).not.toContain('scrypt$');
+    // 不能只查 JSON.stringify：Error.prototype.message 不可枚举，序列化时整个看不见，
+    // 于是「把密钥写进 message」这种最直接的泄露会让这条测试永远绿。
+    expectNoSecretLeak(err, [goodKey, base.ADMIN_PASSWORD_HASH]);
+  });
+
+  it('would actually catch a secret leaked through the non-enumerable message channel', () => {
+    // 守住上一条测试的检查手段本身：把密钥塞进 message 造一个假错误，
+    // expectNoSecretLeak 必须抓到它。否则「不泄露」的保证只是看起来存在。
+    const fake = new AppError('INVALID_INPUT', `密钥有问题：${goodKey}`);
+    expect(() => expectNoSecretLeak(fake, [goodKey])).toThrow();
+    expect(JSON.stringify(fake), 'message 确实不可枚举，这正是旧写法失明的原因').not.toContain(goodKey);
   });
 });
