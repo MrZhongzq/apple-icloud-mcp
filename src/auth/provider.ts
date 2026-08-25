@@ -2,11 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import {
-  InvalidGrantError,
-  InvalidTokenError,
-  ServerError,
-} from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type {
   OAuthClientInformationFull,
   OAuthTokenRevocationRequest,
@@ -14,12 +10,17 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { AuthStore, StoredToken } from './store.js';
 import { generateToken, hashToken } from './crypto.js';
+import { createPendingStore, renderLoginPage, renderAuthorizeErrorPage } from './login.js';
+import type { PendingStore } from './login.js';
 import type { Logger } from '../core/logger.js';
 import type { SessionStore } from '../core/session.js';
 
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 3600_000;
 const DEFAULT_REFRESH_TOKEN_TTL_MS = 30 * 24 * 3600_000;
 const DEFAULT_AUTH_CODE_TTL_MS = 60_000;
+/** 一次待授权请求（等管理员在登录页确认）的存活时间——比授权码本身（60s）宽松得多，
+ *  因为这段时间里有一个真人在输密码，不是机器瞬时兑换。 */
+const DEFAULT_PENDING_AUTH_TTL_MS = 10 * 60_000;
 
 /**
  * `SessionStore.destroyByToken` 不属于本任务：它由 Task 5 加到 `src/core/session.ts` 上，
@@ -57,15 +58,20 @@ export function createOAuthProvider(deps: {
   store: AuthStore;
   sessions: SessionStore;
   logger: Logger;
+  /** Task 4：authorize() 把待授权请求暂存在这里。不传时内部自建一份——
+   *  这个依赖是新加的，老调用方（如既有的令牌测试）不必跟着改。 */
+  pending?: PendingStore;
   accessTokenTtlMs?: number;
   refreshTokenTtlMs?: number;
   authCodeTtlMs?: number;
 }): AppleOAuthProvider {
   const { store, logger } = deps;
   const sessions = deps.sessions as SessionStoreWithTokenDestroy;
+  const pending = deps.pending ?? createPendingStore();
   const accessTokenTtlMs = deps.accessTokenTtlMs ?? DEFAULT_ACCESS_TOKEN_TTL_MS;
   const refreshTokenTtlMs = deps.refreshTokenTtlMs ?? DEFAULT_REFRESH_TOKEN_TTL_MS;
   const authCodeTtlMs = deps.authCodeTtlMs ?? DEFAULT_AUTH_CODE_TTL_MS;
+  const pendingAuthTtlMs = DEFAULT_PENDING_AUTH_TTL_MS;
 
   /** 授权码只在内存里活着：Map<hashToken(code), PendingCode>。 */
   const pendingCodes = new Map<string, PendingCode>();
@@ -272,11 +278,34 @@ export function createOAuthProvider(deps: {
     get clientsStore() {
       return clientsStore;
     },
-    // 参数类型交给 AppleOAuthProvider 的返回类型注解做上下文推断（第三个参数是 express 的
-    // Response，本项目未装 @types/express，也不该为一个桩方法专门加依赖）。
-    async authorize(_client, _params, _res): Promise<void> {
-      // Task 4 实现登录流程后填充此方法。
-      throw new ServerError('authorize() 尚未实现，将由 Task 4 的登录流程提供');
+    // 第三个参数是真正的 express Response（@types/express 已装，见 Task 4 报告）——
+    // res.set()/res.status()/res.send() 在这里是类型检查过的，不是 any。这个方法本身只渲染
+    // 登录页或错误页，从不跳转：真正的 302（把 code/state 带回 redirect_uri，或早退时的
+    // res.redirect()）发生在管理员提交登录表单之后，由消费 handleLoginSubmit() 结果的路由完成。
+    async authorize(client, params, res): Promise<void> {
+      // redirect_uri 必须与客户端注册时的完全一致：不做前缀匹配、不做通配。
+      // 不匹配就不跳转——跳到一个未注册的地址正是开放重定向，这里是唯一会把用户
+      // 交给攻击者的地方。改成"仍然跳转但带错误"看起来更友好，实际上是同一个洞。
+      if (!client.redirect_uris.includes(params.redirectUri)) {
+        logger.warn('authorize: redirect_uri 未注册，拒绝跳转', {
+          clientId: client.client_id,
+        });
+        res.set('Cache-Control', 'no-store');
+        res.status(400).send(renderAuthorizeErrorPage('redirect_uri 未在客户端注册信息中登记，已拒绝'));
+        return;
+      }
+
+      const requestId = pending.put({
+        client_id: client.client_id,
+        redirect_uri: params.redirectUri,
+        code_challenge: params.codeChallenge,
+        scopes: params.scopes ?? [],
+        state: params.state,
+        expires_at: Date.now() + pendingAuthTtlMs,
+      });
+
+      res.set('Cache-Control', 'no-store');
+      res.send(renderLoginPage({ requestId }));
     },
     challengeForAuthorizationCode,
     exchangeAuthorizationCode,
