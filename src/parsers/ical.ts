@@ -87,52 +87,53 @@ function parseRoot(icsText: string): ICAL.Component {
 }
 
 /**
- * The `ICAL.TimezoneService.has(tzid)` gate this used to have meant "only remove what
- * I added", which leaves any TZID already present when a call started completely
- * untouched for the whole call -- including a stale/poisoned entry left by a different
- * tenant's document. Every VTIMEZONE this document carries must govern *this
- * document's own* parsing/patching regardless of what the global table already holds,
- * or `anchorToMaster` (`ICAL.TimezoneService.get(tzid)`, used by `addExdate`/
- * `upsertOverride` to anchor a new EXDATE/RECURRENCE-ID) silently anchors to the wrong
- * offset -- see ical-timezone-isolation.test.ts's "does not let a polluted global
- * registry corrupt an EXDATE". So we snapshot whatever was registered under each TZID
+ * `ICAL.TimezoneService` is a single process-wide registry keyed only on the TZID
+ * string. Under concurrent tenants, two calendars that each carry a VTIMEZONE for the
+ * same TZID would otherwise have the first one's definition silently govern the
+ * second's parsing -- wrong, and wrong in a way that leaves no trace. Every VTIMEZONE
+ * this document carries must govern *this document's own* parsing/patching regardless
+ * of what the global table already holds going in -- including a stale/poisoned entry
+ * left by a different tenant's document -- or `anchorToMaster`
+ * (`ICAL.TimezoneService.get(tzid)`, used by `addExdate`/`upsertOverride` to anchor a
+ * new EXDATE/RECURRENCE-ID) silently anchors to the wrong offset -- see
+ * ical-timezone-isolation.test.ts's "does not let a polluted global registry corrupt an
+ * EXDATE". So for every VTIMEZONE, we snapshot whatever was registered under that TZID
  * before this call (possibly nothing), unconditionally register this document's own
  * definition, and restore the snapshot afterward -- putting the previous entry back if
  * there was one, removing it if there wasn't. The registry's contents once this call
- * returns are identical to before it started; the only difference is what wins
- * *during* the call.
+ * returns are identical to before it started; the only difference is what wins *during*
+ * the call. Register-and-restore is the only isolation available without forking
+ * ical.js: it consults this global table from inside its own parsing path, so there is
+ * nothing to intercept.
+ *
+ * Registration happens *inside* the `try`, with `snapshots` initialised before it: if a
+ * document carries two VTIMEZONEs and the second registration throws, the first must
+ * still be restored in `finally`, not leaked because the throw happened before the try
+ * block was entered.
+ *
+ * A malformed document repeating the same TZID twice is skipped on its second
+ * occurrence: by the time that iteration runs, `has(tzid)` is already true (this call's
+ * own first registration), so a naive snapshot would capture *this call's own* leaked
+ * object as "the prior state" instead of what genuinely preceded this call -- `finally`
+ * would restore the true original first, then immediately overwrite it with this call's
+ * own object, leaving the registry holding something this call created. Keeping only the
+ * first snapshot per TZID avoids that.
  */
 interface TimezoneSnapshot {
   tzid: string;
   previous: ICAL.Timezone | undefined;
 }
 
-function registerTimezones(root: ICAL.Component): TimezoneSnapshot[] {
-  const snapshots: TimezoneSnapshot[] = [];
-  for (const vtimezone of root.getAllSubcomponents('vtimezone')) {
-    const tzid = vtimezone.getFirstPropertyValue('tzid');
-    if (typeof tzid !== 'string') continue;
-    const previous = ICAL.TimezoneService.has(tzid) ? ICAL.TimezoneService.get(tzid) : undefined;
-    ICAL.TimezoneService.register(new ICAL.Timezone(vtimezone), tzid);
-    snapshots.push({ tzid, previous });
-  }
-  return snapshots;
-}
-
-/**
- * `ICAL.TimezoneService` is a single process-wide registry keyed only on the TZID
- * string. Under concurrent tenants, two calendars that each carry a VTIMEZONE for the
- * same TZID would otherwise have the first one's definition silently govern the
- * second's parsing -- wrong, and wrong in a way that leaves no trace. Register-and-
- * restore around each parse/patch call is the only isolation available without forking
- * ical.js: it consults this global table from inside its own parsing path, so there is
- * nothing to intercept. `try/finally` so a malformed calendar that throws mid-parse
- * still restores the registry, rather than leaving a permanent squatter (or a
- * permanently lost prior entry) behind.
- */
 function withTimezones<T>(root: ICAL.Component, fn: () => T): T {
-  const snapshots = registerTimezones(root);
+  const snapshots: TimezoneSnapshot[] = [];
   try {
+    for (const vtimezone of root.getAllSubcomponents('vtimezone')) {
+      const tzid = vtimezone.getFirstPropertyValue('tzid');
+      if (typeof tzid !== 'string' || snapshots.some((s) => s.tzid === tzid)) continue;
+      const previous = ICAL.TimezoneService.has(tzid) ? ICAL.TimezoneService.get(tzid) : undefined;
+      ICAL.TimezoneService.register(new ICAL.Timezone(vtimezone), tzid);
+      snapshots.push({ tzid, previous });
+    }
     return fn();
   } finally {
     for (const { tzid, previous } of snapshots) {
@@ -281,7 +282,7 @@ function wallClockToUtcMillis(wall: WallClockParts, tzid: string): number {
  *
  * A third case looks identical to "genuinely floating" but isn't: a `DTSTART;TZID=X:...`
  * whose X has no matching VTIMEZONE in this object also resolves to `localTimezone` (see
- * `registerTimezones`), yet it very much has a stated timezone -- reading it as UTC
+ * `withTimezones`), yet it very much has a stated timezone -- reading it as UTC
  * wall-clock would be confidently wrong (and internally contradictory with the `timezone`
  * field we also report). `tzid` is the *raw* TZID string read off the property
  * (independent of whether ical.js managed to resolve it); when present in this branch, it
