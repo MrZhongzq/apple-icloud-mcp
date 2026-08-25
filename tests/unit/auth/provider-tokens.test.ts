@@ -262,3 +262,58 @@ describe('revocation', () => {
     await expect(provider.revokeToken!(client, { token: 'never-existed' })).resolves.toBeUndefined();
   });
 });
+
+describe('authorize (login page)', () => {
+  function fakeRes() {
+    const sent: { status?: number; body?: string; headers: Record<string, string> } = { headers: {} };
+    const res = {
+      set(k: string, v: string) {
+        sent.headers[k] = v;
+        return res;
+      },
+      status(code: number) {
+        sent.status = code;
+        return res;
+      },
+      send(body: string) {
+        sent.body = body;
+        return res;
+      },
+      redirect(url: string) {
+        sent.body = `REDIRECT:${url}`;
+        return res;
+      },
+    };
+    return { res: res as never, sent };
+  }
+
+  it('refuses to redirect to an unregistered redirect_uri', async () => {
+    const { provider } = await makeProvider();
+    const { res, sent } = fakeRes();
+
+    await provider.authorize(
+      { client_id: 'client-1', redirect_uris: [REDIRECT] } as OAuthClientInformationFull,
+      { redirectUri: 'https://evil.example/cb', codeChallenge: 'c', scopes: ['mcp'], state: 's' },
+      res,
+    );
+
+    expect(sent.status, '未注册的 redirect_uri 必须走错误页，不是跳转').toBe(400);
+    expect(sent.body ?? '', '一旦跳转到未注册地址，这就是开放重定向本身').not.toContain('REDIRECT:');
+    expect(sent.body ?? '').not.toContain('evil.example');
+  });
+
+  it('renders the login page for a registered redirect_uri', async () => {
+    const { provider } = await makeProvider();
+    const { res, sent } = fakeRes();
+
+    await provider.authorize(
+      { client_id: 'client-1', redirect_uris: [REDIRECT] } as OAuthClientInformationFull,
+      { redirectUri: REDIRECT, codeChallenge: 'c', scopes: ['mcp'], state: 's' },
+      res,
+    );
+
+    expect(sent.status).toBeUndefined();
+    expect(sent.headers['Cache-Control']).toBe('no-store');
+    expect(sent.body ?? '').toContain('type="password"');
+  });
+});

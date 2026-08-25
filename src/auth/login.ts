@@ -18,16 +18,18 @@ export interface PendingAuthorization {
 }
 
 /**
- * `createPendingStore()` 的返回类型。`put`/`take`/`sweep` 是对外的公开契约。`__restore` 不是——
- * 它只给 `handleLoginSubmit` 在口令错误时用：把刚 `take()` 出来的请求，原样放回同一个
- * `requestId` 下，好让已经发到浏览器手上的隐藏字段继续有效。`put()` 每次都生成新 id，
- * 没法承担这个角色，所以单独开一个方法，不写进公开的三方法契约里。
+ * `createPendingStore()` 的返回类型。`peek` 只读取、不消费——过期的一律当作不存在；
+ * `take` 消费掉一条记录，只在口令通过、即将签发授权码的那一刻调用。分开这两个方法是为了让
+ * `handleLoginSubmit` 不需要「先取出、失败了再放回去」：那种取了再撤销的写法，在两步之间
+ * 一旦抛异常就会把一条本该还能重试的待授权请求永久丢掉。
  */
 export type PendingStore = {
   put(p: PendingAuthorization): string;
+  /** 只读取，不消费；过期的一律当作不存在。 */
+  peek(requestId: string): PendingAuthorization | undefined;
+  /** 消费掉，用于口令通过、即将签发授权码的那一刻。 */
   take(requestId: string): PendingAuthorization | undefined;
   sweep(now?: number): number;
-  __restore(requestId: string, p: PendingAuthorization): void;
 };
 
 const REQUEST_ID_BYTES = 32;
@@ -43,17 +45,27 @@ export function createPendingStore(ttlMs: number = DEFAULT_PENDING_TTL_MS): Pend
   void ttlMs;
   const pending = new Map<string, PendingAuthorization>();
 
+  function isLive(entry: PendingAuthorization, now: number): boolean {
+    return entry.expires_at > now;
+  }
+
   return {
     put(p: PendingAuthorization): string {
       const requestId = randomBytes(REQUEST_ID_BYTES).toString('base64url');
       pending.set(requestId, p);
       return requestId;
     },
+    peek(requestId: string): PendingAuthorization | undefined {
+      const entry = pending.get(requestId);
+      if (entry === undefined) return undefined;
+      if (!isLive(entry, Date.now())) return undefined;
+      return entry;
+    },
     take(requestId: string): PendingAuthorization | undefined {
       const entry = pending.get(requestId);
       if (entry === undefined) return undefined;
       pending.delete(requestId);
-      if (entry.expires_at <= Date.now()) return undefined;
+      if (!isLive(entry, Date.now())) return undefined;
       return entry;
     },
     sweep(now: number = Date.now()): number {
@@ -65,9 +77,6 @@ export function createPendingStore(ttlMs: number = DEFAULT_PENDING_TTL_MS): Pend
         }
       }
       return removed;
-    },
-    __restore(requestId: string, p: PendingAuthorization): void {
-      pending.set(requestId, p);
     },
   };
 }
@@ -152,18 +161,21 @@ export function handleLoginSubmit(
 ): { redirectTo: string } | { error: string } {
   const { adminPasswordHash, provider, logger, pending } = deps;
 
-  const entry = pending.take(params.requestId);
+  const entry = pending.peek(params.requestId);
   if (entry === undefined) {
     return { error: '登录请求不存在或已过期，请重新发起授权' };
   }
 
   if (!verifyPassword(params.password, adminPasswordHash)) {
-    // 口令错，但这次授权请求本身还没过期——把它放回同一个 requestId 下，
-    // 这样管理员可以用同一张已经打开的登录页再试一次。
-    pending.__restore(params.requestId, entry);
+    // 口令错，但这次授权请求本身还没过期——只 peek 过，从没消费掉它，requestId 原样有效，
+    // 管理员可以用同一张已经打开的登录页再试一次。没有「取出再放回」的窗口可丢。
     logger.warn('admin login rejected: wrong password', { requestId: params.requestId });
     return { error: '口令不正确，请重试' };
   }
+
+  // 口令通过，这是唯一一次真正消费这条待授权请求的地方——用 take() 而不是 peek()，
+  // 保证同一个 requestId 不能被并发/重放来签发出两个授权码。
+  pending.take(params.requestId);
 
   const code = provider.issueAuthorizationCode({
     clientId: entry.client_id,
