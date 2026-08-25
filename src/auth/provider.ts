@@ -13,7 +13,7 @@ import { generateToken, hashToken } from './crypto.js';
 import { createPendingStore, renderLoginPage, renderAuthorizeErrorPage } from './login.js';
 import type { PendingStore } from './login.js';
 import type { Logger } from '../core/logger.js';
-import type { SessionStore } from '../core/session.js';
+import { TOKEN_FAMILY_KEY, type SessionStore } from '../core/session.js';
 
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 3600_000;
 const DEFAULT_REFRESH_TOKEN_TTL_MS = 30 * 24 * 3600_000;
@@ -253,6 +253,11 @@ export function createOAuthProvider(deps: {
       clientId: record.client_id,
       scopes: record.scopes,
       expiresAt: Math.floor(record.access_expires_at / 1000),
+      // 令牌家族必须一路带到工具层：`apple_login` 靠它把新建的会话登记到这个家族名下，
+      // 否则 `revokeToken`/重放检测调用的 `sessions.destroyByToken(familyId)` 永远匹配不到
+      // 任何会话——令牌作废了，可拿着 session_id 的一方仍然连着用户的 IMAP/SMTP。
+      // `AuthInfo.extra` 是 SDK 给这类附加数据留的正式位置，不是断言出来的字段。
+      extra: { [TOKEN_FAMILY_KEY]: record.family_id },
     };
   }
 

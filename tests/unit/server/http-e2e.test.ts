@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { createServer as createNodeServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -11,7 +11,7 @@ import { createPendingStore } from '../../../src/auth/login.js';
 import { hashPassword } from '../../../src/auth/crypto.js';
 import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig } from '../../../src/core/config.js';
-import type { SessionStore } from '../../../src/core/session.js';
+import { createSessionStore, type SessionStore } from '../../../src/core/session.js';
 
 /**
  * 端到端：真实 AuthStore + 真实 AppleOAuthProvider（不 mock），真的绑到 127.0.0.1:0 打
@@ -63,6 +63,10 @@ afterEach(() => {
 
 interface TestServer {
   base: string;
+  /** 真的 SessionStore，不是 vi.fn()——吊销那条测试要看的就是它里面还剩几条会话。 */
+  sessions: SessionStore;
+  /** 被销毁的会话关掉了哪些底层连接。 */
+  closedProviders: string[];
   close: () => Promise<void>;
 }
 
@@ -75,11 +79,32 @@ async function startServer(): Promise<TestServer> {
   await store.load();
 
   const pending = createPendingStore();
-  const sessions = {
-    create: vi.fn(),
-    get: vi.fn(),
-    destroyByToken: vi.fn().mockResolvedValue(0),
-  } as unknown as SessionStore;
+
+  // 真实的 SessionStore，只把最底下那层网络 provider 换成不连网的替身。
+  // 这里曾经整个是 `{ create: vi.fn(), destroyByToken: vi.fn() }`——于是"吊销令牌会不会
+  // 真的销毁会话"这个问题在本文件里根本问不出来：被问的那个对象就是假的。生产代码那时
+  // 恰好把会话建成了不带令牌家族的样子，`destroyByToken` 一条也匹配不到，而三个 mock 掉
+  // 关键环节的单测全是绿的。用真的 store，那个 bug 就无处可藏。
+  const closedProviders: string[] = [];
+  const sessions = createSessionStore({
+    ttlMs: 60_000,
+    providerFactory: () =>
+      ({
+        imap: {
+          verify: async (): Promise<void> => {},
+          close: async (): Promise<void> => {
+            closedProviders.push('imap');
+          },
+        },
+        smtp: {
+          close: async (): Promise<void> => {
+            closedProviders.push('smtp');
+          },
+        },
+        caldav: { verify: async (): Promise<void> => {} },
+        carddav: { verify: async (): Promise<void> => {} },
+      }) as never,
+  });
 
   const provider = createOAuthProvider({ store, sessions, logger, pending });
 
@@ -100,15 +125,21 @@ async function startServer(): Promise<TestServer> {
 
   return {
     base: `http://127.0.0.1:${port}`,
+    sessions,
+    closedProviders,
     async close() {
       await closeAll();
+      await sessions.destroyAll();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
 }
 
-/** register -> authorize -> admin-login -> token，返回 /token 的原始 status 与已解析的 body。 */
-async function runFullAuthFlow(base: string): Promise<{ status: number; body: Record<string, unknown> }> {
+/** register -> authorize -> admin-login -> token，返回 /token 的原始 status、已解析的 body
+ *  与这次动态注册拿到的 client_id（`/revoke` 需要它做客户端认证）。 */
+async function runFullAuthFlow(
+  base: string,
+): Promise<{ status: number; body: Record<string, unknown>; clientId: string }> {
   const codeVerifier = b64url(randomBytes(32));
   const codeChallenge = b64url(createHash('sha256').update(codeVerifier).digest());
 
@@ -167,7 +198,86 @@ async function runFullAuthFlow(base: string): Promise<{ status: number; body: Re
     }).toString(),
   });
   const body = (await tokenRes.json()) as Record<string, unknown>;
-  return { status: tokenRes.status, body };
+  return { status: tokenRes.status, body, clientId };
+}
+
+const NEWLINE = String.fromCharCode(10);
+const PROTOCOL_VERSION = '2025-06-18';
+
+/** Streamable HTTP 的 POST 回应是 SSE 帧，不是裸 JSON：把 data: 行挑出来解析。 */
+function parseSseMessages(text: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const rawLine of text.split(NEWLINE)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice('data:'.length).trim();
+    if (payload.length === 0) continue;
+    out.push(JSON.parse(payload) as Record<string, unknown>);
+  }
+  return out;
+}
+
+async function mcpPost(
+  base: string,
+  accessToken: string,
+  body: unknown,
+  mcpSessionId?: string,
+): Promise<{ status: number; mcpSessionId?: string; messages: Record<string, unknown>[]; raw: string }> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    'mcp-protocol-version': PROTOCOL_VERSION,
+    authorization: `Bearer ${accessToken}`,
+  };
+  if (mcpSessionId !== undefined) headers['mcp-session-id'] = mcpSessionId;
+
+  const res = await fetch(`${base}/mcp`, { method: 'POST', headers, body: JSON.stringify(body) });
+  const raw = await res.text();
+  return {
+    status: res.status,
+    mcpSessionId: res.headers.get('mcp-session-id') ?? undefined,
+    messages: parseSseMessages(raw),
+    raw,
+  };
+}
+
+/** initialize -> notifications/initialized -> tools/call apple_login，返回工具吐出的 session_id。
+ *  刻意走完整的 MCP 握手而不是直接调服务层函数：令牌家族正是在这条路上被 SDK 从
+ *  requireBearerAuth 一路传到工具回调第二个参数的，绕过它就等于没测。 */
+async function loginThroughMcp(base: string, accessToken: string): Promise<string> {
+  const init = await mcpPost(base, accessToken, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: 'revocation-probe', version: '1.0.0' },
+    },
+  });
+  expect(init.status, `initialize 失败 —— body: ${init.raw}`).toBe(200);
+  const mcpSessionId = init.mcpSessionId;
+  if (mcpSessionId === undefined) throw new Error('initialize did not return an mcp-session-id header');
+
+  await mcpPost(base, accessToken, { jsonrpc: '2.0', method: 'notifications/initialized' }, mcpSessionId);
+
+  const call = await mcpPost(
+    base,
+    accessToken,
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'apple_login', arguments: {} } },
+    mcpSessionId,
+  );
+  expect(call.status, `tools/call apple_login 失败 —— body: ${call.raw}`).toBe(200);
+
+  const message = call.messages.find((m) => m.id === 2);
+  const result = message?.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined;
+  const text = result?.content?.[0]?.text;
+  if (typeof text !== 'string') throw new Error(`apple_login returned no text content: ${call.raw}`);
+  const payload = JSON.parse(text) as { session_id?: string };
+  if (typeof payload.session_id !== 'string') {
+    throw new Error(`apple_login did not return a session_id: ${text}`);
+  }
+  return payload.session_id;
 }
 
 describe('oauth chain end to end (real provider, real store, real port)', () => {
@@ -226,6 +336,41 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
       // 401 之下不该出现 express 的默认错误页（那正是 WWW-Authenticate 头炸掉时的样子）
       expect(body).not.toContain('ERR_INVALID_CHAR');
       expect(body).not.toContain('<pre>');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // 这条测试问的是"吊销之后那条会话还在不在"，而不是"吊销之后 /mcp 还认不认这个令牌"。
+  // 后者由 verifyAccessToken 在 HTTP 边界上保证，令牌记录一删就自然成立——它在会话销毁
+  // 完全没接上的时候也照样是绿的，所以拿它当吊销的证据是假证据。这里直接看真实
+  // SessionStore 里还剩什么：会话没了、IMAP 连接关了，才叫票和人一起离场。
+  it('destroys the live MCP session the revoked token had authorized', async () => {
+    const srv = await startServer();
+    try {
+      const { body, clientId } = await runFullAuthFlow(srv.base);
+      const accessToken = body.access_token as string;
+
+      const sessionId = await loginThroughMcp(srv.base, accessToken);
+      expect(srv.sessions.size(), 'apple_login 应当建立了一条会话').toBe(1);
+      expect(srv.sessions.get(sessionId).id, 'session_id 在吊销前必须可用').toBe(sessionId);
+
+      const revokeRes = await fetch(`${srv.base}/revoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token: accessToken, client_id: clientId }).toString(),
+      });
+      expect(revokeRes.status, `POST /revoke —— body: ${await revokeRes.text()}`).toBe(200);
+
+      expect(
+        srv.sessions.size(),
+        '令牌已吊销，它授权建立的会话必须当场消失，而不是等 30 分钟空闲 TTL',
+      ).toBe(0);
+      expect(() => srv.sessions.get(sessionId), '被吊销的 session_id 必须立刻失效').toThrow();
+      expect(
+        srv.closedProviders,
+        '只从 Map 里删掉会留下一条还连着用户 iCloud 邮箱的 IMAP 连接',
+      ).toContain('imap');
     } finally {
       await srv.close();
     }

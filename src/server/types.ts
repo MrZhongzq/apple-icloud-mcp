@@ -1,6 +1,17 @@
 import type { ZodRawShape } from 'zod';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { SessionStore } from '../core/session.js';
 import type { Logger } from '../core/logger.js';
+
+/**
+ * MCP SDK 传给工具回调的第二个参数（`RequestHandlerExtra`）中我们用得到的那一小块。
+ * 只声明 `authInfo`，因为工具层只关心"这次调用是谁授权的"：远程 HTTP 入口下
+ * `requireBearerAuth` 会把 `verifyAccessToken` 的返回值挂在这里，stdio 入口下它是
+ * undefined。整个接口都是可选的，所以 24 个不关心授权上下文的工具一行都不用改。
+ */
+export interface ToolExtra {
+  authInfo?: AuthInfo;
+}
 
 export interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -30,7 +41,7 @@ export interface ToolRegistrar {
   registerTool(
     name: string,
     config: ToolConfig,
-    handler: (args: any) => Promise<ToolResult>,
+    handler: (args: any, extra?: ToolExtra) => Promise<ToolResult>,
   ): unknown;
 }
 

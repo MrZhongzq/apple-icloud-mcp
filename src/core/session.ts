@@ -41,6 +41,25 @@ export interface SessionStore {
   size(): number;
 }
 
+/**
+ * `AuthInfo.extra` 里存放令牌家族 ID 的键名。两端共用同一个常量而不是各写一遍字符串：
+ * 写入端是 `auth/provider.ts::verifyAccessToken`，读取端是 `modules/session/tools.ts`
+ * 里的 `apple_login`，中间隔着整个 SDK（requireBearerAuth → RequestHandlerExtra →
+ * 工具回调的第二个参数）。这条链上没有任何一步会对键名做类型检查，两边各写一个字面量
+ * 拼错了也不会有人报错——只会安静地退回"会话不带家族"，也就是吊销令牌销毁不了会话的那个
+ * bug 本身。放在这里而不是 auth/ 下，是为了不让 modules 反向依赖 auth：会话属于哪个令牌
+ * 家族本来就是 Session 自己的字段。
+ */
+export const TOKEN_FAMILY_KEY = 'tokenFamilyId';
+
+/** 从工具回调的 `extra` 里取出令牌家族 ID；没有（stdio 入口）或类型不对时返回 undefined。 */
+export function tokenFamilyIdFrom(extra?: {
+  authInfo?: { extra?: Record<string, unknown> | undefined } | undefined;
+}): string | undefined {
+  const value = extra?.authInfo?.extra?.[TOKEN_FAMILY_KEY];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 export interface SessionStoreOptions {
   ttlMs: number;
   providerFactory: ProviderFactory;

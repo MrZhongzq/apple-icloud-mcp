@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { findAccount, type AppConfig } from '../../core/config.js';
 import { AppError } from '../../core/errors.js';
+import { tokenFamilyIdFrom } from '../../core/session.js';
 import { wrapTool } from '../../server/wrap.js';
 import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
 
@@ -41,7 +42,7 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    wrapTool(logger, 'apple_login', async (args: { account?: string }) => {
+    wrapTool(logger, 'apple_login', async (args: { account?: string }, extra) => {
       const account = findAccount(config, args.account);
 
       // 每个协议只在它服务的能力真的开着时才验证。无条件验证 IMAP 会把
@@ -61,7 +62,10 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
         });
       }
 
-      const session = sessions.create(account);
+      // 远程 HTTP 入口下，这次调用是被某个 OAuth 访问令牌放行的；把那个令牌所属的家族
+      // 登记到会话上，吊销该令牌时 `destroyByToken` 才找得到这条会话并真的关掉它的
+      // IMAP/SMTP 连接。stdio 入口没有 authInfo，值为 undefined，行为与以前完全一致。
+      const session = sessions.create(account, tokenFamilyIdFrom(extra));
 
       try {
         if (needsImap) await session.providers.imap.verify();
