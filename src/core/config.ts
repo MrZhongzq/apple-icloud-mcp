@@ -232,9 +232,16 @@ const GENERATE_ADMIN_HASH_HINT =
   `{input:process.stdin,output:process.stderr});r.question('password: ',p=>{r.close();` +
   `import('./dist/auth/crypto.js').then(m=>console.log(m.hashPassword(p)))})"`;
 
+/** 显式、独立于共享的 clean() 做 trim——不是因为 clean() 不够，而是让"HTTP 配置在存进
+ *  HttpConfig 之前会被 trim"这件事在这里自己说清楚，不必让读者去翻 clean() 的实现才能确认。
+ *  这三个变量（PUBLIC_URL / ADMIN_PASSWORD_HASH / TOKEN_ENCRYPTION_KEY）都经过这里，
+ *  所以粘贴带来的首尾空白——比如 .env 里 "KEY= value" 等号后的那个空格——三个都会被处理。
+ *  尾部的换行符不需要特殊处理：trim() 本身就会去掉它，而下游的 base64url 解码就算留着换行符
+ *  也会忽略它，所以真正会改变解码结果的只有首尾空白，不是所有"看不见的字符"都要挡。 */
 function requireHttpEnv(env: NodeJS.ProcessEnv, key: string, hint: string): string {
-  const value = clean(env[key]);
-  if (value === undefined) {
+  const raw = env[key];
+  const value = raw === undefined ? undefined : raw.trim();
+  if (value === undefined || value.length === 0) {
     throw new AppError('INVALID_INPUT', `缺少必需的环境变量 ${key}`, { hint });
   }
   return value;

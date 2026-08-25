@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { loadHttpConfig } from '../../../src/core/config.js';
 import { AppError } from '../../../src/core/errors.js';
+import { hashPassword, verifyPassword } from '../../../src/auth/crypto.js';
 import { randomBytes } from 'node:crypto';
 
 const goodKey = randomBytes(32).toString('base64');
@@ -51,6 +52,28 @@ describe('loadHttpConfig', () => {
 
   it('still accepts the well-formed hash fixture the other tests rely on', () => {
     expect(() => loadHttpConfig({ ...base } as NodeJS.ProcessEnv)).not.toThrow();
+  });
+
+  it('trims a whitespace-padded ADMIN_PASSWORD_HASH so the loaded value still verifies the original password', () => {
+    // Simulates the ordinary paste accidents that produce padding: a leading space from
+    // ".env" syntax like "ADMIN_PASSWORD_HASH= <value>", and trailing space picked up when
+    // copying out of a terminal. The property that matters is not "load succeeds" but that
+    // the loaded hash can still authenticate the password it was generated from.
+    const plain = 'correct horse battery staple';
+    const stored = hashPassword(plain);
+    const padded = '  ' + stored + '  ';
+    const cfg = loadHttpConfig({ ...base, ADMIN_PASSWORD_HASH: padded } as NodeJS.ProcessEnv);
+    expect(verifyPassword(plain, cfg.adminPasswordHash)).toBe(true);
+  });
+
+  it('trims a whitespace-padded TOKEN_ENCRYPTION_KEY to a usable 32-byte key', () => {
+    const cfg = loadHttpConfig({ ...base, TOKEN_ENCRYPTION_KEY: '  ' + goodKey + '  ' } as NodeJS.ProcessEnv);
+    expect(cfg.encryptionKey).toHaveLength(32);
+  });
+
+  it('trims a whitespace-padded PUBLIC_URL', () => {
+    const cfg = loadHttpConfig({ ...base, PUBLIC_URL: '  https://mcp.example.com  ' } as NodeJS.ProcessEnv);
+    expect(cfg.publicUrl.origin).toBe('https://mcp.example.com');
   });
 
   it('requires TOKEN_ENCRYPTION_KEY and validates its length', () => {
