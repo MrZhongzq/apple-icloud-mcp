@@ -87,19 +87,36 @@ function parseRoot(icsText: string): ICAL.Component {
 }
 
 /**
- * iCloud 下发的 VTIMEZONE 必须先注册，TZID 才能解析成正确的瞬时时间。返回本次调用
- * 实际注册（而非因为已存在而跳过）的 TZID 列表，供调用方精确摘除——跳过的那些不是
- * 本次调用注册的，不能动。
+ * The `ICAL.TimezoneService.has(tzid)` gate this used to have meant "only remove what
+ * I added", which leaves any TZID already present when a call started completely
+ * untouched for the whole call -- including a stale/poisoned entry left by a different
+ * tenant's document. Every VTIMEZONE this document carries must govern *this
+ * document's own* parsing/patching regardless of what the global table already holds,
+ * or `anchorToMaster` (`ICAL.TimezoneService.get(tzid)`, used by `addExdate`/
+ * `upsertOverride` to anchor a new EXDATE/RECURRENCE-ID) silently anchors to the wrong
+ * offset -- see ical-timezone-isolation.test.ts's "does not let a polluted global
+ * registry corrupt an EXDATE". So we snapshot whatever was registered under each TZID
+ * before this call (possibly nothing), unconditionally register this document's own
+ * definition, and restore the snapshot afterward -- putting the previous entry back if
+ * there was one, removing it if there wasn't. The registry's contents once this call
+ * returns are identical to before it started; the only difference is what wins
+ * *during* the call.
  */
-function registerTimezones(root: ICAL.Component): string[] {
-  const registered: string[] = [];
+interface TimezoneSnapshot {
+  tzid: string;
+  previous: ICAL.Timezone | undefined;
+}
+
+function registerTimezones(root: ICAL.Component): TimezoneSnapshot[] {
+  const snapshots: TimezoneSnapshot[] = [];
   for (const vtimezone of root.getAllSubcomponents('vtimezone')) {
     const tzid = vtimezone.getFirstPropertyValue('tzid');
-    if (typeof tzid !== 'string' || ICAL.TimezoneService.has(tzid)) continue;
+    if (typeof tzid !== 'string') continue;
+    const previous = ICAL.TimezoneService.has(tzid) ? ICAL.TimezoneService.get(tzid) : undefined;
     ICAL.TimezoneService.register(new ICAL.Timezone(vtimezone), tzid);
-    registered.push(tzid);
+    snapshots.push({ tzid, previous });
   }
-  return registered;
+  return snapshots;
 }
 
 /**
@@ -107,17 +124,24 @@ function registerTimezones(root: ICAL.Component): string[] {
  * string. Under concurrent tenants, two calendars that each carry a VTIMEZONE for the
  * same TZID would otherwise have the first one's definition silently govern the
  * second's parsing -- wrong, and wrong in a way that leaves no trace. Register-and-
- * remove around each parse/patch call is the only isolation available without forking
+ * restore around each parse/patch call is the only isolation available without forking
  * ical.js: it consults this global table from inside its own parsing path, so there is
  * nothing to intercept. `try/finally` so a malformed calendar that throws mid-parse
- * still gets cleaned up, rather than leaving a permanent squatter in the global table.
+ * still restores the registry, rather than leaving a permanent squatter (or a
+ * permanently lost prior entry) behind.
  */
 function withTimezones<T>(root: ICAL.Component, fn: () => T): T {
-  const registered = registerTimezones(root);
+  const snapshots = registerTimezones(root);
   try {
     return fn();
   } finally {
-    for (const tzid of registered) ICAL.TimezoneService.remove(tzid);
+    for (const { tzid, previous } of snapshots) {
+      if (previous) {
+        ICAL.TimezoneService.register(previous, tzid);
+      } else {
+        ICAL.TimezoneService.remove(tzid);
+      }
+    }
   }
 }
 
