@@ -8,6 +8,17 @@ import { decryptJson, encryptJson, hashToken } from './crypto.js';
 export interface StoredClient {
   client_id: string;
   client_secret?: string;
+  /**
+   * 客户端密钥的过期时刻（**秒**级 epoch，与 RFC 7591 的 `client_secret_expires_at` 同单位，
+   * 而不是本文件其余时间戳用的毫秒）；0 表示永不过期，公开客户端为 undefined。
+   *
+   * 这个字段必须真的存下来：SDK 的客户端认证检查写作
+   * `if (client.client_secret_expires_at && client.client_secret_expires_at < now)`，
+   * 字段缺席时整段判断被跳过。而 `/register` 的 201 响应里这个字段是有的——注册处理器
+   * 自己算好了 30 天后的时刻并放进返回体。也就是说：不存的话，服务器会告诉每个机密客户端
+   * "你的密钥 30 天后过期"，然后永远认它。泄露的 client_secret 于是永久有效。
+   */
+  client_secret_expires_at?: number;
   client_name?: string;
   redirect_uris: string[];
   created_at: number;

@@ -61,6 +61,24 @@ describe('client registration', () => {
     expect(got?.redirect_uris).toEqual(['https://claude.ai/api/mcp/auth_callback']);
   });
 
+  // 密钥过期时刻必须活过一次重启：SDK 的客户端认证是在 getClient() 的返回值上判断的，
+  // 重载后字段丢了，那段检查就又变回"永远跳过"，泄露的 client_secret 重新变成永久有效。
+  it('round-trips client_secret_expires_at through a reload', async () => {
+    const store = makeStore();
+    await store.load();
+    const expiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
+    await store.registerClient({
+      client_id: 'c1',
+      client_secret: 'top-secret',
+      client_secret_expires_at: expiresAt,
+      redirect_uris: ['https://x/cb'],
+    });
+
+    const reopened = makeStore();
+    await reopened.load();
+    expect((await reopened.getClient('c1'))?.client_secret_expires_at).toBe(expiresAt);
+  });
+
   it('creates the directory when it does not exist yet', async () => {
     const store = makeStore();
     await store.load();

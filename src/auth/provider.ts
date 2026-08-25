@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import {
+  InvalidGrantError,
+  InvalidScopeError,
+  InvalidTokenError,
+} from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type {
   OAuthClientInformationFull,
   OAuthTokenRevocationRequest,
@@ -83,6 +87,9 @@ export function createOAuthProvider(deps: {
       return {
         client_id: stored.client_id,
         client_secret: stored.client_secret,
+        // 必须原样带回：SDK 的 authenticateClient 就是在这个返回值上判断密钥是否过期的，
+        // 少了它那段检查会被整个跳过（`if (client.client_secret_expires_at && …)`）。
+        client_secret_expires_at: stored.client_secret_expires_at,
         redirect_uris: stored.redirect_uris,
         client_name: stored.client_name,
       } as OAuthClientInformationFull;
@@ -94,6 +101,9 @@ export function createOAuthProvider(deps: {
       const saved = await store.registerClient({
         client_id: clientId,
         client_secret: client.client_secret,
+        // 注册处理器已经算好了这个时刻（默认签发后 30 天，公开客户端为 undefined）。
+        // 存下来，201 响应里那句"30 天后过期"才是真的会被执行的承诺。
+        client_secret_expires_at: client.client_secret_expires_at,
         client_name: client.client_name,
         redirect_uris: client.redirect_uris,
       });
@@ -101,6 +111,7 @@ export function createOAuthProvider(deps: {
         ...client,
         client_id: saved.client_id,
         client_secret: saved.client_secret,
+        client_secret_expires_at: saved.client_secret_expires_at,
         client_id_issued_at: Math.floor(saved.created_at / 1000),
       } as OAuthClientInformationFull;
     },
@@ -125,12 +136,19 @@ export function createOAuthProvider(deps: {
     return code;
   }
 
-  /** 签发一对新令牌并落盘，返回 SDK 期望的响应形状。 */
-  async function issueTokenPair(
+  /**
+   * 生成一对新令牌与它的存储记录，返回 SDK 期望的响应形状。**不落盘**——落盘由调用方做，
+   * 因为两个调用方要走的是不同的写入路径：授权码兑换用 `saveTokens`（新增一条），刷新
+   * 用 `rotateRefresh`（把旧记录标记 rotated 并写入新记录）。这里原先顺手调了一次
+   * `saveTokens`，于是每次刷新都把同一条新记录写两遍：`rotateRefresh` 再 push 一次，
+   * 快照里就多出一条重复记录（一次授权加三次刷新会得到 7 条，而不是 4 条）。索引会被后写的
+   * 那份覆盖，所以不是数据损坏，但整份快照每次都要重写，文件增长速度大约是应有的两倍。
+   */
+  function buildTokenPair(
     clientId: string,
     scopes: string[],
     familyId: string,
-  ): Promise<{ tokens: OAuthTokens; record: StoredToken }> {
+  ): { tokens: OAuthTokens; record: StoredToken } {
     const accessToken = generateToken();
     const refreshToken = generateToken();
     const now = Date.now();
@@ -144,7 +162,6 @@ export function createOAuthProvider(deps: {
       refresh_expires_at: now + refreshTokenTtlMs,
       rotated: false,
     };
-    await store.saveTokens(record);
     const tokens: OAuthTokens = {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -208,7 +225,8 @@ export function createOAuthProvider(deps: {
       throw new InvalidGrantError('redirect_uri does not match the value used when the code was issued');
     }
 
-    const { tokens } = await issueTokenPair(pending.client_id, pending.scopes, randomUUID());
+    const { tokens, record } = buildTokenPair(pending.client_id, pending.scopes, randomUUID());
+    await store.saveTokens(record);
     return tokens;
   }
 
@@ -233,12 +251,23 @@ export function createOAuthProvider(deps: {
       throw new InvalidGrantError('refresh token replay detected; the token family has been revoked, re-authorize');
     }
 
+    // RFC 6749 §6：刷新时请求的 scope 必须是原始授权的子集，绝不能借刷新扩权。
+    // 今天这条检查在本服务上"没有实际后果"，因为 requireBearerAuth 是不带 requiredScopes
+    // 调的，没有任何地方按 scope 做决策——但那正是不能用来免检的理由：它成立与否取决于
+    // 别处一个随时可能改的调用点，而不是取决于这里。谁哪天加上一个 scope 检查，
+    // 一个只被授予 ['mcp'] 的客户端就能拿着 scope=admin 刷新出一个 admin 令牌来。
+    // 消息保持 ASCII：InvalidScopeError 会被 token.js 序列化进 JSON body，虽然不进
+    // 响应头，但错误类归一化文案在本文件里统一按 ASCII 写。
+    if (scopes !== undefined) {
+      const granted = new Set(record.scopes);
+      const escalated = scopes.filter((scope) => !granted.has(scope));
+      if (escalated.length > 0) {
+        throw new InvalidScopeError('requested scope exceeds the scope of the original grant');
+      }
+    }
     const nextScopes = scopes ?? record.scopes;
-    const { tokens, record: nextRecord } = await issueTokenPair(
-      record.client_id,
-      nextScopes,
-      record.family_id,
-    );
+    const { tokens, record: nextRecord } = buildTokenPair(record.client_id, nextScopes, record.family_id);
+    // 只写这一次：rotateRefresh 既标记旧记录、又写入新记录，前面 buildTokenPair 不落盘。
     await store.rotateRefresh(refreshToken, nextRecord);
     return tokens;
   }
@@ -300,7 +329,10 @@ export function createOAuthProvider(deps: {
       // 不匹配就不跳转——跳到一个未注册的地址正是开放重定向，这里是唯一会把用户
       // 交给攻击者的地方。改成"仍然跳转但带错误"看起来更友好，实际上是同一个洞。
       if (!client.redirect_uris.includes(params.redirectUri)) {
-        logger.warn('authorize: redirect_uri 未注册，拒绝跳转', {
+        // 操作者日志通道统一用英文：login.ts / store.ts / httpApp.ts / bin/*.ts 里
+        // 每一条 logger.* 都是英文，只有这一条是中文。面向用户的页面文案仍然是中文，
+        // 那是另一个通道（见下面那句 renderAuthorizeErrorPage）。
+        logger.warn('authorize: redirect_uri is not registered for this client, refusing to redirect', {
           clientId: client.client_id,
         });
         res.set('Cache-Control', 'no-store');
