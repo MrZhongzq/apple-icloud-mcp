@@ -1,8 +1,21 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import ICAL from 'ical.js';
 import { parseCalendarObject, addExdate, applyEventPatch } from '../../../src/parsers/ical.js';
 
 const ref = { collectionUrl: 'https://c/1/cal/', resourceUrl: 'https://c/1/cal/a.ics' };
+
+/**
+ * 每条用例都从「注册表里没有 Asia/Shanghai」出发。
+ *
+ * 原来的写法是先记下 `before = has(...)`、事后比对「有没有变化」。那种断言依赖执行顺序：
+ * 一旦前一条用例泄漏了这个 TZID（正是变异实验会造成的情形），后一条的基线就变成 true，
+ * 于是它的断言恒真、看起来通过。这个假象在整文件运行时出现过，单独跑才会红。
+ *
+ * 我们真正要断言的是「注册表是干净的」，不是「注册表没变化」——前者与顺序无关。
+ */
+beforeEach(() => {
+  ICAL.TimezoneService.remove('Asia/Shanghai');
+});
 const CRLF = String.fromCharCode(13, 10);
 
 /** 两份都声明 Asia/Shanghai，但偏移量不同 —— 现实中不会这样，正因如此它能证明串扰。
@@ -71,16 +84,16 @@ function calendarWithDuplicateTz(offsetA: string, offsetB: string, hour: string)
 
 describe('timezone registry isolation', () => {
   it('leaves no TZID registered after parsing', () => {
-    const before = ICAL.TimezoneService.has('Asia/Shanghai');
+    expect(ICAL.TimezoneService.has('Asia/Shanghai'), '前置条件：注册表应当是干净的').toBe(false);
     parseCalendarObject(calendarWithTz('+0800', '10'), ref);
     expect(
       ICAL.TimezoneService.has('Asia/Shanghai'),
       '解析完必须把自己注册的 TZID 摘掉，否则下一个租户的同名时区会被它支配',
-    ).toBe(before);
+    ).toBe(false);
   });
 
   it('restores the registry when the wrapped work throws after registration', () => {
-    const before = ICAL.TimezoneService.has('Asia/Shanghai');
+    expect(ICAL.TimezoneService.has('Asia/Shanghai'), '前置条件：注册表应当是干净的').toBe(false);
     // 只有 VTIMEZONE、没有 VEVENT：registerTimezones 会先注册成功，
     // 随后 applyEventPatch 因为找不到 VEVENT 而抛 —— 这才走到 finally。
     // 原来那条测试用截断日历，异常在 parseRoot 里就抛了，根本没注册过东西。
@@ -97,7 +110,7 @@ describe('timezone registry isolation', () => {
     expect(
       ICAL.TimezoneService.has('Asia/Shanghai'),
       '注册之后才抛的异常必须走到 finally，否则一份坏日历就在全局表里留下永久占位',
-    ).toBe(before);
+    ).toBe(false);
   });
 
   it('does not let a polluted global registry corrupt an EXDATE', () => {
