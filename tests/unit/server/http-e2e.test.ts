@@ -230,4 +230,45 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
       await srv.close();
     }
   });
+
+  // 未认证请求不该碰到这条路径（requireBearerAuth 先挡住），但一个真正通过认证的调用方
+  // 完全可能自己发一个畸形 JSON body 过来——这条测试打的是终态错误处理中间件本身：
+  // body-parser 抛出的 SyntaxError 必须被压成固定 JSON 形状，绝不是 Express 默认错误页。
+  it('normalizes a malformed body from an authenticated caller instead of leaking a stack trace', async () => {
+    const srv = await startServer();
+    try {
+      const { body: tokenBody } = await runFullAuthFlow(srv.base);
+      const accessToken = tokenBody.access_token as string;
+
+      const res = await fetch(`${srv.base}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${accessToken}`,
+        },
+        body: '{not valid json',
+      });
+      const responseBody = await res.text();
+
+      expect(responseBody, '不能是 Express 默认错误页').not.toContain('<pre>');
+      expect(responseBody, '不能带堆栈行').not.toContain('at ');
+      expect(responseBody, '不能带文件系统路径').not.toContain('node_modules');
+
+      // 走到这里说明认证已经通过（否则会在 requireBearerAuth 就被拦成 401），
+      // 剩下的失败只可能来自 body-parser 抛出的 SyntaxError，必须被终态错误处理
+      // 中间件压成与 /mcp 处理器自己的 500 分支一致的固定 JSON 形状。
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(responseBody) as Record<string, unknown>;
+      } catch {
+        parsed = null;
+      }
+      expect(parsed, '响应必须是可解析的 JSON，不是 HTML 错误页').not.toBeNull();
+      expect((parsed as Record<string, unknown>).jsonrpc).toBe('2.0');
+      expect((parsed as Record<string, unknown>).error).toBeTruthy();
+    } finally {
+      await srv.close();
+    }
+  });
 });

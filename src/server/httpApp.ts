@@ -238,10 +238,14 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
   const { handler: mcpHandler, closeAll } = createMcpRouteHandler({ config, sessions, logger });
   const verifier = createVerifier(provider);
 
-  app.use('/mcp', express.json());
-  // 这一行是整个文件最重要的一行：requireBearerAuth 必须在 mcpHandler 之前。
-  // 顺序弄反，之前五个任务做的全部防护形同虚设——见下方的鉴别性实验。
-  app.all('/mcp', requireBearerAuth({ verifier }), (req: Request, res: Response) => {
+  // 这一行是整个文件最重要的一行：requireBearerAuth 必须在 express.json() 之前，也在
+  // mcpHandler 之前。顺序弄反有两层后果：一是之前五个任务做的全部认证防护形同虚设
+  // ——见下方第一个鉴别性实验；二是未认证请求会先摸到 body 解析器，一个畸形 JSON body
+  // 就能让 express.json() 抛出的 SyntaxError 一路冒到 Express 默认错误页，把绝对路径
+  // 和堆栈发给一个从没证明过身份的调用方——这和 /health 只回 { status: 'ok' } 是同一条
+  // 原则，只是从另一扇门泄漏。requireBearerAuth 挡在最前面，未认证请求根本碰不到
+  // express.json()，这类请求体永远不会被解析。见下方第二个鉴别性实验。
+  app.all('/mcp', requireBearerAuth({ verifier }), express.json(), (req: Request, res: Response) => {
     mcpHandler(req, res).catch((err: unknown) => {
       logger.error('mcp request handling failed', {
         detail: err instanceof Error ? err.name : typeof err,
@@ -253,6 +257,29 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
           id: null,
         });
       }
+    });
+  });
+
+  // 终态错误处理中间件：必须最后注册、四个参数（err, req, res, next）——这是 Express
+  // 识别"这是错误处理器"的唯一方式，少一个参数就会被当成普通中间件而永远跳过。
+  // 兜底任何没被各路由自己 catch 住的异常（body-parser 解析畸形请求体抛出的 SyntaxError
+  // 是本轮修复的直接起因，但这道兜底不只为它存在，也接住以后任何新路由漏接的异常）。
+  // 绝不依赖 NODE_ENV=production 去掩盖 Express 默认错误页——那是一个部署者可能忘记设置
+  // 的环境变量，不构成安全属性。真实错误只经 logger 落地，响应体永远是同一个固定形状，
+  // 不带堆栈、不带文件系统路径、不带任何关于这次失败具体是什么的信息。
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      // 响应已经开始发送，不能再改状态码/正文——交还给 Express 自身的兜底路径。
+      next(err);
+      return;
+    }
+    logger.error('unhandled express error', {
+      detail: err instanceof Error ? err.name : typeof err,
+    });
+    res.status(500).json({
+      jsonrpc: '2.0',
+      error: { code: -32603, message: '服务内部错误' },
+      id: null,
     });
   });
 

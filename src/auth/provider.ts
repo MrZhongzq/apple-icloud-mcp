@@ -155,13 +155,14 @@ export function createOAuthProvider(deps: {
     return { tokens, record };
   }
 
-  // 下面这一组 InvalidGrantError / InvalidTokenError（到 verifyAccessToken 为止）故意用
-  // 英文而不是本文件其余部分的中文：SDK 的 requireBearerAuth 把 error.message 原样塞进
-  // WWW-Authenticate 响应头（bearerAuth.js 的 buildWwwAuthHeader），token 端点的错误
-  // JSON body 同样直接带上这段文本。HTTP 头值必须是 ASCII——中文字符会让
-  // res.set() 抛 ERR_INVALID_CHAR，把本该返回的 401 变成一个 500，而且是那种只在真实
-  // provider 上才会暴露、mock 掉 verifyAccessToken 的单测完全看不见的 500。
-  // 这不是风格不一致，是这条路径唯一能安全经过的字符集；别为了和别处统一改回中文。
+  // 下面这一组 InvalidGrantError（本函数到 exchangeRefreshToken 为止）改成了英文，
+  // 但只是跟着统一，不是必须——它们只经 token.js 序列化进 JSON body，UTF-8 完全安全。
+  // 真正受 ASCII 约束的只有下面 verifyAccessToken 抛出的那一个 InvalidTokenError：
+  // 它会被 requireBearerAuth 原样塞进 WWW-Authenticate 响应头（bearerAuth.js 的
+  // buildWwwAuthHeader），HTTP 头值必须是 ASCII，中文字符会让 res.set() 抛
+  // ERR_INVALID_CHAR，把本该返回的 401 变成一个 500——而且是那种只在真实 provider 上
+  // 才会暴露、mock 掉 verifyAccessToken 的单测完全看不见的 500。别把这条推广成
+  // "AppError 的消息也要 ASCII"：那些从不进 HTTP 头，中文该留着给人读。
   async function challengeForAuthorizationCode(
     client: OAuthClientInformationFull,
     authorizationCode: string,
