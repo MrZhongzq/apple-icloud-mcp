@@ -217,6 +217,16 @@ export interface HttpConfig {
   adminPasswordHash: string;
   tokenStorePath: string;
   encryptionKey: Buffer;
+  /**
+   * 是否启用 express 的 `trust proxy`，即把 `X-Forwarded-For` 的最左端当成客户端地址。
+   *
+   * 默认 **false**：直接把端口暴露到公网的部署里，这个头是调用方自己写的，信它等于让任何人
+   * 自选限流桶，一个客户端就能无限重试管理员口令。反过来，本仓库自带的 `docker-compose.yml`
+   * 在前面放了 Caddy，此时每个请求的 socket 远端地址都是同一个容器 IP，按 `req.ip` 限流
+   * 等于全世界共用一个桶——一个未认证的访客就能把 `/admin-login` 与 `/token` 的额度替所有人
+   * 耗光，把整条授权流程锁死。两种部署都真实存在，所以这件事只能由部署方声明，不能猜。
+   */
+  trustProxy: boolean;
 }
 
 const DEFAULT_HTTP_PORT = 17733;
@@ -328,6 +338,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv): HttpConfig {
     adminPasswordHash,
     tokenStorePath,
     encryptionKey,
+    trustProxy: readBool(env, 'TRUST_PROXY', false),
   };
 }
 

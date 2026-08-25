@@ -43,6 +43,14 @@ services:
       # mount below and the app's own idea of where to write agree even if
       # one of the two is ever changed independently.
       TOKEN_STORE_PATH: /app/data/tokens.json.enc
+      # Caddy sits in front, so every request reaches `app` from one container
+      # IP. Without this, the per-IP rate limits on /admin-login and /token
+      # collapse into a single shared bucket and any unauthenticated visitor
+      # can exhaust it for everyone, locking the whole authorization flow.
+      # This is safe *because* nothing but caddy can reach `app` (no published
+      # host port, see below) -- do not copy this line into a deployment that
+      # exposes the port directly, where X-Forwarded-For is caller-controlled.
+      TRUST_PROXY: "true"
     volumes:
       - token_store:/app/data
     expose:

@@ -9,6 +9,12 @@ build/
 *.tsbuildinfo
 
 # Environment / secrets
+# The default TOKEN_STORE_PATH is ./data/tokens.json.enc, and the README tells
+# people to run exactly that way for local testing -- so `git add -A` after one
+# local run would otherwise commit the encrypted OAuth client/token database into
+# history, where it is unrecoverable and decryptable by anyone who later gets
+# TOKEN_ENCRYPTION_KEY. .dockerignore already excludes `data` for the same reason.
+data/
 .env
 .env.*
 !.env.example

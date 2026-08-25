@@ -80,6 +80,28 @@ export function createPendingStore(): PendingStore {
   };
 }
 
+/**
+ * 登录页（以及同一路由上的授权错误页）必须带的响应头。
+ *
+ * `no-store` 之外还有两条防点击劫持的：这是整套服务里唯一一个有真人往里输管理员口令的页面，
+ * 一旦能被第三方站点嵌进 iframe，攻击者就可以把它盖在自己的页面下面骗一次提交。
+ * `X-Frame-Options: DENY` 管住老浏览器，CSP 的 `frame-ancestors 'none'` 是现代等价物，
+ * 两条都给，因为它们的覆盖面不完全重合。集中成一个常量，是为了让登录页的三个发送点
+ * （authorize() 渲染登录页、渲染错误页，以及 /admin-login 提交失败后重新渲染）不会各写
+ * 一份、日后只改其中一处。
+ */
+export const LOGIN_PAGE_HEADERS: ReadonlyArray<readonly [string, string]> = [
+  ['Cache-Control', 'no-store'],
+  ['X-Frame-Options', 'DENY'],
+  ['Content-Security-Policy', "frame-ancestors 'none'"],
+];
+
+/** 把上面那组头写到响应上。只依赖 `set(name, value)`，所以真实的 express Response
+ *  与单测里的假 res 都能直接用。 */
+export function applyLoginPageHeaders(res: { set(name: string, value: string): unknown }): void {
+  for (const [name, value] of LOGIN_PAGE_HEADERS) res.set(name, value);
+}
+
 function escapeHtml(input: string): string {
   const map: Record<string, string> = {
     '&': '&amp;',

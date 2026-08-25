@@ -63,6 +63,8 @@ afterEach(() => {
 
 interface TestServer {
   base: string;
+  /** 周期性清理器，正常由 bin/http.ts 的定时器调用；测试里直接调，并注入一个假的 now。 */
+  sweepIdleTransports: (now?: number) => Promise<number>;
   /** 真的 SessionStore，不是 vi.fn()——吊销那条测试要看的就是它里面还剩几条会话。 */
   sessions: SessionStore;
   /** 被销毁的会话关掉了哪些底层连接。 */
@@ -115,9 +117,17 @@ async function startServer(): Promise<TestServer> {
     adminPasswordHash: hashPassword(ADMIN_PASSWORD),
     tokenStorePath: join(dir, 'tokens.json.enc'),
     encryptionKey: randomBytes(32),
+    trustProxy: false,
   };
 
-  const { app, closeAll } = createHttpApp({ config: appConfig, httpConfig, sessions, provider, logger, pending });
+  const { app, closeAll, sweepIdleTransports } = createHttpApp({
+    config: appConfig,
+    httpConfig,
+    sessions,
+    provider,
+    logger,
+    pending,
+  });
   const server = createNodeServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
@@ -125,6 +135,7 @@ async function startServer(): Promise<TestServer> {
 
   return {
     base: `http://127.0.0.1:${port}`,
+    sweepIdleTransports,
     sessions,
     closedProviders,
     async close() {
@@ -371,6 +382,106 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
         srv.closedProviders,
         '只从 Map 里删掉会留下一条还连着用户 iCloud 邮箱的 IMAP 连接',
       ).toContain('imap');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // transport 表原先只增不减：`initialize` 往里放，只有客户端正常关闭（DELETE 或连接自然
+  // 结束）触发的 onclose 会摘掉。断线重连的客户端每重连一次就漏一个 transport 加一个
+  // McpServer，一直留到进程退出。这里注入一个假的 now，不靠 sleep 判定，避免时间上的偶然。
+  it('sweeps an idle mcp transport, and leaves an active one alone', async () => {
+    const srv = await startServer();
+    try {
+      const { body } = await runFullAuthFlow(srv.base);
+      const accessToken = body.access_token as string;
+
+      const init = await mcpPost(srv.base, accessToken, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'sweep-probe', version: '1.0.0' },
+        },
+      });
+      expect(init.status, `initialize 失败 —— body: ${init.raw}`).toBe(200);
+      const mcpSessionId = init.mcpSessionId as string;
+      expect(typeof mcpSessionId).toBe('string');
+
+      expect(await srv.sweepIdleTransports(Date.now()), '刚建立的 transport 不能被清掉').toBe(0);
+
+      // 再打一个请求，刷新 lastActiveAt——顺便证明 Map 里存的就是请求路径上被刷新的那个对象。
+      await mcpPost(
+        srv.base,
+        accessToken,
+        { jsonrpc: '2.0', method: 'notifications/initialized' },
+        mcpSessionId,
+      );
+      expect(await srv.sweepIdleTransports(Date.now()), '还在用的 transport 不能被清掉').toBe(0);
+
+      // 空闲超过会话 TTL（本测试配置里是 60 秒）之后，它必须被关掉并摘掉。
+      expect(
+        await srv.sweepIdleTransports(Date.now() + appConfig.sessionTtlMs + 1_000),
+        '空闲超过 TTL 的 transport 必须被清掉',
+      ).toBe(1);
+
+      const afterSweep = await mcpPost(
+        srv.base,
+        accessToken,
+        { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+        mcpSessionId,
+      );
+      expect(afterSweep.status, '被清掉的 MCP 会话 ID 不该还能用').toBe(400);
+
+      expect(await srv.sweepIdleTransports(Date.now() + appConfig.sessionTtlMs + 1_000), '已经清过了').toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // 整套服务里唯一一个有真人往里输管理员口令的页面。能被第三方站点嵌进 iframe，
+  // 就能被盖在别的页面下面骗一次提交。X-Frame-Options 管老浏览器，CSP 的
+  // frame-ancestors 是现代等价物，两条都要，覆盖面不完全重合。
+  it('serves the admin login page with anti-clickjacking headers', async () => {
+    const srv = await startServer();
+    try {
+      const regRes = await fetch(`${srv.base}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [REDIRECT_URI],
+          token_endpoint_auth_method: 'none',
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+        }),
+      });
+      const { client_id: clientId } = (await regRes.json()) as { client_id: string };
+
+      const authorizeUrl = new URL(`${srv.base}/authorize`);
+      authorizeUrl.searchParams.set('response_type', 'code');
+      authorizeUrl.searchParams.set('client_id', clientId);
+      authorizeUrl.searchParams.set('redirect_uri', REDIRECT_URI);
+      authorizeUrl.searchParams.set('code_challenge', b64url(randomBytes(32)));
+      authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+
+      const page = await fetch(authorizeUrl, { redirect: 'manual' });
+      expect(page.status).toBe(200);
+      expect(page.headers.get('cache-control')).toBe('no-store');
+      expect(page.headers.get('x-frame-options')).toBe('DENY');
+      expect(page.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+
+      // 口令错时重新渲染的那一份也是同一个页面，必须带同样的头。
+      const retry = await fetch(`${srv.base}/admin-login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        redirect: 'manual',
+        body: new URLSearchParams({ request_id: 'nope', password: 'wrong' }).toString(),
+      });
+      expect(retry.status).toBe(401);
+      expect(retry.headers.get('x-frame-options')).toBe('DENY');
+      expect(retry.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
     } finally {
       await srv.close();
     }

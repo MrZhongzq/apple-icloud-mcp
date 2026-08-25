@@ -43,7 +43,7 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 
 ### Remote HTTP transport only
 
-**These five variables are read only by `dist/bin/http.js` (`loadHttpConfig`).** The stdio entrypoint (`dist/bin/stdio.js`, everything above) never reads them and never requires them — running this server locally for Claude Code/Desktop does not need a domain, a certificate, or any of this. They matter only if you're doing the [remote deployment](#remote-deployment-http--oauth) below.
+**These six variables are read only by `dist/bin/http.js` (`loadHttpConfig`).** The stdio entrypoint (`dist/bin/stdio.js`, everything above) never reads them and never requires them — running this server locally for Claude Code/Desktop does not need a domain, a certificate, or any of this. They matter only if you're doing the [remote deployment](#remote-deployment-http--oauth) below.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
@@ -52,6 +52,7 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 | `TOKEN_ENCRYPTION_KEY` | yes | — | Base64 encoding of a 32-byte key, used to encrypt the OAuth client/token store at rest (AES-256-GCM). Generate with the command below. Losing or rotating this key makes the existing store undecryptable — see Troubleshooting. |
 | `PORT` | no | `17733` | Port the HTTP server listens on. |
 | `TOKEN_STORE_PATH` | no | `./data/tokens.json.enc` | Where the encrypted OAuth client/token database lives. In Docker this is set to `/app/data/tokens.json.enc`, backed by the `token_store` named volume. |
+| `TRUST_PROXY` | no | `false` | Whether to trust `X-Forwarded-For` when deciding a request's client address. Rate limits (admin login, `/token`, `/register`, `/revoke`) are keyed on that address, so this is not cosmetic in either direction. **Leave it off if the server's port is exposed directly** — the header is written by the caller, and trusting it lets anyone pick their own rate-limit bucket and retry the admin password without limit. **Turn it on if anything terminates TLS in front of it** — including the `docker-compose.yml` in this repo, which puts Caddy in front: without it every request arrives from one container IP, so per-IP limiting distinguishes nobody and a single unauthenticated visitor can exhaust the admin-login and `/token` budgets for everyone, locking the whole authorization flow. The shipped compose file sets it to `true` for exactly this reason. |
 
 ## Install
 

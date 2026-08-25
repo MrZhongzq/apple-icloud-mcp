@@ -35,7 +35,13 @@ const httpConfig = {
   adminPasswordHash: 'scrypt$32768$8$1$c2FsdA$aGFzaA',
   tokenStorePath: './data/tokens.json.enc',
   encryptionKey: Buffer.alloc(32),
+  // 默认关：直接暴露端口的部署里 X-Forwarded-For 是调用方自己写的，信它等于让任何人
+  // 自选限流桶。本仓库自带的 compose 在前面放了 Caddy，那种部署要把它打开。
+  trustProxy: false,
 };
+
+/** /admin-login 的窗口上限是 20，多打一次就该看到 429。 */
+const ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT = 21;
 
 let verifyAccessToken: ReturnType<typeof vi.fn>;
 
@@ -54,10 +60,10 @@ function makeProvider() {
   } as never;
 }
 
-function build() {
+function build(httpConfigOverrides: Partial<typeof httpConfig> = {}) {
   return createHttpApp({
     config: appConfig,
-    httpConfig,
+    httpConfig: { ...httpConfig, ...httpConfigOverrides },
     sessions: { create: vi.fn(), get: vi.fn(), destroyByToken: vi.fn() } as unknown as SessionStore,
     provider: makeProvider(),
     logger,
@@ -188,5 +194,45 @@ describe('cors', () => {
     const { app } = build();
     const res = await request(app, 'GET', '/health', { origin: 'https://claude.ai' });
     expect(res.headers['access-control-allow-origin']).toBe('https://claude.ai');
+  });
+});
+
+/**
+ * 限流按 `req.ip` 分桶，而 `req.ip` 是什么取决于 express 的 `trust proxy`。
+ * 两种部署都真实存在——直接暴露端口时不能信 X-Forwarded-For（调用方自己写的，信它等于让
+ * 任何人自选限流桶）；本仓库自带的 compose 在前面放了 Caddy，不信它则全世界共用一个桶，
+ * 任何未认证的访客都能替所有人耗光 /admin-login 与 /token 的额度。所以这里两个方向都测。
+ */
+describe('TRUST_PROXY', () => {
+  /** 连打 count 次 /admin-login，每次带一个不同的 X-Forwarded-For，返回最后一次的状态码。 */
+  async function floodAdminLogin(app: import('express').Express, count: number): Promise<number> {
+    let status = 0;
+    for (let i = 0; i < count; i += 1) {
+      const res = await request(
+        app,
+        'POST',
+        '/admin-login',
+        { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': `203.0.113.${i}` },
+        'request_id=nope&password=nope',
+      );
+      status = res.status;
+    }
+    return status;
+  }
+
+  it('ignores X-Forwarded-For when it is off, so a forged header cannot buy extra attempts', async () => {
+    const { app } = build({ trustProxy: false });
+    expect(
+      await floodAdminLogin(app, ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT),
+      '不信任代理时每次伪造的 X-Forwarded-For 都落进同一个桶，必然打满',
+    ).toBe(429);
+  });
+
+  it('buckets by the forwarded client address when it is on, so one proxy is not one bucket', async () => {
+    const { app } = build({ trustProxy: true });
+    expect(
+      await floodAdminLogin(app, ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT),
+      '信任代理时不同的转发来源各占一个桶，一个访客锁不死所有人',
+    ).not.toBe(429);
   });
 });

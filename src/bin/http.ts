@@ -41,7 +41,14 @@ async function main(): Promise<void> {
   const pending = createPendingStore();
   const provider = createOAuthProvider({ store, sessions, logger, pending });
 
-  const { app, closeAll } = createHttpApp({ config, httpConfig, sessions, provider, logger, pending });
+  const { app, closeAll, sweepIdleTransports } = createHttpApp({
+    config,
+    httpConfig,
+    sessions,
+    provider,
+    logger,
+    pending,
+  });
 
   const server = createNodeServer(app);
 
@@ -60,10 +67,16 @@ async function main(): Promise<void> {
   });
 
   const sweeper = setInterval(() => {
-    void Promise.all([sessions.sweep(), provider.sweep()])
-      .then(([removedSessions, removedAuth]) => {
-        if (removedSessions > 0 || removedAuth > 0) {
-          logger.debug('swept expired sessions and auth records', { removedSessions, removedAuth });
+    // transport 表也必须在这里扫：它只在客户端正常关闭（DELETE 或连接自然结束）时才会
+    // 自己收缩，一个直接断线重连的客户端每重连一次就漏掉一个 transport 加一个 McpServer。
+    void Promise.all([sessions.sweep(), provider.sweep(), sweepIdleTransports()])
+      .then(([removedSessions, removedAuth, removedTransports]) => {
+        if (removedSessions > 0 || removedAuth > 0 || removedTransports > 0) {
+          logger.debug('swept expired sessions and auth records', {
+            removedSessions,
+            removedAuth,
+            removedTransports,
+          });
         }
       })
       .catch((err: unknown) => {

@@ -14,7 +14,12 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { AuthStore, StoredToken } from './store.js';
 import { generateToken, hashToken } from './crypto.js';
-import { createPendingStore, renderLoginPage, renderAuthorizeErrorPage } from './login.js';
+import {
+  applyLoginPageHeaders,
+  createPendingStore,
+  renderLoginPage,
+  renderAuthorizeErrorPage,
+} from './login.js';
 import type { PendingStore } from './login.js';
 import type { Logger } from '../core/logger.js';
 import { TOKEN_FAMILY_KEY, type SessionStore } from '../core/session.js';
@@ -335,7 +340,7 @@ export function createOAuthProvider(deps: {
         logger.warn('authorize: redirect_uri is not registered for this client, refusing to redirect', {
           clientId: client.client_id,
         });
-        res.set('Cache-Control', 'no-store');
+        applyLoginPageHeaders(res);
         res.status(400).send(renderAuthorizeErrorPage('redirect_uri 未在客户端注册信息中登记，已拒绝'));
         return;
       }
@@ -349,7 +354,7 @@ export function createOAuthProvider(deps: {
         expires_at: Date.now() + pendingAuthTtlMs,
       });
 
-      res.set('Cache-Control', 'no-store');
+      applyLoginPageHeaders(res);
       res.send(renderLoginPage({ requestId }));
     },
     challengeForAuthorizationCode,
