@@ -223,12 +223,42 @@ const DEFAULT_HTTP_PORT = 17733;
 /** OAuth 元数据要求 issuer 是 https，但本地开发没有证书，所以这两个 host 豁免。 */
 const HTTPS_EXEMPT_HOSTS = new Set(['localhost', '127.0.0.1']);
 
+/** 自包含的生成命令：不指向任何文档章节（本仓库已经因为提示语指向不存在的东西踩过好几次坑），
+ *  而是直接给出可以照抄执行的命令。口令从标准输入读入而不是命令行参数——参数会留在 shell
+ *  历史和进程列表里，被同一台机器上的其他用户看到。 */
+const GENERATE_ADMIN_HASH_HINT =
+  `用以下命令生成 ADMIN_PASSWORD_HASH（在 npm run build 之后于项目根目录运行，口令从标准输入读入，` +
+  `不会留在 shell 历史或进程列表里）：node -e "const r=require('node:readline').createInterface(` +
+  `{input:process.stdin,output:process.stderr});r.question('password: ',p=>{r.close();` +
+  `import('./dist/auth/crypto.js').then(m=>console.log(m.hashPassword(p)))})"`;
+
 function requireHttpEnv(env: NodeJS.ProcessEnv, key: string, hint: string): string {
   const value = clean(env[key]);
   if (value === undefined) {
     throw new AppError('INVALID_INPUT', `缺少必需的环境变量 ${key}`, { hint });
   }
   return value;
+}
+
+/** 只检查形状（六个 $ 分隔字段、scheme 是 scrypt、N/r/p 是正整数）——不校验 salt/hash 的内容，
+ *  那部分校验不了也不需要校验。目的是把"哈希格式不对"这个问题挡在启动时，而不是让它一路
+ *  沉默到登录时才在 verifyPassword 里悄悄变成一句"密码错误"，把部署者的排查方向指错。 */
+function validateAdminPasswordHashFormat(hash: string): void {
+  const invalid = (): never => {
+    throw new AppError('INVALID_INPUT', 'ADMIN_PASSWORD_HASH 格式不对', {
+      hint: `ADMIN_PASSWORD_HASH 必须是形如 scrypt$32768$8$1$<salt>$<hash> 的哈希串，而不是口令明文本身。${GENERATE_ADMIN_HASH_HINT}`,
+    });
+  };
+  const parts = hash.split(String.fromCharCode(36));
+  if (parts.length !== 6) invalid();
+  const [scheme, nRaw, rRaw, pRaw] = parts;
+  if (scheme !== 'scrypt') invalid();
+  const n = Number(nRaw);
+  const r = Number(rRaw);
+  const p = Number(pRaw);
+  if (!Number.isInteger(n) || n <= 0) invalid();
+  if (!Number.isInteger(r) || r <= 0) invalid();
+  if (!Number.isInteger(p) || p <= 0) invalid();
 }
 
 function parsePublicUrl(raw: string): URL {
@@ -271,7 +301,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv): HttpConfig {
   const adminPasswordHash = requireHttpEnv(
     env,
     'ADMIN_PASSWORD_HASH',
-    '用 hashPassword() 为管理员口令生成 scrypt 哈希（形如 scrypt$32768$8$1$<salt>$<hash>）后设置为 ADMIN_PASSWORD_HASH，参见 README 的 HTTP 部署说明',
+    `设置 ADMIN_PASSWORD_HASH 为管理员口令的 scrypt 哈希（形如 scrypt$32768$8$1$<salt>$<hash>）。${GENERATE_ADMIN_HASH_HINT}`,
   );
   const tokenEncryptionKeyRaw = requireHttpEnv(
     env,
@@ -280,6 +310,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv): HttpConfig {
   );
 
   const publicUrl = parsePublicUrl(publicUrlRaw);
+  validateAdminPasswordHashFormat(adminPasswordHash);
   const encryptionKey = parseEncryptionKey(tokenEncryptionKeyRaw);
   const port = readHttpPort(env);
   const tokenStorePath = clean(env.TOKEN_STORE_PATH) ?? path.join(process.cwd(), 'data', 'tokens.json.enc');

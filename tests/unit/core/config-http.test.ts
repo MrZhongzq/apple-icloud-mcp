@@ -37,6 +37,22 @@ describe('loadHttpConfig', () => {
     ).toThrow(AppError);
   });
 
+  it('rejects a malformed ADMIN_PASSWORD_HASH at load time, instead of only failing at login', () => {
+    const err = (() => {
+      try {
+        loadHttpConfig({ ...base, ADMIN_PASSWORD_HASH: 'correct horse battery staple' } as NodeJS.ProcessEnv);
+        return undefined;
+      } catch (e) {
+        return e as AppError;
+      }
+    })();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('still accepts the well-formed hash fixture the other tests rely on', () => {
+    expect(() => loadHttpConfig({ ...base } as NodeJS.ProcessEnv)).not.toThrow();
+  });
+
   it('requires TOKEN_ENCRYPTION_KEY and validates its length', () => {
     expect(() =>
       loadHttpConfig({ ...base, TOKEN_ENCRYPTION_KEY: undefined } as NodeJS.ProcessEnv),
