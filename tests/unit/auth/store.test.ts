@@ -136,12 +136,16 @@ describe('refresh rotation and family revocation', () => {
     const first = tokenRecord();
     await store.saveTokens(first.record);
 
-    const second = tokenRecord({ family_id: 'fam-1' });
+    const second = tokenRecord({ family_id: first.record.family_id });
     await store.rotateRefresh(first.refresh, second.record);
 
     const old = await store.findByRefreshToken(first.refresh);
     expect(old?.rotated, '旧刷新令牌必须留在存储里并标记为已轮换 —— 删掉它就再也认不出重放').toBe(true);
     expect((await store.findByRefreshToken(second.refresh))?.rotated).toBe(false);
+    expect(
+      (await store.findByRefreshToken(second.refresh))?.family_id,
+      '轮换后必须保留同一个 family_id —— 否则整族吊销机制形同虚设',
+    ).toBe(first.record.family_id);
   });
 
   it('revokes every token in a family', async () => {
@@ -238,5 +242,20 @@ describe('atomic writes', () => {
       reopened.load(),
       '静默从空存储启动会让所有客户端的授权无声失效，且没人知道为什么',
     ).rejects.toThrow();
+  });
+
+  it('does not lose a write when callers do not wait for each other', async () => {
+    const store = makeStore();
+    await store.load();
+    const ids = Array.from({ length: 10 }, (_, i) => `c${i}`);
+
+    // 并发，不逐个 await —— 这正是 HTTP 服务器同时处理多个请求时的形态
+    await Promise.all(ids.map((id) => store.registerClient({ client_id: id, redirect_uris: [`https://x/${id}`] })));
+
+    const reopened = makeStore();
+    await reopened.load();
+    for (const id of ids) {
+      expect(await reopened.getClient(id), `${id} 成功返回却不在盘上`).toBeDefined();
+    }
   });
 });

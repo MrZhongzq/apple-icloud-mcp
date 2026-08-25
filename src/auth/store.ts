@@ -61,6 +61,11 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
   const byAccessHash = new Map<string, StoredToken>();
   const byRefreshHash = new Map<string, StoredToken>();
 
+  // 所有写入串行排队，而不是各自捕获快照后并发抢跑同一个目标路径。
+  // 队列本身用 .catch 吞掉失败，让某次写入失败不会把后面所有排队的写入一起卡死；
+  // 失败仍然原样传给发起那次写入的调用方，因为 run（未被 catch 过）才是返回给它的 promise。
+  let writeQueue: Promise<void> = Promise.resolve();
+
   function reindex(): void {
     byAccessHash.clear();
     byRefreshHash.clear();
@@ -75,10 +80,11 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
     if (byRefreshHash.get(record.refresh_token_hash) === record) byRefreshHash.delete(record.refresh_token_hash);
   }
 
-  async function persist(): Promise<void> {
+  /** 实际的落盘工作：调用时才读取当前内存状态并生成快照，绝不在排队之前捕获。 */
+  async function writeSnapshotToDisk(): Promise<void> {
     const snapshot: StoreSnapshot = {
       clients: Array.from(clients.values()),
-      tokens,
+      tokens: [...tokens],
     };
     const blob = encryptJson(snapshot, key);
     const dir = dirname(path);
@@ -98,6 +104,13 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
       await rm(tmpPath, { force: true }).catch(() => {});
       throw err;
     }
+  }
+
+  /** 把落盘工作挂到队列尾部，串行执行，避免并发调用者各自捕获快照后互相抢跑覆盖。 */
+  function persist(): Promise<void> {
+    const run = writeQueue.then(() => writeSnapshotToDisk());
+    writeQueue = run.catch(() => undefined);
+    return run;
   }
 
   async function load(): Promise<void> {
