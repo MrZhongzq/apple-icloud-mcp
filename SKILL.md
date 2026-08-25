@@ -1,11 +1,11 @@
 ---
 name: apple-icloud-mcp-skill
-description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts over stdio).
+description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts, over stdio or remote Streamable HTTP + OAuth).
 ---
 
 # Apple iCloud MCP Server — AI Client Contract
 
-This server exposes 25 tools for Apple iCloud Mail, Calendar, Reminders, and Contacts. Read this before calling any of them.
+This server exposes the same 25 tools for Apple iCloud Mail, Calendar, Reminders, and Contacts whether it's reached as a local stdio subprocess or as a remote Streamable HTTP server behind OAuth 2.1 (see the host project's README → "Remote deployment"). The two entrypoints share every tool and all business logic — the remote one only adds an authorization step (a browser-based login, handled entirely outside this contract) before your first call. Once a session exists, `apple_login`'s semantics, arguments, and return shape below are identical on both: it still connects live to verify credentials and still returns the same `session_id` shape, regardless of which entrypoint issued it. Read this before calling any of them.
 
 ## Workflow
 

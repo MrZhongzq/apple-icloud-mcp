@@ -1,0 +1,28 @@
+# Credentials must never enter the build context, let alone an image layer --
+# an image layer can be unpacked by anyone who pulls the image, and deleting a
+# file in a later layer does not remove it from an earlier one it was already
+# baked into. See CLAUDE.md "Repository hygiene" and task-7-brief.md.
+.env
+.env.*
+
+.git
+.gitignore
+.github
+
+node_modules
+dist
+data
+coverage
+
+docs
+.superpowers
+tests
+
+tmp
+temp
+tmpprobe
+*.log
+.vscode
+.idea
+.DS_Store
+Thumbs.db

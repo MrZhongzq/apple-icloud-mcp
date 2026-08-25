@@ -1,0 +1,14 @@
+# Reads PUBLIC_URL from the environment (docker-compose.yml passes it through
+# via env_file: .env) so the domain is configured in exactly one place -- the
+# same PUBLIC_URL the app itself uses as its OAuth issuer. Caddy accepts a
+# full URL (with scheme) as a site address; giving it "https://..." both
+# selects the hostname to serve and confirms automatic HTTPS should be used.
+#
+# If PUBLIC_URL and the domain Caddy actually serves ever disagree, every
+# request to /mcp will 401 -- see README.md "Remote deployment" ->
+# Troubleshooting: the OAuth issuer in the metadata won't match what a client
+# discovers, even though credentials and tokens are otherwise fine.
+
+{$PUBLIC_URL} {
+	reverse_proxy app:17733
+}

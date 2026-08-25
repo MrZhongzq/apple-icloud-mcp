@@ -1,6 +1,8 @@
 # Apple iCloud MCP Server
 
-A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP), **Calendar** (CalDAV), **Reminders** (CalDAV), and **Contacts** (CardDAV) as tools for AI agents, over the stdio transport. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
+A Model Context Protocol (MCP) server that exposes Apple iCloud **Mail** (IMAP/SMTP), **Calendar** (CalDAV), **Reminders** (CalDAV), and **Contacts** (CardDAV) as tools for AI agents. Supports up to 5 iCloud accounts at once, each with independent read/write permissions.
+
+Two ways to run it: the **stdio** transport (`dist/bin/stdio.js`), launched as a local subprocess by your MCP client — this is what the rest of this README assumes until the "Remote deployment" section — and a **remote Streamable HTTP + OAuth 2.1** transport (`dist/bin/http.js`), for putting the server on the internet behind your own domain so a hosted client like claude.ai can reach it. The two entrypoints share every tool and all business logic; the HTTP one adds an authorization server in front. See [Remote deployment](#remote-deployment-http--oauth) below.
 
 **Not supported, and not planned for this approach:** iCloud Notes. Apple provides no standard protocol for Notes (no IMAP/CalDAV equivalent) that works with an App-Specific Password, so there is no way to implement this without reverse-engineering a private, unsupported API.
 
@@ -38,6 +40,18 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 **The effective sender must be an iCloud mail address.** IMAP/SMTP authenticate with the effective sender (`ICLOUD_SENDER_n`, falling back to `ICLOUD_ACCOUNT_n` if unset) — not with `ICLOUD_ACCOUNT_n` itself, which CalDAV uses instead. Apple's IMAP/SMTP servers reject any username that isn't an Apple-assigned iCloud address, so if your Apple ID (or your `ICLOUD_SENDER_n`) is not `@icloud.com` / `@me.com` / `@mac.com` / `@icloud.com.cn`, that account's mail tools are **automatically disabled at startup** — `mailRead`/`mailWrite` are forced to `false` regardless of `ALLOW_MAIL_READ_n`/`ALLOW_MAIL_WRITE_n`, and a notice explaining why is printed to stderr. Calendar, reminders and contacts are unaffected. If you do have an iCloud mail address, set `ICLOUD_SENDER_n` to it; if you don't, that account simply doesn't use iCloud Mail and its calendar, reminders and contacts tools remain available.
 
 **Legacy (v1) variable names still work**, mapped automatically with a deprecation warning on stderr: `icloud_account`, `icloud_app_pass`, `icloud_sender`, and the multi-account forms with the digit inside the name (`icloud_account2`, `allow_mail2_read`, `allow_calendar3_write`, …). `multiple_account_enable` is now a no-op — accounts 2–5 are detected by presence of `ICLOUD_ACCOUNT_n`, not by an enable flag.
+
+### Remote HTTP transport only
+
+**These five variables are read only by `dist/bin/http.js` (`loadHttpConfig`).** The stdio entrypoint (`dist/bin/stdio.js`, everything above) never reads them and never requires them — running this server locally for Claude Code/Desktop does not need a domain, a certificate, or any of this. They matter only if you're doing the [remote deployment](#remote-deployment-http--oauth) below.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `PUBLIC_URL` | yes | — | Full base URL this server is reachable at, e.g. `https://mcp.example.com` (no trailing slash). Doubles as the OAuth issuer and the callback base. Must be `https://` except for `localhost`/`127.0.0.1`, which are exempted for local testing. |
+| `ADMIN_PASSWORD_HASH` | yes | — | The scrypt hash of the admin login password (`scrypt$32768$8$1$<salt>$<hash>`), **not the password itself**. Generate with the stdin command below. |
+| `TOKEN_ENCRYPTION_KEY` | yes | — | Base64 encoding of a 32-byte key, used to encrypt the OAuth client/token store at rest (AES-256-GCM). Generate with the command below. Losing or rotating this key makes the existing store undecryptable — see Troubleshooting. |
+| `PORT` | no | `17733` | Port the HTTP server listens on. |
+| `TOKEN_STORE_PATH` | no | `./data/tokens.json.enc` | Where the encrypted OAuth client/token database lives. In Docker this is set to `/app/data/tokens.json.enc`, backed by the `token_store` named volume. |
 
 ## Install
 
@@ -124,6 +138,9 @@ A healthy server answers on stdout with 25 tools (3 session + 7 mail + 5 calenda
 | `SESSION_EXPIRED` | Sessions expire after `SESSION_TTL_MINUTES` of inactivity | The model should call `apple_login` again; the error hint says so. Raise the TTL if it happens constantly. |
 | Client shows the server as failed, with no useful error | Something wrote to stdout and corrupted the JSON-RPC stream | This should not happen — all logging is on stderr by design. If it does, capture stderr and file it as a bug. |
 | Calendar events come back an hour off after a DST change | Recurring events created by this server are UTC-anchored | Known phase-one limitation, documented under Limitations. Events created in the Apple UI are unaffected. |
+| *(remote HTTP transport only)* Every request to `/mcp` returns 401, even with a freshly-issued token | The client dynamically registered against a different `PUBLIC_URL` than the one the server is now configured with, so the `issuer` in the OAuth metadata doesn't match what the client discovered when it registered | Restart the authorization from the client with `PUBLIC_URL` matching the domain it's actually reaching. There's no way to fix an existing registration's issuer after the fact — it has to re-register. |
+| *(remote HTTP transport only)* The admin login page appears, but submitting it doesn't get you back to the client | The pending authorization request expired — it's held in memory for 10 minutes from when `/authorize` was first hit, and the login page re-renders with "登录请求不存在或已过期" | Don't retry the same form — the `request_id` it's bound to is already gone. Start the authorization over from the client (e.g. re-add the connector in claude.ai). |
+| *(remote HTTP transport only)* Server starts fine, but no client can complete authorization / every login attempt errors | The token store (`TOKEN_STORE_PATH`) can't be decrypted — almost always `TOKEN_ENCRYPTION_KEY` changed since the store was written, occasionally file corruption | Deleting the store file is the intended recovery, not a last resort: stop the server, remove the file at `TOKEN_STORE_PATH` (or `docker volume rm` the `token_store` volume), and restart. Every previously-authorized client has to re-authorize — that's the only effect; no iCloud data is touched. |
 
 ## Tools
 
@@ -172,6 +189,69 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 - **Contact birthdays accept only `YYYY-MM-DD` or `--MM-DD`.** Anything else is rejected with `INVALID_INPUT` rather than written — a vCard `BDAY` the parser cannot read makes the whole card unreadable, which would leave the contact unreachable through this server. Reading is tolerant in the other direction: a card written by another client with an unparseable `BDAY` still comes back, just without the `birthday` field, and a no-year birthday (Apple stores those with a placeholder year of 1604) is reported as `--MM-DD`.
 - **Contact photos are reported as a boolean only.** `has_photo` tells you whether a `PHOTO` property exists on the vCard; no tool returns photo bytes or a URL, and no response ever contains base64 image data.
 
+## Remote deployment (HTTP + OAuth)
+
+This puts the server on the internet as a remote MCP endpoint — for example, so you can add it as a custom connector in claude.ai instead of running it as a local stdio subprocess. Everything in this section is about `dist/bin/http.js`; nothing here changes how the stdio transport (all of the above) works or what it needs.
+
+### 1. Domain and DNS
+
+You need a domain name (a subdomain is fine, e.g. `mcp.example.com`) with an A/AAAA record pointing at the machine that will run this, and ports 80 and 443 reachable from the internet on it. Caddy (in `docker-compose.yml`) uses port 80 to complete the ACME HTTP challenge and provisions a Let's Encrypt certificate automatically the first time it starts — there's nothing to configure for TLS beyond having the domain resolve correctly before you bring the stack up.
+
+`PUBLIC_URL` is that domain as a full URL, e.g. `https://mcp.example.com` (no trailing slash). It is simultaneously: the OAuth issuer a client verifies against, the base every OAuth callback is built from, and the domain the `Caddyfile` serves (`{$PUBLIC_URL}` — one value, read in both places, so it can't drift out of sync with itself).
+
+### 2. Generate key material
+
+Two commands, run from the repo root after `npm run build` (the second one imports the compiled `dist/auth/crypto.js`):
+
+```bash
+# TOKEN_ENCRYPTION_KEY — 32 random bytes, base64-encoded
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
+
+# ADMIN_PASSWORD_HASH — prompts for the password on stdin; it is never echoed
+# and never appears as a command-line argument, so it never lands in shell
+# history or in `ps`/the process list the way `node -e "...('the password')"` would.
+node -e "const r=require('node:readline').createInterface({input:process.stdin,output:process.stderr});r.question('password: ',p=>{r.close();import('./dist/auth/crypto.js').then(m=>console.log(m.hashPassword(p)))})"
+```
+
+Put both outputs, plus `PUBLIC_URL`, into `.env` (`cp .env.example .env` first if you haven't) alongside your existing iCloud credentials. The admin password is whatever you type at the `password:` prompt — you use that plaintext password to log in later; only its hash goes in `.env`.
+
+### 3. Bring the stack up
+
+```bash
+docker compose up -d --build
+```
+
+This starts two containers: `caddy` (public-facing, terminates TLS, proxies to `app:17733` over the internal compose network) and `app` (this server; publishes no host port of its own — only `caddy` can reach it). The OAuth client/token database lives in the `token_store` named volume; losing it means every client has to re-authorize (not an iCloud data loss) — see "Revoking a client's authorization" below.
+
+Confirm it's up without going through the OAuth flow:
+
+```bash
+curl https://mcp.example.com/health   # -> {"status":"ok"} — this route needs no auth
+```
+
+### 4. Add it as a remote MCP server in claude.ai
+
+1. In claude.ai, add a custom connector / remote MCP server pointing at `https://mcp.example.com/mcp` (your `PUBLIC_URL` plus `/mcp`).
+2. claude.ai discovers this server's OAuth metadata at `/.well-known/oauth-authorization-server`, then dynamically registers itself as a client (`POST /register`) and opens `/authorize` in a browser.
+3. You'll land on this server's own admin login page. Enter the **plaintext** admin password you chose in step 2 above — not the hash.
+4. On success, the browser is redirected back to claude.ai's `redirect_uri` with an authorization code and the original `state` value intact; claude.ai exchanges the code for an access/refresh token pair at `/token`. From then on, its tool calls carry `Authorization: Bearer <access token>` to `/mcp`.
+
+This exact chain — dynamic registration, `/authorize`, the login page, the `/token` exchange, a real tool call, and a 401 both for a missing and for a forged token — has been run end to end against a built image on a real port.
+
+### 5. Revoking a client's authorization
+
+This phase does not ship an admin page listing every client that has ever authorized and letting you pick one to kick off — there is no such inventory UI. Two things you actually have:
+
+- **If you're holding a specific token** (typically because you're testing your own deployment with `curl`), `POST /revoke` (RFC 7009) with that token invalidates it immediately: revoking either the access or the refresh token revokes the whole family (both), and — verified end to end — **immediately destroys any live MCP session that token was authenticating**, not on the next TTL check. A revoked `session_id` is unusable on its very next call.
+- **To cut off every client at once** — e.g. you suspect `TOKEN_ENCRYPTION_KEY` leaked, or you just want a clean slate — stop `app` and delete the token store: remove the file at `TOKEN_STORE_PATH`, or `docker compose down` plus `docker volume rm <project>_token_store`. Every previously-authorized client, claude.ai included, will have to redo the authorization flow the next time it calls a tool. This is the same recovery as a token-store decryption failure (see Troubleshooting) and is not a loss of any iCloud data — only re-authorization is required.
+
+There is currently no way to revoke one specific already-connected client (e.g. "kick out this one device, leave the others") without holding a token it was issued — that would require an admin inventory of clients/tokens, which this phase does not build. The store file itself is encrypted at rest, so reading it directly isn't a workaround either.
+
+### Notes
+
+- **CORS** on `/mcp` allows only `PUBLIC_URL`'s own origin and `https://claude.ai` — a browser-based client at any other origin will be blocked by the server itself, not just by the client's own same-origin policy.
+- Local testing without Docker or a domain: `PUBLIC_URL=http://localhost:17733` is allowed (localhost/127.0.0.1 are exempted from the https requirement) — set the three required variables in `.env` and run `npm run build && npm run serve:http` (or `npm run start:http` from source, no build step).
+
 ## Testing
 
 ```bash
@@ -188,7 +268,3 @@ npm run test:integration # live iCloud tests: requires .env.test, see below
 3. `npm run test:integration`.
 
 `.env.test` is gitignored; never commit it.
-
-## What's not here yet
-
-- **Remote HTTP transport with OAuth 2.1** (phase three): this server currently only speaks stdio, for a single local trusted client. A `bin/http.ts` Streamable HTTP transport with a proper authorization server, plus Docker/deployment docs, is planned but not implemented in this repository yet.

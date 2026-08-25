@@ -1,0 +1,56 @@
+# Two services: `caddy` (reverse proxy + automatic TLS certificate) and `app`
+# (this server's HTTP + OAuth entrypoint). Secrets live only in `.env`
+# (gitignored, see .env.example) and are pulled in via `env_file` -- nothing
+# secret is written into this file, which is meant to be committed.
+#
+# Before first run:
+#   1. cp .env.example .env and fill in real values (see README.md "Remote
+#      deployment" for PUBLIC_URL / ADMIN_PASSWORD_HASH / TOKEN_ENCRYPTION_KEY).
+#   2. Point DNS for PUBLIC_URL's host at this machine.
+#   3. docker compose up -d
+#
+# The `token_store` named volume holds the encrypted OAuth client/token
+# database (TOKEN_STORE_PATH inside the container). Losing this volume is not
+# a data-loss event in the usual sense -- iCloud mail/calendar/reminders/
+# contacts data is untouched -- but every previously-authorized client
+# (e.g. claude.ai) will have to go through the authorization flow again.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Matches the Dockerfile's own default; set explicitly so the volume
+      # mount below and the app's own idea of where to write agree even if
+      # one of the two is ever changed independently.
+      TOKEN_STORE_PATH: /app/data/tokens.json.enc
+    volumes:
+      - token_store:/app/data
+    expose:
+      - "17733"
+    # No published host port on purpose: only `caddy` talks to `app`, over the
+    # compose-internal network, addressed as `app:17733` (see Caddyfile).
+
+volumes:
+  caddy_data:
+  caddy_config:
+  token_store:
