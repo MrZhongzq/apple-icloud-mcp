@@ -1208,6 +1208,18 @@ export function createPendingStore(ttlMs?: number): {
 
 它内部用 `timingSafeEqual`。**不要在这一层再写一次比较逻辑。**
 
+- [ ] **Step 0: 先装 `@types/express`**
+
+```bash
+npm install --save-exact --save-dev @types/express@5.0.0
+```
+
+**这一步必须在写代码之前做，理由不是整洁而是安全。** express 5 不自带类型声明，本项目也没装过；而 `tsconfig.json` 开着 `skipLibCheck: true`，于是 SDK 的 `provider.d.ts` 里那句 `import { Response } from 'express'` 解析失败被静默吞掉，`authorize()` 第三个参数**退化成 `any`**。实测确认：写一个 `r.thisMethodDoesNotExistOnResponse()` 能通过 `npm run typecheck`。
+
+本任务要写的正是 `res.redirect(...)`、`res.set(...)` 这类**防开放重定向的安全逻辑**——在 `any` 上写它们，等于把这一层的类型检查整个关掉。装上类型后，再跑一次那个探针确认它现在会报错，把两次输出贴进报告。
+
+装完确认 `npm audit` 仍为 0。
+
 - [ ] **Step 1: 写失败测试 `tests/unit/auth/login.test.ts`**
 
 ```ts
@@ -1823,8 +1835,9 @@ Run: `npx vitest run tests/unit/server/http-app.test.ts`
 
 ```bash
 npm install --save-exact express@5.2.1
-npm install --save-exact --save-dev @types/express@5.0.0
 ```
+
+`@types/express` 已在 Task 4 装好（理由见那里），此处不重复。
 
 版本要与 SDK 依赖的大版本一致（SDK 声明 `express: ^5.2.1`）。装完确认 `npm audit` 仍为 0、`npm ls express` 没有出现两份不同版本。
 
