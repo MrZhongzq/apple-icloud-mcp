@@ -105,6 +105,21 @@ describe('loadHttpConfig', () => {
     ).not.toThrow();
   });
 
+  // 默认必须是 false：端口直接暴露时 X-Forwarded-For 是调用方自己写的，默认信它等于
+  // 默认让任何人自选限流桶。要开是部署方的显式声明（本仓库的 compose 就显式开着）。
+  it('leaves TRUST_PROXY off unless it is set, and accepts the usual boolean spellings', () => {
+    expect(loadHttpConfig({ ...base } as NodeJS.ProcessEnv).trustProxy).toBe(false);
+    expect(loadHttpConfig({ ...base, TRUST_PROXY: 'true' } as NodeJS.ProcessEnv).trustProxy).toBe(true);
+    expect(loadHttpConfig({ ...base, TRUST_PROXY: '1' } as NodeJS.ProcessEnv).trustProxy).toBe(true);
+    expect(loadHttpConfig({ ...base, TRUST_PROXY: 'false' } as NodeJS.ProcessEnv).trustProxy).toBe(false);
+  });
+
+  it('refuses an unrecognizable TRUST_PROXY instead of silently treating it as off', () => {
+    expect(() =>
+      loadHttpConfig({ ...base, TRUST_PROXY: 'maybe' } as NodeJS.ProcessEnv),
+    ).toThrow();
+  });
+
   it('rejects a non-numeric or out-of-range PORT', () => {
     expect(() => loadHttpConfig({ ...base, PORT: 'abc' } as NodeJS.ProcessEnv)).toThrow(AppError);
     expect(() => loadHttpConfig({ ...base, PORT: '0' } as NodeJS.ProcessEnv)).toThrow(AppError);
