@@ -155,19 +155,26 @@ export function createOAuthProvider(deps: {
     return { tokens, record };
   }
 
+  // 下面这一组 InvalidGrantError / InvalidTokenError（到 verifyAccessToken 为止）故意用
+  // 英文而不是本文件其余部分的中文：SDK 的 requireBearerAuth 把 error.message 原样塞进
+  // WWW-Authenticate 响应头（bearerAuth.js 的 buildWwwAuthHeader），token 端点的错误
+  // JSON body 同样直接带上这段文本。HTTP 头值必须是 ASCII——中文字符会让
+  // res.set() 抛 ERR_INVALID_CHAR，把本该返回的 401 变成一个 500，而且是那种只在真实
+  // provider 上才会暴露、mock 掉 verifyAccessToken 的单测完全看不见的 500。
+  // 这不是风格不一致，是这条路径唯一能安全经过的字符集；别为了和别处统一改回中文。
   async function challengeForAuthorizationCode(
     client: OAuthClientInformationFull,
     authorizationCode: string,
   ): Promise<string> {
     const pending = pendingCodes.get(hashToken(authorizationCode));
     if (!pending || pending.expires_at <= Date.now()) {
-      throw new InvalidGrantError('授权码不存在或已过期');
+      throw new InvalidGrantError('authorization code not found or expired');
     }
     // 目前这个返回值只在 SDK 内部做哈希比对，从不回显，且 exchangeAuthorizationCode 会在
     // 签发令牌前再核对一次归属——但检查的价值不只在于挡住了什么，也在于下一个读者不必
     // 自己重建这三步论证来确认「不检查也安全」。那个论证现在成立，不代表它会一直成立。
     if (pending.client_id !== client.client_id) {
-      throw new InvalidGrantError('授权码不属于该客户端');
+      throw new InvalidGrantError('authorization code does not belong to this client');
     }
     return pending.code_challenge;
   }
@@ -185,19 +192,19 @@ export function createOAuthProvider(deps: {
     pendingCodes.delete(codeHash);
 
     if (!pending) {
-      throw new InvalidGrantError('授权码不存在、已被使用或已过期');
+      throw new InvalidGrantError('authorization code not found, already used, or expired');
     }
     if (pending.expires_at <= Date.now()) {
-      throw new InvalidGrantError('授权码已过期');
+      throw new InvalidGrantError('authorization code expired');
     }
     if (pending.client_id !== client.client_id) {
-      throw new InvalidGrantError('授权码不属于该客户端');
+      throw new InvalidGrantError('authorization code does not belong to this client');
     }
     // redirectUri 在 SDK 的 token schema 里是 optional 字段——调用方可以整个不发。
     // 签发时 issueAuthorizationCode 总是记录一个具体的 redirect_uri，所以「没发」
     // 和「发的不一样」都算不一致：RFC 6749 §4.1.3 要求无条件回比，不能因为字段缺席就放行。
     if (pending.redirect_uri !== redirectUri) {
-      throw new InvalidGrantError('redirect_uri 与签发时不一致');
+      throw new InvalidGrantError('redirect_uri does not match the value used when the code was issued');
     }
 
     const { tokens } = await issueTokenPair(pending.client_id, pending.scopes, randomUUID());
@@ -212,17 +219,17 @@ export function createOAuthProvider(deps: {
   ): Promise<OAuthTokens> {
     const record = await store.findByRefreshToken(refreshToken);
     if (!record) {
-      throw new InvalidGrantError('刷新令牌不存在或已过期');
+      throw new InvalidGrantError('refresh token not found or expired');
     }
     if (record.client_id !== client.client_id) {
-      throw new InvalidGrantError('刷新令牌不属于该客户端');
+      throw new InvalidGrantError('refresh token does not belong to this client');
     }
 
     if (record.rotated) {
       // 已轮换的刷新令牌再次出现 = 泄露信号：无法分辨是本人还是窃贼，两个都断掉。
       await store.revokeFamily(record.family_id);
       await sessions.destroyByToken(record.family_id);
-      throw new InvalidGrantError('检测到刷新令牌重放，已吊销整个令牌家族，请重新授权');
+      throw new InvalidGrantError('refresh token replay detected; the token family has been revoked, re-authorize');
     }
 
     const nextScopes = scopes ?? record.scopes;
@@ -238,7 +245,7 @@ export function createOAuthProvider(deps: {
   async function verifyAccessToken(token: string): Promise<AuthInfo> {
     const record = await store.findByAccessToken(token);
     if (!record) {
-      throw new InvalidTokenError('访问令牌不存在、已过期或已被吊销');
+      throw new InvalidTokenError('access token not found, expired, or revoked');
     }
     return {
       token,
