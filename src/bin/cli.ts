@@ -111,16 +111,23 @@ async function main(): Promise<void> {
   for (const notice of config.notices) logger.warn(notice);
 
   // 这是 `cli start` detach 出来的子进程内部标记，不是用户命令：真正的常驻
-  // 主体在这里——`startDaemon` 后直接 `return`，靠监听中的 server 和 SIGINT/
-  // SIGTERM 处理器活着，直到被 `stop` 或空闲超时关掉。父进程（下面的 `start`
-  // 分支）负责把这个子进程 spawn 出去、等它真正可连接、打印端点、退出。
+  // 主体在这里。父进程（下面的 `start` 分支）负责把这个子进程 spawn 出去、
+  // 等它真正可连接、打印端点、退出。
   if (first === DAEMON_RUN_MARKER) {
-    const handle = await startDaemon({ config, logger });
-    const shutdown = (): void => {
-      void handle.close().then(() => process.exit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
+    const handle = await startDaemon({
+      config,
+      logger,
+      // 空闲超时、收到 stop 指令、或者收到信号，都要真的退出这个进程——
+      // 光把 server 关掉、会话销毁、端点文件删掉，不代表进程会自己退出：
+      // 万一某个 provider 留下一个没清干净的定时器/连接，事件循环就不会
+      // 自然排空，daemon 变成一个没有监听、没有端点文件、`cli stop` 也找
+      // 不到、`cli start` 却会在它旁边再起一个的隐形僵尸。`onShutdown` 是
+      // `shutdown()` 内部三条触发路径（空闲计时器、`__cli_daemon_stop__`、
+      // 外部 `close()`）共用的唯一出口，保证它们都真的落到 `process.exit`。
+      onShutdown: () => process.exit(0),
+    });
+    process.once('SIGINT', () => void handle.close());
+    process.once('SIGTERM', () => void handle.close());
     return;
   }
 
@@ -130,7 +137,10 @@ async function main(): Promise<void> {
   if (first === 'stop') {
     const stopped = await stopDaemon();
     await flush(process.stdout, (stopped ? '守护进程已停止' : '没有正在运行的守护进程') + NEWLINE);
-    process.exit(stopped ? 0 : 1);
+    // 退出码恒为 0：没有守护进程在跑不是一次失败，是这条命令想要的终态之一——
+    // `cli stop` 常出现在清理脚本或 `set -e` 的收尾处，一个本来就无事可做的
+    // 清理步骤不该让脚本因此中断。
+    process.exit(0);
   }
 
   if (first === 'start') {
@@ -140,10 +150,12 @@ async function main(): Promise<void> {
       exitUsageError(multiAccountRefusal(config));
     }
 
-    // 已经有一个能连上的守护进程在跑，就不再 spawn 第二个——同一个 socket 路径
-    // 被两个监听者抢占没有好结果（后来者会先 unlink 前者的 socket 文件再 listen，
-    // 前者留在内存里但再也没人连得上，变成一个谁都不知道的孤儿进程）。
-    // 用 timeoutMs: 0 只做一次即时探测，不是真的等——已经在跑就该立刻知道。
+    // 已经有一个能连上的守护进程在跑，就不再 spawn 第二个——两个监听者抢占
+    // 同一个 socket 地址没有好结果。用 timeoutMs: 0 只做一次即时探测，不是
+    // 真的等——已经在跑就该立刻知道。这只是缩小竞态窗口的快路径，真正的
+    // 安全网是 daemon.ts 里的 EADDRINUSE 探测 + 端点文件所有权校验：
+    // 就算两个 `cli start` 在这里同时探测到"没人在跑"、都真的 spawn 了，
+    // 后起的那个也不会删掉先起的那个仍然活着的端点。
     const already = await waitForDaemonReady(undefined, 0);
     if (already) {
       await flush(process.stdout, `守护进程已经在跑，监听于 ${describeEndpoint(already)}` + NEWLINE);
@@ -156,13 +168,38 @@ async function main(): Promise<void> {
     }
 
     // `detached: true` + `unref()`：子进程脱离这个父进程的进程组，父进程退出
-    // 后子进程继续活着。`stdio: 'ignore'`——子进程不该往父进程继承来的
-    // stdout/stderr 写任何东西，那条流在父进程退出后就没人读了。
+    // 后子进程继续活着。stderr 用 'pipe' 而不是 'ignore'——子进程失败的唯一
+    // 反馈渠道曾经就是"5 秒之后超时，打印一句没有实际信息的提示"；这里在
+    // 父进程还醒着、还在轮询就绪状态的这段时间里，把子进程的 stderr 收集
+    // 起来，失败时原样带出去。
     const child = spawn(process.execPath, [scriptPath, DAEMON_RUN_MARKER], {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
     child.unref();
+
+    let childStderr = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      childStderr += chunk.toString('utf8');
+    });
+
+    let childFailure: string | undefined;
+    child.once('error', (err) => {
+      // spawn 本身失败（比如可执行文件路径有问题）：Node 用 'error' 事件报告，
+      // 不接这个监听器的话它会在某个后续 tick 被当成未捕获异常抛出，绕过
+      // main().catch，用户看到的是一段和这次操作毫不相关的原始堆栈。
+      childFailure = err instanceof Error ? err.message : String(err);
+    });
+    const childExited = new Promise<void>((resolve) => {
+      child.once('exit', (code, signal) => {
+        if (childFailure === undefined) {
+          childFailure = signal
+            ? `守护进程子进程被信号 ${signal} 终止`
+            : `守护进程子进程提前退出，退出码 ${code ?? 'null'}`;
+        }
+        resolve();
+      });
+    });
 
     // 不是等文件出现，是等真的能连上：`writeEndpoint` 只在 `listen`（以及
     // unix 模式下的 `chmod`）成功之后才落盘，但端点文件本身可能是上一个
@@ -170,10 +207,18 @@ async function main(): Promise<void> {
     // 进程已经在监听"。`cli start && cli mail_search` 这种调用方式要求
     // start 返回时 daemon 必须真的可用，否则 mail_search 会在 daemon 就绪
     // 前抢跑，悄悄退回一次性模式，付掉 daemon 本该省下的握手成本，而且
-    // 没有任何症状。
-    const endpoint = await waitForDaemonReady(undefined, START_TIMEOUT_MS);
+    // 没有任何症状。和子进程的退出赛跑——子进程如果直接死掉，没有理由还
+    // 傻等满 5 秒超时才告诉用户。
+    const endpoint = await Promise.race([waitForDaemonReady(undefined, START_TIMEOUT_MS), childExited.then(() => undefined)]);
+
     if (!endpoint) {
-      exitUsageError(`守护进程未能在 ${START_TIMEOUT_MS}ms 内就绪；用 cli stop 清理残留状态后重试`);
+      const detail =
+        childFailure !== undefined
+          ? NEWLINE + childFailure + (childStderr.trim().length > 0 ? NEWLINE + childStderr.trim() : '')
+          : childStderr.trim().length > 0
+            ? NEWLINE + childStderr.trim()
+            : '';
+      exitUsageError(`守护进程未能在 ${START_TIMEOUT_MS}ms 内就绪；用 cli stop 清理残留状态后重试` + detail);
     }
     await flush(process.stdout, `守护进程已启动，监听于 ${describeEndpoint(endpoint)}` + NEWLINE);
     process.exit(0);

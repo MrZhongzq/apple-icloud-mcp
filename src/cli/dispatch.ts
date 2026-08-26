@@ -195,18 +195,33 @@ export interface RunCliDaemonDeps extends RunCliDeps {
  * `bin/cli.ts` 真正对外暴露的 `cli <tool>` 分派：先试有没有一个活着的守护进程，
  * 能连上就用它已经建好的会话执行（省下这次调用本该重做的 TCP+TLS+AUTH 握手）；
  * 连不上——没启动、被杀掉、端点文件是僵死的——`callDaemon` 会自己清理端点文件
- * 并返回 `undefined`，这里随即原样退回 `executeAndFormat` 的一次性模式。
+ * 并返回 `undefined`，这里随即原样退回 `executeAndFormat` 的一次性模式（并在
+ * stderr 上说一声，见下面 catch 之外的 `logger.warn`——这条退回完全没有别的
+ * 症状，用户拿到的结果照样正确，唯一的差别是悄悄多付了一次握手，不说清楚
+ * 就没人会知道）。
  *
  * 用法解析（--list/--help/排除名单/多账号拒绝/flag 校验）与 `runCli` 共享同一个
  * `resolveCall`，只在"已经解析出一个要执行的调用"之后才分叉成两条执行路径——
  * 这条顺序不能反：先跑一次性模式、daemon 只是"顺便"，会让常驻会话形同虚设，
  * 每条命令还是在从头登录，而命令本身照样能跑通、没有任何症状。
+ *
+ * `callDaemon` 在"请求已经写给 daemon、但没能确认执行结果"时会抛而不是返回
+ * `undefined`（`client.ts` 的 `RoundTripOutcome` 上有完整说明）——这里必须把
+ * 那个异常当成一次失败直接报给调用方，绝不能落到下面的 `executeAndFormat`
+ * 重跑一遍：daemon 可能已经真的执行了那次调用，对 `mail_send` 这类写操作，
+ * 重试意味着用户会收到两封信。
  */
 export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]): Promise<RunCliOutcome> {
   const resolved = resolveCall(deps, argv);
   if (resolved.kind === 'outcome') return resolved.outcome;
 
-  const daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files);
+  let daemonResult;
+  try {
+    daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files);
+  } catch (err) {
+    return { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE };
+  }
+
   if (daemonResult) {
     if (daemonResult.isError) {
       return { exitCode: 2, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
@@ -214,5 +229,6 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
     return { exitCode: 0, stdout: JSON.stringify(daemonResult.value, null, 2) + NEWLINE, stderr: '' };
   }
 
+  deps.logger.warn('daemon unavailable, falling back to a one-shot session', { tool: resolved.toolName });
   return executeAndFormat(deps, resolved.toolName, resolved.args);
 }
