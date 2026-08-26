@@ -328,7 +328,11 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
           },
         }),
       });
-      expect(res.status, '真实令牌不该被当成未授权拒绝').not.toBe(401);
+      // `.not.toBe(401)` 曾经是这里的断言：那样写的话，500、502、连接被
+      // reset 都会让测试通过——"没被当成未授权"和"什么正经响应都没有"
+      // 长得一样。这里改成正向断言：一次成功的 MCP initialize 请求应该拿到
+      // 200，而不只是"不是 401"。
+      expect(res.status, '真实令牌不该被当成未授权拒绝，应当正常完成 initialize').toBe(200);
     } finally {
       await srv.close();
     }

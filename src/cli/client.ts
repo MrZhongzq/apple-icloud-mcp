@@ -102,7 +102,7 @@ function connect(endpoint: Endpoint, timeoutMs: number = DEFAULT_CONNECT_TIMEOUT
   });
 }
 
-type RoundTripOutcome =
+export type RoundTripOutcome =
   | { kind: 'ok'; value: WireResult }
   /** daemon 主动拒绝了这次请求（比如令牌不对），而且这个拒绝发生在它调用
    *  任何工具之前——协议上保证了这一点：daemon 侧的拒绝分支永远先于
@@ -130,7 +130,8 @@ type RoundTripOutcome =
  * 冒充成了失败，daemon 路径反而比它要取代的一次性模式更差。`timeoutMs`
  * 仍然是个参数，但只给测试用：不传（生产路径的调用方式）就是永不超时。
  */
-function roundTrip(socket: net.Socket, payload: unknown, timeoutMs?: number): Promise<RoundTripOutcome> {
+// 导出仅供测试直接驱动：要证明“不传 timeoutMs 时真的一个 setTimeout 都不会安”，需要直接监听全局 setTimeout，不能只依靠真实网络连接的行为推断。
+export function roundTrip(socket: net.Socket, payload: unknown, timeoutMs?: number): Promise<RoundTripOutcome> {
   return new Promise((resolve) => {
     let buffer = '';
     let settled = false;

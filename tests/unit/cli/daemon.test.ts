@@ -152,7 +152,10 @@ describe('daemon access control', () => {
       const mode = statSync(handle.endpoint.path).mode & 0o777;
       expect(mode, 'Node 建出来默认是 755/775，谁都能连；那后面挂着一个已登录的 iCloud 会话').toBe(0o600);
     } else {
-      expect(handle.endpoint.kind).toBe('tcp');
+      // 这里不再重复 `expect(handle.endpoint.kind).toBe('tcp')`——走到这个
+      // 分支就已经证明了 kind !== 'unix'，而 Endpoint 只有 unix/tcp 两种
+      // 取值，那一句在类型层面必然为真，不是一个真正的运行时断言。真正
+      // 有内容的检查是下面这一句。
       expect(handle.endpoint.token.length, 'TCP 模式没有文件权限可依赖，必须有一个非空令牌').toBeGreaterThan(0);
     }
   });

@@ -2,6 +2,7 @@ import { AppError } from '../core/errors.js';
 import { deriveFlags, parseFlags, renderHelp } from './flags.js';
 import { executeOnce, type SessionFactory } from './execute.js';
 import { callDaemon } from './client.js';
+import type { ClientTimeouts } from './client.js';
 import type { AppConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
 import type { CollectedTool } from './registry.js';
@@ -189,6 +190,9 @@ export async function runCli(deps: RunCliDeps, argv: string[]): Promise<RunCliOu
 export interface RunCliDaemonDeps extends RunCliDeps {
   /** 测试注入的端点文件位置；生产环境省略，用默认的临时目录路径。 */
   files?: EndpointFiles;
+  /** 测试注入的超时旋钮，原样传给 callDaemon。生产路径（bin/cli.ts）
+   *  从不传——见 client.ts 里 roundTrip 上的注释：请求字节写出去之后不该有总时长上限。 */
+  timeouts?: ClientTimeouts;
 }
 
 /**
@@ -217,7 +221,7 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
 
   let daemonResult;
   try {
-    daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files);
+    daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files, deps.timeouts);
   } catch (err) {
     return { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE };
   }

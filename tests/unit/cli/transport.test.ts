@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import {
   endpointFiles, canUseUnixSocket, writeEndpoint, readEndpoint, clearEndpoint,
 } from '../../../src/cli/transport.js';
@@ -97,12 +97,21 @@ describe('endpointFiles', () => {
     delete process.env.MCP_CLI_RUNTIME_DIR;
     try {
       const dirName = dirname(endpointFiles().infoPath).split(/[\\/]/).pop() ?? '';
-      // 一个不带用户区分的固定名字在共享 /tmp 上是可预测、可被别的用户抢先
-      // 创建并占有的路径——见 transport.ts 里 ensureOwnedDir 的注释。这里
-      // 只断言"目录名不是那个裸的固定名字"，具体用什么区分符（uid 还是
-      // 用户名）留给实现，不在这里锁死。
-      expect(dirName, '默认运行时目录名不应该是一个所有用户共享的固定名字').not.toBe('apple-icloud-mcp-cli');
-      expect(dirName.startsWith('apple-icloud-mcp-cli')).toBe(true);
+      // 正向断言，不是“不等于裸名字、且以它开头”：一个退化成永远返回空
+      // 字符串的 currentUserTag() 会让目录名变成 "apple-icloud-mcp-cli-"——
+      // 依然不等于裸名字、依然以它开头，之前这两条断言会全部
+      // 通过，却照样把机器上所有用户折叠回同一个共享路径，
+      // 这正是 F-3 要防的后果本身。这里用同样的公开
+      // API（process.getuid / os.userInfo().username）独立算出期望的标签，
+      // 断言目录名后缀真的是它。
+      const expectedTag =
+        typeof process.getuid === 'function'
+          ? String(process.getuid())
+          : userInfo().username.replace(/[^a-zA-Z0-9_.-]/g, '_');
+      expect(expectedTag.length, '这条测试自己算出的标签不能是空的，否则测试本身就测不出任何东西').toBeGreaterThan(0);
+      expect(dirName, '运行时目录名必须真的带上当前用户的标识，不能只是长得像').toBe(
+        `apple-icloud-mcp-cli-${expectedTag}`,
+      );
     } finally {
       if (prev !== undefined) process.env.MCP_CLI_RUNTIME_DIR = prev;
     }

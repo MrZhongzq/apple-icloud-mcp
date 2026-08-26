@@ -154,10 +154,6 @@ export async function startDaemon(deps: {
   // 对已存在的目录是空操作（后面 listenUnixSocket 里的 chmodSync 只管 socket
   // 文件本身，不管它的父目录），补救式的权限收紧会漏掉 mkdir 到 chmod 之间
   // 那个真实存在的窗口，也漏掉目录本来就已经存在的情形。
-  // N-1: 必须在建目录这一步就把 mode 定死，不能建完再补 chmod——mkdir
-  // 对已存在的目录是空操作（后面 listenUnixSocket 里的 chmodSync 只管 socket
-  // 文件本身，不管它的父目录），补救式的权限收紧会漏掉 mkdir 到 chmod 之间
-  // 那个真实存在的窗口，也漏掉目录本来就已经存在的情形。
   await mkdir(join(files.infoPath, '..'), { recursive: true, mode: 0o700 });
 
   const sessions = createSessionStore({

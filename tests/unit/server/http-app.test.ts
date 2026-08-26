@@ -230,9 +230,14 @@ describe('TRUST_PROXY', () => {
 
   it('buckets by the forwarded client address when it is on, so one proxy is not one bucket', async () => {
     const { app } = build({ trustProxy: true });
+    // `.not.toBe(429)` 曾经是这里的断言：那样写的话，不管 floodAdminLogin 最后
+    // 一次请求实际拿到 500、404，还是路由整个消失，只要不是恰好 429 就会通过——
+    // "没有被限流"和"什么正经响应都没有"在这个断言里长得一样。改成正向断言：
+    // 每个来源各占一个桶，意味着最后这一次请求应该走到正常的登录校验逻辑，
+    // 拿到密码错误的 401，而不是被限流的 429。
     expect(
       await floodAdminLogin(app, ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT),
-      '信任代理时不同的转发来源各占一个桶，一个访客锁不死所有人',
-    ).not.toBe(429);
+      '信任代理时不同的转发来源各占一个桶，一个访客锁不死所有人；最后一次请求应该正常校验到密码错误（401），而不是被限流（429）',
+    ).toBe(401);
   });
 });

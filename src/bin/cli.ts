@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-import { existsSync, openSync, closeSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import dotenv from 'dotenv';
 import { loadConfig } from '../core/config.js';
 import { createLogger } from '../core/logger.js';
@@ -11,15 +10,11 @@ import { collectTools } from '../cli/registry.js';
 import { runCliDaemonFirst, formatFailure, multiAccountRefusal } from '../cli/dispatch.js';
 import { startDaemon } from '../cli/daemon.js';
 import { stopDaemon, waitForDaemonReady } from '../cli/client.js';
-import { DAEMON_RUN_MARKER, endpointFiles, ensureOwnedDir } from '../cli/transport.js';
+import { startDaemonProcess } from '../cli/start.js';
+import { DAEMON_RUN_MARKER } from '../cli/transport.js';
 import type { Endpoint } from '../cli/transport.js';
 
 const NEWLINE = String.fromCharCode(10);
-
-/** `cli start` 等一个新起的守护进程真正可连接的上限；`waitForDaemonReady` 内部
- *  50ms 轮一次，这个上限只是给"进程起不来"（比如配置在 spawn 之后才报错）
- *  一个明确的失败点，而不是无限等下去。 */
-const START_TIMEOUT_MS = 5_000;
 
 /**
  * stdio 入口（`bin/stdio.ts`）靠 spawn 它的客户端注入环境变量，没有父进程替
@@ -111,8 +106,8 @@ async function main(): Promise<void> {
   for (const notice of config.notices) logger.warn(notice);
 
   // 这是 `cli start` detach 出来的子进程内部标记，不是用户命令：真正的常驻
-  // 主体在这里。父进程（下面的 `start` 分支）负责把这个子进程 spawn 出去、
-  // 等它真正可连接、打印端点、退出。
+  // 主体在这里。父进程（下面的 `start` 分支，实际逻辑在 `cli/start.ts`）
+  // 负责把这个子进程 spawn 出去、等它真正可连接、打印端点、退出。
   if (first === DAEMON_RUN_MARKER) {
     const handle = await startDaemon({
       config,
@@ -167,76 +162,34 @@ async function main(): Promise<void> {
       exitUsageError('无法确定当前脚本路径，无法启动守护进程');
     }
 
-    // 子进程的 stderr 必须落在一个文件里，不能是父进程手里的一条 pipe——
-    // `detached` 子进程本来就该比父进程活得久（父进程等就绪确认完就会
-    // exit(0)），而 pipe 的读端归父进程所有：父进程一退出，子进程下一次往
-    // stderr 写东西就会撞上 EPIPE，没人接这个信号的话就是一个未捕获异常，
-    // daemon 直接死掉。这不是假设——默认 LOG_LEVEL 是 info，
-    // `contacts/cache.ts` 首次 `contacts_search` 就会在 info 级别写一行日志，
-    // 相当于"cli start 之后的第一次真实调用就会把 daemon 干掉"。文件是
-    // fd，子进程独立持有自己的一份，父进程退不退出都不影响它。运行时目录
-    // 用之前必须先建好（0700，和 daemon 自己启动时用的是同一个目录），
-    // 不能假设它已经存在。
-    const files = endpointFiles();
-    const runtimeDir = path.dirname(files.infoPath);
-    await ensureOwnedDir(runtimeDir);
-    const logPath = path.join(runtimeDir, 'daemon.log');
-    // 'w'：每次 start 都截断重写，避免上一次失败的残留日志和这一次的诊断
-    // 信息混在一起，误导排查。
-    const logFd = openSync(logPath, 'w', 0o600);
+    // spawn、等就绪、和子进程的退出赛跑，全部在 cli/start.ts 里——单独抽出来
+    // 是因为这套逻辑本身需要被测试覆盖（NN-1：旧的固定 5s 超时比子进程自己
+    // 冷启动都短），而 bin/cli.ts 作为一个"加载即执行"的入口脚本没法被安全
+    // 导入到测试里。
+    const result = await startDaemonProcess({ scriptPath });
 
-    // `detached: true` + `unref()`：子进程脱离这个父进程的进程组，父进程退出
-    // 后子进程继续活着。
-    const child = spawn(process.execPath, [scriptPath, DAEMON_RUN_MARKER], {
-      detached: true,
-      stdio: ['ignore', 'ignore', logFd],
-    });
-    child.unref();
-    // fd 已经被子进程继承（复制）走了，父进程这份可以立刻关掉——不关的话
-    // 父进程会一直占着这个文件描述符，直到自己退出。
-    closeSync(logFd);
-
-    let childFailure: string | undefined;
-    child.once('error', (err) => {
-      // spawn 本身失败（比如可执行文件路径有问题）：Node 用 'error' 事件报告，
-      // 不接这个监听器的话它会在某个后续 tick 被当成未捕获异常抛出，绕过
-      // main().catch，用户看到的是一段和这次操作毫不相关的原始堆栈。
-      childFailure = err instanceof Error ? err.message : String(err);
-    });
-    const childExited = new Promise<void>((resolve) => {
-      child.once('exit', (code, signal) => {
-        if (childFailure === undefined) {
-          childFailure = signal
-            ? `守护进程子进程被信号 ${signal} 终止`
-            : `守护进程子进程提前退出，退出码 ${code ?? 'null'}`;
-        }
-        resolve();
-      });
-    });
-
-    // 不是等文件出现，是等真的能连上：`writeEndpoint` 只在 `listen`（以及
-    // unix 模式下的 `chmod`）成功之后才落盘，但端点文件本身可能是上一个
-    // 崩溃/被杀掉的守护进程留下的僵尸——文件"存在"不等于"这次启动的这个
-    // 进程已经在监听"。`cli start && cli mail_search` 这种调用方式要求
-    // start 返回时 daemon 必须真的可用，否则 mail_search 会在 daemon 就绪
-    // 前抢跑，悄悄退回一次性模式，付掉 daemon 本该省下的握手成本，而且
-    // 没有任何症状。和子进程的退出赛跑——子进程如果直接死掉，没有理由还
-    // 傻等满 5 秒超时才告诉用户。
-    const endpoint = await Promise.race([waitForDaemonReady(undefined, START_TIMEOUT_MS), childExited.then(() => undefined)]);
-
-    if (!endpoint) {
-      let logTail = '';
-      try {
-        logTail = readFileSync(logPath, 'utf8').trim();
-      } catch {
-        // 日志文件本身读不到就算了，不能让诊断信息的读取失败盖过原本的报错。
-      }
-      const detail =
-        (childFailure !== undefined ? NEWLINE + childFailure : '') + (logTail.length > 0 ? NEWLINE + logTail : '');
-      exitUsageError(`守护进程未能在 ${START_TIMEOUT_MS}ms 内就绪；用 cli stop 清理残留状态后重试` + detail);
+    if (result.kind === 'ready') {
+      await flush(process.stdout, `守护进程已启动，监听于 ${describeEndpoint(result.endpoint)}` + NEWLINE);
+      process.exit(0);
     }
-    await flush(process.stdout, `守护进程已启动，监听于 ${describeEndpoint(endpoint)}` + NEWLINE);
-    process.exit(0);
+
+    if (result.kind === 'child-failed') {
+      exitUsageError(
+        `守护进程启动失败；用 cli stop 清理残留状态后重试` + (result.detail.length > 0 ? NEWLINE + result.detail : ''),
+      );
+    }
+
+    // result.kind === 'timed-out-but-alive'：这不是失败，是起得慢。子进程
+    // 冷启动（Node 自身 + 本项目的模块图：express/imapflow/nodemailer/tsdav/
+    // mailparser/ical.js/zod/MCP SDK）在慢机器、冷页缓存、网络挂载的安装
+    // 目录下可能超过一般的预期——绝不能在这里建议 cli stop，那会杀掉一个
+    // 正在起来的健康守护进程；也不能假装它已经就绪。退出码非零，因为这次
+    // `start` 调用确实没能确认成功，但消息必须清楚说明原因不是"死了"。
+    exitUsageError(
+      `守护进程仍在启动中（超过 ${result.timeoutMs}ms 还没就绪），但子进程还活着——这是启动慢，不是启动失败。` +
+        NEWLINE +
+        '不要用 cli stop（会杀掉一个正在起来的健康守护进程）；稍后重新运行 cli start——已经就绪的话会直接告诉你监听地址，否则继续等或查看运行时目录下的 daemon.log。',
+    );
   }
 
   const sessions = createSessionStore({
