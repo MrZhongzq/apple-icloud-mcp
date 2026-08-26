@@ -7,10 +7,7 @@ import { createLogger } from '../core/logger.js';
 import { createSessionStore } from '../core/session.js';
 import { createProviders } from '../providers/icloud/index.js';
 import { collectTools } from '../cli/registry.js';
-import { deriveFlags, parseFlags, renderHelp } from '../cli/flags.js';
-import { executeOnce } from '../cli/execute.js';
-import { AppError } from '../core/errors.js';
-import type { CollectedTool } from '../cli/registry.js';
+import { runCli, formatFailure } from '../cli/dispatch.js';
 
 const NEWLINE = String.fromCharCode(10);
 
@@ -24,14 +21,6 @@ function loadDotEnvIfPresent(): void {
   if (existsSync(envPath)) {
     dotenv.config({ path: envPath, override: false });
   }
-}
-
-function formatFailure(err: unknown): string {
-  if (err instanceof AppError) {
-    return err.hint ? `${err.message}${NEWLINE}提示：${err.hint}` : err.message;
-  }
-  if (err instanceof Error) return err.message;
-  return String(err);
 }
 
 /**
@@ -50,15 +39,14 @@ function exitUsageError(message: string): never {
 }
 
 /**
- * 把 text 写到给定的流，等它真正被消费完（写回调触发）以后再退出。
- * 用于可能较大的负载（工具的执行结果）：直接 `write(x); process.exit(code)`
- * 在部分平台的管道上（尤其是 Windows）不保证 write 已经落地，会截断输出；
- * 用回调换取"退出前一定写完"的保证。
+ * 把非空文本写到给定的流，等它真正被消费完（写回调触发）才 resolve。
+ * 直接 `stream.write(x); process.exit(code)` 在部分平台的管道上（尤其是
+ * Windows）不保证 write 已经落地，会截断输出；用回调换取"退出前一定写完"的保证。
  */
-function writeThenExit(stream: NodeJS.WritableStream, text: string, code: number): void {
-  process.exitCode = code;
-  stream.write(text, () => {
-    process.exit(code);
+function flush(stream: NodeJS.WritableStream, text: string): Promise<void> {
+  if (text.length === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    stream.write(text, () => resolve());
   });
 }
 
@@ -75,28 +63,20 @@ function renderUsage(): string {
   );
 }
 
-function renderToolList(tools: Map<string, CollectedTool>): string {
-  const names = [...tools.keys()].sort();
-  const lines = names.map((name) => {
-    const tool = tools.get(name);
-    const description = tool ? tool.config.description.split(NEWLINE)[0] : '';
-    return name + '  ' + description;
-  });
-  return lines.join(NEWLINE) + NEWLINE;
-}
-
 async function main(): Promise<void> {
   loadDotEnvIfPresent();
 
   const argv = process.argv.slice(2);
   const first = argv[0];
 
+  // 顶层的"没参数"/"--help" 必须能在没有任何有效配置的情况下也显示用法——
+  // 一个刚拿到沙盒、还没设置任何 ICLOUD_ACCOUNT_n 的用户第一步往往就是 cli --help。
   if (first === undefined) {
     exitUsageError(renderUsage());
   }
   if (first === '--help' || first === '-h') {
-    writeThenExit(process.stdout, renderUsage(), 0);
-    return;
+    await flush(process.stdout, renderUsage());
+    process.exit(0);
   }
 
   let config;
@@ -117,47 +97,15 @@ async function main(): Promise<void> {
 
   const tools = collectTools({ config, sessions, logger });
 
-  if (first === '--list') {
-    writeThenExit(process.stdout, renderToolList(tools), 0);
-    return;
-  }
+  // sessionFactory 必须返回上面这同一个 `sessions` 实例——`tools` 里的 handler
+  // （比如 mail_search）内部是靠这个 store 的 `get(session_id)` 找会话的；
+  // executeOnce 若用另一个 store 建会话，注入的 session_id 在 handler 眼里就是
+  // 个不存在的会话。
+  const outcome = await runCli({ config, logger, tools, sessionFactory: () => sessions }, argv);
 
-  const toolName = first;
-  const tool = tools.get(toolName);
-  if (!tool) {
-    exitUsageError(`未知工具：${toolName}${NEWLINE}用 cli --list 查看全部工具`);
-  }
-
-  const rest = argv.slice(1);
-  const specs = deriveFlags(tool.config);
-
-  if (rest[0] === '--help' || rest[0] === '-h') {
-    writeThenExit(process.stdout, renderHelp(toolName, tool.config, specs) + NEWLINE, 0);
-    return;
-  }
-
-  let args: Record<string, unknown>;
-  try {
-    args = parseFlags(specs, rest);
-  } catch (err) {
-    exitUsageError(formatFailure(err));
-  }
-
-  try {
-    // sessionFactory 必须返回上面这同一个 `sessions` 实例——`tools` 里的
-    // handler（比如 mail_search）内部是靠这个 store 的 `get(session_id)`
-    // 找会话的；executeOnce 若用另一个 store 建会话，注入的 session_id
-    // 在 handler 眼里就是个不存在的会话。
-    const result = await executeOnce({ config, logger, tools, sessionFactory: () => sessions }, { tool: toolName, args });
-
-    if (result.isError) {
-      writeThenExit(process.stderr, JSON.stringify(result.value, null, 2) + NEWLINE, 2);
-      return;
-    }
-    writeThenExit(process.stdout, JSON.stringify(result.value, null, 2) + NEWLINE, 0);
-  } catch (err) {
-    exitUsageError(formatFailure(err));
-  }
+  await flush(process.stdout, outcome.stdout);
+  await flush(process.stderr, outcome.stderr);
+  process.exit(outcome.exitCode);
 }
 
 main().catch((err: unknown) => {
