@@ -41,6 +41,19 @@ describe('boolean flags', () => {
     expect(() => parseFlags(deriveFlags(boolCfg), ['--completed', 'true'])).toThrow(/true/);
   });
 
+  it('rejects --x and --no-x together instead of letting the last one win', () => {
+    // `--x --unset-x` 早就是拒绝的；F8 加进 `--no-x` 时没跟上，于是同一种
+    // "两句互相否定的话"在一处报错、在另一处静默按后写的算。静默挑一个的
+    // 后果是：用户要的是"只看未完成"，拿到的是一份已完成清单，没有任何提示。
+    expect(() => parseFlags(deriveFlags(boolCfg), ['--completed', '--no-completed'])).toThrow(/completed/);
+    expect(() => parseFlags(deriveFlags(boolCfg), ['--no-completed', '--completed'])).toThrow(/completed/);
+  });
+
+  it('still allows the same form repeated — that is not a contradiction', () => {
+    expect(parseFlags(deriveFlags(boolCfg), ['--completed', '--completed'])).toEqual({ completed: true });
+    expect(parseFlags(deriveFlags(boolCfg), ['--no-completed', '--no-completed'])).toEqual({ completed: false });
+  });
+
   it('does not invent --no- for non-boolean flags', () => {
     expect(() => parseFlags(deriveFlags(boolCfg), ['--no-other'])).toThrow(/--no-other/);
   });

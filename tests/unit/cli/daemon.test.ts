@@ -196,7 +196,10 @@ describe('daemon wire protocol', () => {
     await new Promise<void>((r) => socket.on('connect', () => r()));
 
     socket.write(line); // 第一条：会卡在 gate 上
-    await delay(30);
+    // 等到确认第一条**真的进了闸门**再写第二条，而不是靠一个 sleep 赌它到了。
+    // 这条测试的第一版整个不可能失败（两行塞进同一个 write），所以这里多花
+    // 一行把时序也钉死，不留"经验上稳定"的部分。
+    await vi.waitFor(() => expect(listFolders).toHaveBeenCalledTimes(1));
     socket.write(line); // 第二条：独立的 data 事件，第一条还没处理完
     await delay(30);
     release();
@@ -221,6 +224,26 @@ describe('daemon wire protocol', () => {
     expect(reply.usageError, '参数错是用法错误：工具没跑，退出码该是 1 而不是 2').toBe(true);
     expect(reply.value.error.message).toContain('limt');
     expect(listFolders, '参数没过校验，工具一次都不该被调用').not.toHaveBeenCalled();
+  });
+
+  it('a refused (drifted) request does not keep the daemon alive', async () => {
+    // F-6 是 resetIdle() 跑在**令牌**校验之前；N-1 是同一个函数、同一个顺序
+    // 错误，换成了配置漂移这道新闸门：一个已经被拒绝服务、对谁都没用的陈旧
+    // daemon，被那些被拒绝的请求本身无限续命。
+    handle = await startDaemon({ config, logger, files, idleMs: 300 });
+    const ep = handle.endpoint;
+
+    const knock = wireLine(ep, { tool: 'apple_accounts', args: {}, configFingerprint: 'stale' });
+    for (let i = 0; i < 6; i += 1) {
+      // 一旦它真的走了，后面的敲门会 ECONNREFUSED——那正是我们要的结果，
+      // 不是测试失败。这里吞掉连接错误，判定交给下面的断言。
+      await rawSend(ep as never, [knock]).catch(() => undefined);
+      await delay(100);
+    }
+
+    // 敲了 600ms，每次都被拒。空闲窗口是 300ms，所以它早该自己走了。
+    expect(await readEndpoint(files), '被拒绝的请求不该续命——它们恰恰证明这个 daemon 没用了').toBeUndefined();
+    expect(closeImap, '空闲超时必须真的销毁会话，不只是变得连不上').toHaveBeenCalled();
   });
 
   it('refuses to serve a client whose config fingerprint does not match its own', async () => {

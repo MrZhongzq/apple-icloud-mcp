@@ -243,10 +243,22 @@ export function generateOwnerId(): string {
  *
  * 指纹里不含密码明文，只含它的摘要：换了密码指纹就会变，但这个值会随请求
  * 写进 socket，不能让它本身泄露凭据。
+ *
+ * **只覆盖账号相关的字段，不是整份 `AppConfig`，这是有意的。** `LOG_LEVEL`、
+ * `SESSION_TTL_MINUTES`、`IMAP_IDLE_TIMEOUT_SECONDS` 这些旋钮**故意排除在外**：
+ * 把整份配置一股脑哈希掉，等于把"调一下日志级别"变成"必须重启守护进程"，
+ * 而那些值改了并不会让 daemon 给出错误答案——它只是继续用旧的日志级别，
+ * 影响的是它自己，不是回答的正确性。指纹要覆盖的是**会让答案错掉**的那些：
+ * 账号身份、凭据、以及决定工具表和读写权限的 capabilities（外加 label，
+ * 因为 `apple_accounts` 会把它原样报给用户）。往里加字段之前先问一句：
+ * 这个值变了，daemon 的回答会不会变得**错误**？不会的话就别加。
  */
 export function configFingerprint(config: AppConfig): string {
   const material = config.accounts.map((account) => ({
     id: account.id,
+    // label 会出现在 apple_accounts 的输出里——不放进指纹的话，那个专门用来
+    // 报告"现在配成什么样"的工具会照旧报旧名字，而且退出码是 0。
+    label: account.label,
     email: account.email,
     sender: account.sender,
     password: createHash('sha256').update(account.appPassword).digest('hex'),

@@ -187,6 +187,20 @@ export async function startDaemon(deps: {
   let closed = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /**
+   * 续上空闲计时器。
+   *
+   * **`resetIdle()` 的含义是"确实有一个正当的客户端还在用这个 daemon"，所以它
+   * 必须排在每一道"能判定调用方不是正当客户端"的闸门之后。** 在它之前加任何
+   * 新的拒绝检查，都要把 `resetIdle()` 一起挪到那道检查后面去。
+   *
+   * 这条规则是被同一个 bug 教两遍教出来的：F-6 是 `resetIdle()` 跑在**令牌**
+   * 校验之前，于是任何能连上回环端口的本地进程不用带令牌、光靠隔三差五开一条
+   * 连接，就能让一个已登录的 iCloud 会话永不超时；N-1 是同一个函数、同一个
+   * 顺序错误，换成了**配置漂移**这道新闸门——一个已经被拒绝服务、对谁都没用的
+   * 陈旧 daemon，被那些被拒绝的请求本身无限续命（实测：idleMs 400、敲 1.2 秒，
+   * 它仍然在监听）。所以现在它落在 handleRequest 里、所有闸门之后。
+   */
   function resetIdle(): void {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -249,6 +263,10 @@ export async function startDaemon(deps: {
         // 提示绝不能写"用 --list 查看全部可用工具"——用户刚从 --list 里看到了它。
         throw new CliUsageError('NOT_FOUND', `守护进程不认识工具 ${req.tool}：${DRIFT_MESSAGE}`, { hint: DRIFT_HINT });
       }
+      // 全部闸门都过了：到这里才算"有一个正当的客户端在用我"，可以续命。
+      // 见 resetIdle 上面那段注释——它必须排在每一道拒绝检查之后。
+      resetIdle();
+
       // 记下这次用的是哪个会话对象：并发请求同时撞上 SESSION_EXPIRED 时，
       // rebuildSession 靠它判断"我要重建的那个是不是已经被别人换掉了"。
       const stale = session;
@@ -340,7 +358,8 @@ export async function startDaemon(deps: {
         return;
       }
 
-      resetIdle();
+      // 注意这里**没有** resetIdle()——它挪进 handleRequest，排在全部闸门之后。
+      // 规则见 resetIdle 自己的注释；停机指令不需要续命，它下一步就是关停。
 
       // stopDaemon 的信使：不查工具表，回一个成功响应后立刻关停。走同一条
       // 令牌校验（上面那行），所以 TCP 模式下拿不到令牌的人也停不了 daemon。
@@ -359,38 +378,52 @@ export async function startDaemon(deps: {
     socket.on('error', () => undefined);
   });
 
-  let endpoint: Endpoint;
   const useUnix = !usesToken;
 
+  /**
+   * `server.listen` 成功之后的每一步都必须包在这里面。
+   *
+   * 监听一旦起来，任何一次抛出都留下一个没人引用、也没人能关的监听 socket
+   * （独立 daemon 进程靠 `main().catch` 退出，掩盖了这一点；嵌入式/测试用法
+   * 会真的泄漏）。此前只有 `writeEndpoint` 被包住，而它前面还有两个会抛的
+   * 地方——unix 分支的 `chmodSync` 和 TCP 分支那句"没分配到端口"的检查——
+   * 都在保护范围之外。往这后面加任何一步，都要留在这个包装里。
+   */
+  const guardStartup = async <T>(fn: () => Promise<T> | T): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await sessions.destroyAll().catch(() => undefined);
+      throw err;
+    }
+  };
+
   if (useUnix) {
-    // listen 之后必须立刻 chmod：Node 建出来的 unix socket 默认 755/775，
-    // 谁都能连，而它后面挂着一个已登录、握着用户 iCloud 连接的会话。运行时
-    // 目录本身已经是 0700（见 transport.ts），这里是纵深防御，不是唯一的门。
     await listenUnixSocket(server, files.socketPath);
-    chmodSync(files.socketPath, 0o600);
-    endpoint = { kind: 'unix', path: files.socketPath };
   } else {
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       server.listen(0, '127.0.0.1', resolve);
     });
+  }
+
+  const endpoint: Endpoint = await guardStartup(() => {
+    if (useUnix) {
+      // listen 之后必须立刻 chmod：Node 建出来的 unix socket 默认 755/775，
+      // 谁都能连，而它后面挂着一个已登录、握着用户 iCloud 连接的会话。运行时
+      // 目录本身已经是 0700（见 transport.ts），这里是纵深防御，不是唯一的门。
+      chmodSync(files.socketPath, 0o600);
+      return { kind: 'unix', path: files.socketPath };
+    }
     const address = server.address();
     if (address === null || typeof address === 'string') {
       throw new AppError('INTERNAL', 'TCP 监听未能分配端口');
     }
-    endpoint = { kind: 'tcp', port: address.port, token };
-  }
+    return { kind: 'tcp', port: address.port, token };
+  });
 
-  // 监听已经起来了：从这里往后任何一次抛出都必须先把 listener 关掉，否则
-  // 嵌入式/测试用法里会留下一个没人引用、也没人能关的监听 socket（独立
-  // daemon 进程靠 main().catch 退出，掩盖了这一点）。
-  try {
-    await writeEndpoint(files, endpoint, ownerId);
-  } catch (err) {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await sessions.destroyAll().catch(() => undefined);
-    throw err;
-  }
+  await guardStartup(() => writeEndpoint(files, endpoint, ownerId));
   resetIdle();
 
   async function shutdown(): Promise<void> {

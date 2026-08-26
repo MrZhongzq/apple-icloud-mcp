@@ -268,13 +268,19 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
   if (resolved.kind === 'outcome') return resolved.outcome;
 
   const files = deps.files ?? endpointFiles();
-  // 有没有端点文件，必须在 callDaemon **之前**问：连不上僵死端点时 callDaemon
-  // 会顺手把文件删掉，事后再问永远得到"没有"——而"你启动过 daemon、它已经没了"
-  // 恰恰是唯一值得说一句的那种情况。
-  const hadEndpoint = (await readEndpoint(files)) !== undefined;
 
+  let hadEndpoint = false;
   let daemonResult;
   try {
+    // 有没有端点文件，必须在 callDaemon **之前**问：连不上僵死端点时 callDaemon
+    // 会顺手把文件删掉，事后再问永远得到"没有"——而"你启动过 daemon、它已经没了"
+    // 恰恰是唯一值得说一句的那种情况。
+    //
+    // 这一句必须和 callDaemon 落在**同一个 try 里**：`readEndpoint` 会在运行时
+    // 目录属于别人时抛 PERMISSION_DENIED（那正是它存在的意义），放在 try 外面
+    // 的话那个异常会一路冒到 bin/cli.ts 的 main().catch，用户看到的是带
+    // "apple-icloud-mcp cli 出错：" 前缀的兜底文案，而不是这里统一的错误渲染。
+    hadEndpoint = (await readEndpoint(files)) !== undefined;
     daemonResult = await callDaemon(
       { tool: resolved.toolName, args: resolved.args, configFingerprint: configFingerprint(deps.config) },
       deps.files,

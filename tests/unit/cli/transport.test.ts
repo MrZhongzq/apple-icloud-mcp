@@ -234,8 +234,16 @@ describe('configFingerprint', () => {
     expect(configFingerprint(cfg())).toBe(configFingerprint(cfg()));
   });
 
-  it('never contains the password itself — it travels over the socket', () => {
-    expect(configFingerprint(cfg({ appPassword: 'super-secret-value' }))).not.toContain('super-secret');
+  it('changes when ICLOUD_LABEL_n changes — apple_accounts reports it verbatim', () => {
+    expect(configFingerprint(cfg({ label: 'renamed' }))).not.toBe(configFingerprint(cfg()));
+  });
+
+  it('is a fixed-width hex digest — the only shape that cannot carry credential material', () => {
+    // 早先这里写的是 `expect(fp).not.toContain('super-secret')`。那条断言对
+    // **任何**十六进制摘要实现都恒成立——包括一个把明文密码原样拼进材料再
+    // 哈希的实现——所以它是装饰，不是保证。真正承担这条性质的是形状断言：
+    // 一个会把凭据带出来的实现（比如直接返回拼接后的材料）过不了它。
+    expect(configFingerprint(cfg({ appPassword: 'super-secret-value' }))).toMatch(/^[0-9a-f]{16}$/);
   });
 });
 

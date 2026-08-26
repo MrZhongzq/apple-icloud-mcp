@@ -166,6 +166,26 @@ export function parseFlags(specs: FlagSpec[], argv: string[]): Record<string, un
   const result: Record<string, unknown> = {};
   const setKeys = new Set<string>();
   const unsetKeys = new Set<string>();
+  /** 布尔参数已经被显式指定成什么了，用来发现 `--x --no-x` 这种自相矛盾的写法。 */
+  const boolValues = new Map<string, boolean>();
+
+  /**
+   * 同一个布尔字段既被置 true 又被置 false 时直接拒绝，不做"后写的赢"。
+   * 与下面 setKeys/unsetKeys 那条冲突检查同一个理由，也同一个标准：
+   * `--limit 3 --limit 5` 那种重复是无害的（两次说的是同一件事的不同取值，
+   * 后者显然是修正），而 `--completed --no-completed` 是两句互相否定的话——
+   * 静默挑一个，用户会带着"我要的是未完成"的以为拿到一份已完成清单。
+   * 这一阶段一直在清除的就是这种形状。
+   */
+  const noteBool = (spec: FlagSpec, value: boolean): void => {
+    const previous = boolValues.get(spec.key);
+    if (previous !== undefined && previous !== value) {
+      throw new Error('不能把同一个字段同时设为 true 和 false：' + spec.key + '（' + spec.flag + ' 与 --no-' + spec.key + '）');
+    }
+    boolValues.set(spec.key, value);
+    result[spec.key] = value;
+    setKeys.add(spec.key);
+  };
 
   let i = 0;
   while (i < argv.length) {
@@ -188,8 +208,7 @@ export function parseFlags(specs: FlagSpec[], argv: string[]): Record<string, un
     // 优先于普通 flag 匹配，理由和 `--unset-` 一样：否则会先被当成未知参数。
     const negatedSpec = byNegatedFlag.get(token);
     if (negatedSpec) {
-      result[negatedSpec.key] = false;
-      setKeys.add(negatedSpec.key);
+      noteBool(negatedSpec, false);
       i += 1;
       continue;
     }
@@ -200,8 +219,7 @@ export function parseFlags(specs: FlagSpec[], argv: string[]): Record<string, un
     }
 
     if (spec.kind === 'boolean') {
-      result[spec.key] = true;
-      setKeys.add(spec.key);
+      noteBool(spec, true);
       i += 1;
       continue;
     }
