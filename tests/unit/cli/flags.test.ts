@@ -58,6 +58,15 @@ describe('deriveFlags', () => {
     expect(by.outer!.description).toBe('外层描述');
     expect(by.inner!.description, '只看最外层会让这一半的帮助文本静默变空').toBe('内层描述');
   });
+
+  it('reads enum choices from the schema for display, not just its kind', () => {
+    const withEnum = cfg({
+      format: z.enum(['text', 'html', 'both']).optional().describe('正文格式'),
+    });
+    const by = Object.fromEntries(deriveFlags(withEnum).map((f) => [f.key, f]));
+    expect(by.format!.kind).toBe('string');
+    expect(by.format!.choices).toEqual(['text', 'html', 'both']);
+  });
 });
 
 describe('parseFlags', () => {
@@ -132,5 +141,17 @@ describe('renderHelp', () => {
     expect(text).toContain('--unset-note');
     expect(text).toMatch(/--subject[^\n]*必填|必填[^\n]*--subject/);
     expect(text, '帮助里不该出现由 CLI 注入的参数').not.toContain('--session_id');
+  });
+
+  it('lists every allowed value for an enum flag, not just <string>', () => {
+    const withEnum = cfg({
+      format: z.enum(['text', 'html', 'both']).optional().describe('正文格式'),
+    });
+    const specs = deriveFlags(withEnum);
+    const text = renderHelp('mail_read', withEnum, specs);
+    expect(text, '调用方光看类型名猜不出合法取值').toContain('--format <text|html|both>');
+    for (const value of ['text', 'html', 'both']) {
+      expect(text).toContain(value);
+    }
   });
 });

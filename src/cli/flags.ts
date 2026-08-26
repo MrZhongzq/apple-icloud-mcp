@@ -4,6 +4,15 @@ import type { ToolConfig } from '../server/types.js';
 
 const NEWLINE = String.fromCharCode(10);
 
+/**
+ * Schema introspection below reads zod's public classic API (`.type`, `.description`,
+ * `instanceof z.ZodOptional`/`z.ZodNullable`, `.unwrap()`, `.options`) instead of the
+ * internal `_def`/`_def.innerType` shape. `_def` is undocumented and free to change
+ * between zod minors; this project pins zod today but will eventually bump it, and the
+ * public surface is the part zod commits to keeping stable. Do not "simplify" this back
+ * to `_def` to save the one `as ZodTypeAny` cast below — that cast is the cheaper cost.
+ */
+
 export type FlagKind = 'string' | 'number' | 'boolean' | 'json';
 
 export interface FlagSpec {
@@ -16,6 +25,12 @@ export interface FlagSpec {
   /** 该参数接受 null（三态），因而额外生成 `--unset-<key>`。 */
   nullable: boolean;
   description?: string;
+  /**
+   * 枚举的合法取值，仅用于 --help 展示。**不要**用它在 parseFlags 里做校验——
+   * 工具自己的 zod schema 已经会拒绝非法值并在报错里列出合法取值，
+   * 这里再校验一遍就是同一份真相的第二个副本，枚举加一个成员时两边迟早会对不上。
+   */
+  choices?: string[];
 }
 
 interface PeelResult {
@@ -79,6 +94,14 @@ function kindOf(base: ZodTypeAny): FlagKind {
   }
 }
 
+/** 枚举的合法取值，仅用于 --help 展示（见 FlagSpec.choices 上的注释）。 */
+function choicesOf(base: ZodTypeAny): string[] | undefined {
+  if (base instanceof z.ZodEnum) {
+    return base.options.map((value) => String(value));
+  }
+  return undefined;
+}
+
 /** session_id 由 CLI 隐式注入（见 Task 2），绝不能生成成 flag。 */
 const INJECTED_KEYS = new Set(['session_id']);
 
@@ -88,6 +111,7 @@ export function deriveFlags(config: ToolConfig): FlagSpec[] {
     if (INJECTED_KEYS.has(key)) continue;
     const schema = rawSchema as ZodTypeAny;
     const { base, required, nullable, description } = peel(schema);
+    const choices = choicesOf(base);
     const spec: FlagSpec = {
       key,
       flag: '--' + key,
@@ -96,6 +120,7 @@ export function deriveFlags(config: ToolConfig): FlagSpec[] {
       nullable,
     };
     if (description !== undefined) spec.description = description;
+    if (choices !== undefined) spec.choices = choices;
     specs.push(spec);
   }
   return specs;
@@ -199,7 +224,9 @@ export function renderHelp(name: string, config: ToolConfig, specs: FlagSpec[]):
 
   for (const spec of specs) {
     const requiredLabel = spec.required ? '必填' : '可选';
-    let line = spec.flag + ' <' + spec.kind + '>  ' + requiredLabel;
+    // choices 存在时展示具体取值（如 <text|html|both>），否则退回类型名。
+    const typeLabel = spec.choices ? spec.choices.join('|') : spec.kind;
+    let line = spec.flag + ' <' + typeLabel + '>  ' + requiredLabel;
     if (spec.description) line += '  ' + spec.description;
     lines.push(line);
     if (spec.nullable) {
