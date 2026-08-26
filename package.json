@@ -19,7 +19,8 @@
     "start": "tsx src/bin/stdio.ts",
     "serve": "node dist/bin/stdio.js",
     "start:http": "tsx src/bin/http.ts",
-    "serve:http": "node dist/bin/http.js"
+    "serve:http": "node dist/bin/http.js",
+    "cli": "node dist/bin/cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
