@@ -1,13 +1,31 @@
 ---
 name: apple-icloud-mcp-skill
-description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts, over stdio or remote Streamable HTTP + OAuth), including the rules that replace it when running unattended in a scheduled routine.
+description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts) — over stdio, over remote Streamable HTTP + OAuth, or from a shell via the sandbox CLI — including the rules that replace it when running unattended in a scheduled routine.
 ---
 
 # Apple iCloud MCP Server — AI Client Contract
 
-This server exposes the same 25 tools for Apple iCloud Mail, Calendar, Reminders, and Contacts whether it's reached as a local stdio subprocess or as a remote Streamable HTTP server behind OAuth 2.1 (see the host project's README → "Remote deployment"). The two entrypoints share every tool and all business logic — the remote one only adds an authorization step (a browser-based login, handled entirely outside this contract) before your first call. Once a session exists, `apple_login`'s semantics, arguments, and return shape below are identical on both: it still connects live to verify credentials and still returns the same `session_id` shape, regardless of which entrypoint issued it. Read this before calling any of them.
+This server exposes the same tools for Apple iCloud Mail, Calendar, Reminders, and Contacts across three ways of reaching it: as a local **stdio** subprocess, as a remote **Streamable HTTP** server behind OAuth 2.1 (see the host project's README → "Remote deployment"), and as a **sandbox CLI** you drive from a shell (`node dist/bin/cli.js`, documented in `docs/沙盒-CLI-用法.md`). All three share every tool and all business logic. Read this before calling any of them.
 
-## Workflow
+## Which of these are you?
+
+**Everything in this document applies to you either way** — what each tool does, its arguments, its return shape, the error codes, the recovery table, and the unattended rules. What differs is only who owns the session, and the two tools that exist solely to manage it. Find your column before you read anything else:
+
+| | **MCP client** (stdio, or remote HTTP) | **Sandbox CLI** (`node dist/bin/cli.js`) |
+|---|---|---|
+| How many tools | **25** | **23** — the same list, minus `apple_login` and `work_done` |
+| Sessions | **You manage them.** `apple_login` → work → `work_done`, passing `session_id` on every call in between | **The CLI manages them.** Every command creates a session, runs, and destroys it. There is no `session_id` argument, ever |
+| `apple_login` / `work_done` | Required — see the workflow below | **They do not exist.** Calling either exits 1 with an error saying so; there is nothing for them to do |
+
+So: paragraphs below marked **(MCP only)** are about a session lifecycle the CLI already handles for you — read them as background, do not try to execute them. Everything else is yours regardless.
+
+Reading a tool signature as a CLI caller: each tool is a subcommand and each argument is a `--flag` (`node dist/bin/cli.js mail_search --folder INBOX --limit 5`); nested objects and arrays are passed as one JSON string (`--query '{"unseen":true}'`); `session_id` is never a flag. `cli <tool> --help` prints that tool's flags straight from its schema, and `cli --list` prints all 23. To run several calls in one session, see `cli start` / `cli stop` and `cli batch` in `docs/沙盒-CLI-用法.md`.
+
+For MCP clients specifically: the remote HTTP entrypoint only adds an authorization step (a browser-based login, handled entirely outside this contract) before your first call. Once a session exists, `apple_login`'s semantics, arguments, and return shape below are identical on both: it still connects live to verify credentials and still returns the same `session_id` shape, regardless of which entrypoint issued it.
+
+## Workflow (MCP only)
+
+On the CLI this whole sequence collapses to "run the command you want" — steps 2 and 4 are done for you, per command, and step 3 needs no `session_id`. Read it for what step 3's tools do; do not run steps 2 or 4.
 
 1. **(Optional) `apple_accounts`** — no session needed. Lists configured accounts and their capabilities. Call this first if you don't already know which account/email to use, especially in multi-account setups.
 2. **`apple_login`** — establish a session. This actually connects to verify the credentials, so a bad password fails here, immediately, not later. Only the protocols the account's enabled capabilities need are contacted — IMAP for mail, CalDAV for calendar and reminders, CardDAV for contacts — so an account whose mail tools are disabled still logs in fine. Returns `session_id`. If there is exactly one configured account, `account` may be omitted.
@@ -15,6 +33,8 @@ This server exposes the same 25 tools for Apple iCloud Mail, Calendar, Reminders
 4. **`work_done`** — call this once you have completely finished the user's task and no longer need iCloud access. It destroys the session and closes the underlying connections. Do not skip this at the end of a task.
 
 ## The 25 tools
+
+(23 on the CLI: everything below except `apple_login` and `work_done`. Where a signature shows `session_id`, the CLI fills it in for you and offers no flag for it.)
 
 ### Session (no `session_id` needed for the first one)
 
@@ -107,7 +127,7 @@ Every failed call returns `{ error: { code, message, hint?, retryable } }` with 
 
 | Code | Meaning | Recovery |
 |---|---|---|
-| `SESSION_EXPIRED` | `session_id` is invalid, unknown, or has been idle past `SESSION_TTL_MINUTES`. | Call `apple_login` again to get a fresh `session_id`, then retry the failed call with the new id. Do this automatically — don't ask the user first. |
+| `SESSION_EXPIRED` | `session_id` is invalid, unknown, or has been idle past `SESSION_TTL_MINUTES`. | *MCP:* call `apple_login` again to get a fresh `session_id`, then retry the failed call with the new id. Do this automatically — don't ask the user first. *CLI:* there is no login to redo — just run the same command again; it builds its own session, and if a resident daemon's session was the stale one the command falls back to a fresh one-shot session by itself. |
 | `PERMISSION_DENIED` | Two distinct causes, told apart by `hint` — (1) the account's config has the relevant read/write capability turned off entirely (e.g. `ALLOW_CALENDAR_WRITE_1=false`, `ALLOW_REMINDERS_WRITE_1=false`, `ALLOW_CONTACTS_WRITE_1=false`), `hint` names an env var; or (2) iCloud itself refused a write on one specific calendar, reminder list, **or address book** (a shared one you can read but not write, or privilege detection guessed wrong), `hint` says to try a different id. | For (1): do not retry. Tell the user which environment variable to set to `true` (for contacts, check `ALLOW_CONTACTS_WRITE_n`) and that the server must be restarted after. For (2): call `calendar_list` / `reminders_lists` / `contacts_search` and retry the write against a different `calendar_id` / `list_id` / `address_book_id` — `calendar_create_event`, `reminders_create`, and `contacts_create` each already do this once automatically when the id was omitted, so seeing this error from them means every writable collection was tried. |
 | `AUTH_FAILED` | iCloud rejected the App-Specific Password (IMAP/SMTP/CalDAV). | Do not retry blindly. Tell the user their App-Specific Password may be wrong/revoked; a new one must be generated at appleid.apple.com. |
 | `NOT_FOUND` | The `uid`/`event_id`/`calendar_id`/`reminder_id`/`list_id`/`contact_id`/`address_book_id`/folder no longer exists (e.g. deleted elsewhere). From `reminders_list` it specifically means a `list_id` you passed matches no current list — the message names the offending id rather than quietly returning nothing. | Re-fetch the current state (`mail_search`, `calendar_list_events`, `calendar_list`, `reminders_list`, `reminders_lists`, or `contacts_search`) and use a fresh id. Do not reuse an id from before the failure. |
@@ -123,9 +143,13 @@ Everything above assumes a person is reading your output and can answer a questi
 
 **There is nobody to ask, so never wait for an answer.** If a decision would normally need confirmation, either take the safe branch and say so in your output, or stop and report. Do not proceed on a guess and do not stall.
 
-**Always reach `work_done`, including on failure.** A session holds a live IMAP connection. If you abandon a run without calling it, that connection stays open until the idle TTL expires, and a routine that runs every hour with a 30-minute TTL will stack sessions. Treat it the way you would a `finally` block: whatever happened, close the session before your run ends.
+**(MCP only) Always reach `work_done`, including on failure.** A session holds a live IMAP connection. If you abandon a run without calling it, that connection stays open until the idle TTL expires, and a routine that runs every hour with a 30-minute TTL will stack sessions. Treat it the way you would a `finally` block: whatever happened, close the session before your run ends.
 
-**One login per run.** `session_id` does not survive between runs — a routine that stored one from last time will get `SESSION_EXPIRED` on its first call. Call `apple_login` at the start of each run and `work_done` at the end of it.
+**The CLI's version of that rule.** There is no `work_done` to reach — each command destroys its own session before the process exits, on the failure path too, so a run that dies halfway leaves nothing open. The one thing that *is* yours: if the run called `cli start` (the resident daemon, which holds one session across commands), it must call `cli stop` before it ends, for exactly the reason above. `cli stop` is safe to call when no daemon is running — it exits 0 and says so — so put it at the end of the run unconditionally rather than trying to remember whether you started one.
+
+**(MCP only) One login per run.** `session_id` does not survive between runs — a routine that stored one from last time will get `SESSION_EXPIRED` on its first call. Call `apple_login` at the start of each run and `work_done` at the end of it.
+
+**On the CLI there is nothing to store and nothing to reuse.** No command hands you a `session_id` and none accepts one, so the failure this rule exists to prevent cannot be written down in the first place. If a run needs several calls to share one session — and the main reason to want that is `contacts_search`, whose cache is per-session — the way to get it is `cli start` … commands … `cli stop`, not carrying an id between calls. A run that needs a fixed list of calls made in one session can also put them in an ops file and use `cli batch ops.json`, which uses a single session for the whole file.
 
 **Writes need a guard against repeating themselves.** A routine runs again tomorrow with the same instructions. Nothing in this server deduplicates, so "create an event for the standup" run daily creates a new event daily. Before any create, search for what you are about to create and skip if it is already there. If you cannot search for it reliably, prefer reporting what you would have created over creating it.
 

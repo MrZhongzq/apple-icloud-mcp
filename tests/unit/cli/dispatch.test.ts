@@ -100,6 +100,45 @@ describe('CLI_MANAGED_SESSION_TOOLS exclusion', () => {
     expect(outcome.stdout).toContain('apple_accounts');
   });
 
+  it('--list prints only the first sentence of each description, one line per tool', async () => {
+    // 工具描述是字符串拼接写出来的，里面一个换行都没有——实测 contacts_search
+    // 那一段有 798 字符。只取第一行等于原样打印整段，--list 就不再是一份能扫一眼
+    // 的清单。完整描述仍然在 --help 里。
+    const tools = baseTools();
+    tools.set('mail_search', {
+      name: 'mail_search',
+      config: {
+        description: '按条件搜索邮件。' + '后面这一整段属于 --help，不属于清单视图。'.repeat(20),
+        inputSchema: { session_id: z.string() },
+      },
+      handler: async () => ({ content: [{ type: 'text', text: '{}' }] }),
+    });
+
+    const outcome = await runCli(deps(singleAccountConfig, tools), ['--list']);
+    expect(outcome.exitCode).toBe(0);
+
+    const line = outcome.stdout.split(String.fromCharCode(10)).find((l) => l.startsWith('mail_search'));
+    expect(line).toBe('mail_search  按条件搜索邮件。');
+    expect(outcome.stdout, '第二句及以后不该出现在清单里').not.toContain('不属于清单视图');
+
+    // 每个工具恰好一行——描述里没有换行，所以行数必须等于工具数。
+    const lines = outcome.stdout.split(String.fromCharCode(10)).filter((l) => l.length > 0);
+    expect(lines).toHaveLength(listCliTools(tools).size);
+  });
+
+  it('--list keeps the whole first line when a description has no full stop', async () => {
+    // 找不到句号时退回整个第一行，而不是按字符数硬截——硬截会把一句话拦腰砍断。
+    const tools = baseTools();
+    tools.set('mail_search', {
+      name: 'mail_search',
+      config: { description: '一段没有句号的描述', inputSchema: { session_id: z.string() } },
+      handler: async () => ({ content: [{ type: 'text', text: '{}' }] }),
+    });
+    const outcome = await runCli(deps(singleAccountConfig, tools), ['--list']);
+    const line = outcome.stdout.split(String.fromCharCode(10)).find((l) => l.startsWith('mail_search'));
+    expect(line).toBe('mail_search  一段没有句号的描述');
+  });
+
   for (const name of CLI_MANAGED_SESSION_TOOLS) {
     it(`rejects invoking ${name} directly with a message about CLI-managed sessions`, async () => {
       const outcome = await runCli(deps(singleAccountConfig, baseTools()), [name]);

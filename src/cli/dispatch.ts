@@ -58,11 +58,28 @@ export function formatFailure(err: unknown): string {
   return String(err);
 }
 
+/**
+ * `--list` 每行只印第一句。
+ *
+ * 光取第一行是不够的：工具描述是靠字符串拼接写出来的，里面**一个换行都没有**，
+ * 于是整段（`contacts_search` 实测 798 字符，`calendar_list_events` 385）会原样
+ * 印在一行上，`--list` 就不再是一份能扫一眼的清单了。完整描述仍然在
+ * `<tool> --help` 里，一个字都没少——这里砍掉的只是清单视图里的后续句子。
+ *
+ * 切分点是第一个句号（工具描述全是中文，第一句都以 `。` 结尾）。找不到句号时
+ * 退回整个第一行，而不是靠字符数硬截——按长度截断会把一句话拦腰砍断，比印全还难读。
+ */
+function firstSentence(description: string): string {
+  const firstLine = description.split(NEWLINE)[0] ?? '';
+  const stop = firstLine.indexOf('。');
+  return stop === -1 ? firstLine : firstLine.slice(0, stop + 1);
+}
+
 function renderToolList(tools: Map<string, CollectedTool>): string {
   const names = [...tools.keys()].sort();
   const lines = names.map((name) => {
     const tool = tools.get(name);
-    const description = tool ? tool.config.description.split(NEWLINE)[0] : '';
+    const description = tool ? firstSentence(tool.config.description) : '';
     return name + '  ' + description;
   });
   return lines.join(NEWLINE) + NEWLINE;

@@ -92,6 +92,30 @@ function planBatch(deps: Pick<RunBatchDeps, 'config' | 'tools'>, ops: readonly B
       });
     }
 
+    // args 里的键必须在工具自己的 schema 里。这条检查在这里、而不是靠工具去发现，
+    // 是因为**命令行这条路上没有别人会做它**：MCP SDK 的 zod 校验发生在 SDK 那一层，
+    // CLI 直接调收集到的 handler，那一层根本不在路径上。少了它，一份把 `limit`
+    // 拼成 `limt` 的 ops.json 会静默地按"没传这个参数"执行——拿回 20 条而不是 5 条，
+    // 没有任何报错，退出码 0。同样地，`args` 拼成 `arg`（见 parseBatchOps）会让整条
+    // 操作变成"不带任何参数地调用"。两种都是这一阶段在反复清除的那种"悄悄干了别的事"。
+    //
+    // 只查键名，不查类型：值的类型该由工具自己的 zod schema 说了算，在这里再写一份
+    // 类型校验就是同一份真相的第二个副本（`flags.ts` 的 FlagSpec.choices 上有同样的
+    // 注释）。键名不一样——schema 里有哪些键是这一层能无歧义知道的事实。
+    const allowedKeys = Object.keys(tool.config.inputSchema);
+    for (const key of Object.keys(op.args ?? {})) {
+      if (!allowedKeys.includes(key)) {
+        const usable = allowedKeys.filter((k) => k !== 'session_id');
+        throw new AppError('INVALID_INPUT', `${where}（${op.tool}）的 args 里有一个该工具不认识的参数：${key}`, {
+          hint:
+            (usable.length > 0 ? `${op.tool} 接受的参数是：${usable.join('、')}。` : `${op.tool} 不接受任何参数。`) +
+            '拼错的参数会被静默当成"没传"，所以这里直接拒绝整批；用 cli ' +
+            op.tool +
+            ' --help 可以看到每个参数的含义',
+        });
+      }
+    }
+
     planned.push({ op, tool, needsSession: 'session_id' in tool.config.inputSchema });
   }
 
@@ -132,6 +156,16 @@ export function parseBatchOps(text: string): BatchOp[] {
       throw new AppError('INVALID_INPUT', `${where}不是一个对象`, { hint: '每一条都应形如 {"tool":"...","args":{...}}' });
     }
     const obj = raw as Record<string, unknown>;
+    // 操作对象上只允许 tool 和 args 两个键。多出来的键**一定**是打错了，而打错的
+    // 后果是静默的：`arg` 而不是 `args`，整条操作就变成"不带任何参数地调用这个工具"，
+    // 照常执行、照常返回一个像模像样的结果。
+    for (const key of Object.keys(obj)) {
+      if (key !== 'tool' && key !== 'args') {
+        throw new AppError('INVALID_INPUT', `${where}有一个多余的键：${key}`, {
+          hint: '每一条操作只接受 tool 和 args 两个键；args 少写一个 s 会让整条操作变成"不带参数调用"，所以这里直接拒绝',
+        });
+      }
+    }
     if (typeof obj.tool !== 'string' || obj.tool.length === 0) {
       throw new AppError('INVALID_INPUT', `${where}缺少 tool 字段（必须是非空字符串）`, {
         hint: '每一条都应形如 {"tool":"...","args":{...}}',
