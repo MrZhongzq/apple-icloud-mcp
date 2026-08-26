@@ -118,3 +118,29 @@ export async function stopDaemon(files?: EndpointFiles): Promise<boolean> {
   const response = await roundTrip(socket, wire);
   return isWireResult(response) && response.isError === false;
 }
+
+/**
+ * 轮询直到端点文件描述的地址真的能连上，而不只是"文件存在"。这两者之间
+ * 有一条真实的缝隙：一个僵死端点文件（上个 daemon 被 kill 或崩溃后留下的）
+ * 从进程启动那一刻就"存在"，但连不上；`cli start` 的调用方（比如一个 routine
+ * 写的 `cli start && cli mail_search`）如果只等文件出现，`mail_search` 就可能
+ * 在 daemon 真正开始监听之前抢跑，落回一次性模式——完全没有症状，用户以为
+ * 自己在复用会话，实际上每次都在重新握手登录。超时后返回 undefined，调用方
+ * 自己决定报错还是回退。
+ */
+export async function waitForDaemonReady(files?: EndpointFiles, timeoutMs = 5_000): Promise<Endpoint | undefined> {
+  const f = files ?? endpointFiles();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const endpoint = await readEndpoint(f);
+    if (endpoint) {
+      const socket = await connect(endpoint);
+      if (socket) {
+        socket.destroy();
+        return endpoint;
+      }
+    }
+    if (Date.now() >= deadline) return undefined;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import dotenv from 'dotenv';
 import { loadConfig } from '../core/config.js';
 import { createLogger } from '../core/logger.js';
@@ -9,9 +10,16 @@ import { createProviders } from '../providers/icloud/index.js';
 import { collectTools } from '../cli/registry.js';
 import { runCliDaemonFirst, formatFailure, multiAccountRefusal } from '../cli/dispatch.js';
 import { startDaemon } from '../cli/daemon.js';
-import { stopDaemon } from '../cli/client.js';
+import { stopDaemon, waitForDaemonReady } from '../cli/client.js';
+import { DAEMON_RUN_MARKER } from '../cli/transport.js';
+import type { Endpoint } from '../cli/transport.js';
 
 const NEWLINE = String.fromCharCode(10);
+
+/** `cli start` 等一个新起的守护进程真正可连接的上限；`waitForDaemonReady` 内部
+ *  50ms 轮一次，这个上限只是给"进程起不来"（比如配置在 spawn 之后才报错）
+ *  一个明确的失败点，而不是无限等下去。 */
+const START_TIMEOUT_MS = 5_000;
 
 /**
  * stdio 入口（`bin/stdio.ts`）靠 spawn 它的客户端注入环境变量，没有父进程替
@@ -62,11 +70,17 @@ function renderUsage(): string {
     NEWLINE +
     '  cli <tool> [flags...]      执行该工具（有守护进程在跑就用它，否则跑一次性会话）' +
     NEWLINE +
-    '  cli start                  启动守护进程，复用同一个会话直到空闲超时' +
+    '  cli start                  启动守护进程（后台），直到它真的能连上才返回' +
     NEWLINE +
     '  cli stop                   停止守护进程' +
     NEWLINE
   );
+}
+
+function describeEndpoint(endpoint: Endpoint): string {
+  return endpoint.kind === 'unix'
+    ? `unix socket ${endpoint.path}`
+    : `127.0.0.1:${endpoint.port}（TCP 回环，需要令牌握手；Windows 沙箱下 unix socket 不可用时的兜底）`;
 }
 
 async function main(): Promise<void> {
@@ -96,9 +110,23 @@ async function main(): Promise<void> {
   for (const notice of config.deprecations) logger.warn(notice);
   for (const notice of config.notices) logger.warn(notice);
 
+  // 这是 `cli start` detach 出来的子进程内部标记，不是用户命令：真正的常驻
+  // 主体在这里——`startDaemon` 后直接 `return`，靠监听中的 server 和 SIGINT/
+  // SIGTERM 处理器活着，直到被 `stop` 或空闲超时关掉。父进程（下面的 `start`
+  // 分支）负责把这个子进程 spawn 出去、等它真正可连接、打印端点、退出。
+  if (first === DAEMON_RUN_MARKER) {
+    const handle = await startDaemon({ config, logger });
+    const shutdown = (): void => {
+      void handle.close().then(() => process.exit(0));
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    return;
+  }
+
   // `stop` 不需要 config 描述的账号信息——它只是去敲已经在跑的那个守护进程的门，
   // 让它自己清理退出。放在 config/logger 之后而不是之前，只是为了和其余分支
-  // 共享同一套“先读配置、打印 notices”的启动顺序，不代表它真的依赖 config 的内容。
+  // 共享同一套"先读配置、打印 notices"的启动顺序，不代表它真的依赖 config 的内容。
   if (first === 'stop') {
     const stopped = await stopDaemon();
     await flush(process.stdout, (stopped ? '守护进程已停止' : '没有正在运行的守护进程') + NEWLINE);
@@ -111,21 +139,44 @@ async function main(): Promise<void> {
     if (config.accounts.length > 1) {
       exitUsageError(multiAccountRefusal(config));
     }
-    const handle = await startDaemon({ config, logger });
-    const where =
-      handle.endpoint.kind === 'unix'
-        ? `unix socket ${handle.endpoint.path}`
-        : `127.0.0.1:${handle.endpoint.port}（TCP 回环，需要令牌握手；Windows 沙箱下 unix socket 不可用时的兜底）`;
-    await flush(process.stdout, `守护进程已启动，监听于 ${where}` + NEWLINE);
-    // 不调用 process.exit：daemon 要作为常驻进程活着，监听中的 server 本身就会
-    // 让事件循环保持运行。调用方自己决定要不要用 `&` / nohup 把这个进程放到
-    // shell 的后台——这里只负责“进程活着、直到被 stop 或空闲超时”。
-    const shutdown = (): void => {
-      void handle.close().then(() => process.exit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-    return;
+
+    // 已经有一个能连上的守护进程在跑，就不再 spawn 第二个——同一个 socket 路径
+    // 被两个监听者抢占没有好结果（后来者会先 unlink 前者的 socket 文件再 listen，
+    // 前者留在内存里但再也没人连得上，变成一个谁都不知道的孤儿进程）。
+    // 用 timeoutMs: 0 只做一次即时探测，不是真的等——已经在跑就该立刻知道。
+    const already = await waitForDaemonReady(undefined, 0);
+    if (already) {
+      await flush(process.stdout, `守护进程已经在跑，监听于 ${describeEndpoint(already)}` + NEWLINE);
+      process.exit(0);
+    }
+
+    const scriptPath = process.argv[1];
+    if (scriptPath === undefined) {
+      exitUsageError('无法确定当前脚本路径，无法启动守护进程');
+    }
+
+    // `detached: true` + `unref()`：子进程脱离这个父进程的进程组，父进程退出
+    // 后子进程继续活着。`stdio: 'ignore'`——子进程不该往父进程继承来的
+    // stdout/stderr 写任何东西，那条流在父进程退出后就没人读了。
+    const child = spawn(process.execPath, [scriptPath, DAEMON_RUN_MARKER], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+
+    // 不是等文件出现，是等真的能连上：`writeEndpoint` 只在 `listen`（以及
+    // unix 模式下的 `chmod`）成功之后才落盘，但端点文件本身可能是上一个
+    // 崩溃/被杀掉的守护进程留下的僵尸——文件"存在"不等于"这次启动的这个
+    // 进程已经在监听"。`cli start && cli mail_search` 这种调用方式要求
+    // start 返回时 daemon 必须真的可用，否则 mail_search 会在 daemon 就绪
+    // 前抢跑，悄悄退回一次性模式，付掉 daemon 本该省下的握手成本，而且
+    // 没有任何症状。
+    const endpoint = await waitForDaemonReady(undefined, START_TIMEOUT_MS);
+    if (!endpoint) {
+      exitUsageError(`守护进程未能在 ${START_TIMEOUT_MS}ms 内就绪；用 cli stop 清理残留状态后重试`);
+    }
+    await flush(process.stdout, `守护进程已启动，监听于 ${describeEndpoint(endpoint)}` + NEWLINE);
+    process.exit(0);
   }
 
   const sessions = createSessionStore({

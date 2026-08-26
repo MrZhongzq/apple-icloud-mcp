@@ -117,3 +117,12 @@ export function generateToken(): string {
  * 各写一份迟早会有一边改了名字另一边忘记跟着改。
  */
 export const DAEMON_STOP_COMMAND = '__cli_daemon_stop__';
+
+/**
+ * `cli start` detach 出来的子进程内部标记，不是用户命令：父进程 spawn 一个
+ * `node <script> __cli_daemon_run__` 的子进程，子进程看到这个标记就直接
+ * `startDaemon` 并常驻，不走一次性分派那条路。放在 transport.ts 而不是
+ * bin/cli.ts 内部，是因为父子两个进程用的是同一份 bin/cli.ts 代码——
+ * 都得认得同一个字面量。
+ */
+export const DAEMON_RUN_MARKER = '__cli_daemon_run__';
