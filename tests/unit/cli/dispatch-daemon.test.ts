@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runCliDaemonFirst } from '../../../src/cli/dispatch.js';
 import { startDaemon } from '../../../src/cli/daemon.js';
+import { writeEndpoint } from '../../../src/cli/transport.js';
 import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig } from '../../../src/core/config.js';
 import type { CollectedTool } from '../../../src/cli/registry.js';
@@ -114,5 +115,29 @@ describe('runCliDaemonFirst', () => {
     const value = JSON.parse(outcome.stdout) as Array<{ email: string }>;
     expect(value[0]?.email).toBe('local-fallback@icloud.com');
     expect(calls(), '没有 daemon 可用时必须退回一次性模式').toBe(1);
+  });
+
+  it('never retries one-shot once the request bytes were written (F-4 boundary)', async () => {
+    // 这是整轮里最关键的一条规则：请求字节一旦写给了 daemon，不管 daemon
+    // 给的回应是"明确拒绝"（这里用的）还是"没能确认"，runCliDaemonFirst
+    // 都绝不能把它当成"daemon 不可用"落到本地一次性模式重跑一遍——对
+    // mail_send 这类写操作，重试意味着用户会收到两封信。
+    handle = await startDaemon({ config, logger, files, forceTcp: true });
+    if (handle.endpoint.kind !== 'tcp') throw new Error('forceTcp should force tcp mode');
+
+    // 单独一份端点文件，端口是真的（daemon 真的在监听），令牌是错的——请求
+    // 字节确实发出去了，daemon 会在调用任何工具之前就用一句明确的拒绝把
+    // 它挡下来。
+    const staleFiles = { infoPath: join(dir, 'stale-endpoint.json'), socketPath: join(dir, 'stale.sock') };
+    await writeEndpoint(staleFiles, { kind: 'tcp', port: handle.endpoint.port, token: 'stale-token' });
+
+    const { tools, calls } = localToolsWithProbe();
+    const outcome = await runCliDaemonFirst(
+      { config, logger, tools, sessionFactory: fakeSessionFactory(), files: staleFiles },
+      ['apple_accounts'],
+    );
+
+    expect(outcome.exitCode, '请求字节已经写出去之后的失败必须报错给用户，不能悄悄伪装成一次成功').toBe(1);
+    expect(calls(), '一旦字节写出去，绝不能落到一次性模式重跑一遍').toBe(0);
   });
 });

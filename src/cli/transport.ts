@@ -87,7 +87,7 @@ export function canUseUnixSocket(): Promise<boolean> {
  * 把令牌写进来。`mkdir(..., { recursive: true })` 对已存在的目录是空操作，
  * 不会去检查所有者——这正是需要显式校验的原因。
  */
-async function ensureOwnedDir(dir: string): Promise<void> {
+export async function ensureOwnedDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   assertOwnedByCurrentUser(dir);
 }

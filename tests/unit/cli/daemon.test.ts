@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import net from 'node:net';
 import { startDaemon } from '../../../src/cli/daemon.js';
@@ -55,6 +55,12 @@ const config = {
  * 那头压根没有服务在监听，连令牌校验的门都不存在）和 `'rejected'`（连上了，
  * 是服务端主动拒绝的）——这两者的含义完全不同："没有门" vs "门把我拒之
  * 门外"，都算进 `'rejected'` 会把"根本没有门"误判成"门正常在拒绝我"。
+ *
+ * N-4 之后，daemon 在拒绝一次请求时会先回一句明确的 `{ error: {...} }`
+ * 再关连接，不再是纯粹的 destroy、什么都不写——所以"收到的字节是不是
+ * 空的"不能再用来判断"是不是被拒绝"了：拒绝也有响应体。这里改成看响应
+ * 里有没有 `"error"` 这个键；真正被正常服务的调用（比如 apple_accounts）
+ * 回的是 `{ value: [...], isError: false }`，不带这个键。
  */
 type TcpOutcome = 'rejected' | 'served' | 'hung' | 'unreachable';
 
@@ -76,7 +82,10 @@ function probeTcp(port: number, payload: Record<string, unknown>): Promise<TcpOu
       got += String(d);
     });
     c.on('error', () => done(connected ? 'rejected' : 'unreachable'));
-    c.on('close', () => done(got.trim().length === 0 ? 'rejected' : 'served'));
+    c.on('close', () => {
+      const trimmed = got.trim();
+      done(trimmed.length === 0 || trimmed.includes('"error"') ? 'rejected' : 'served');
+    });
     setTimeout(() => {
       c.destroy();
       done('hung');
@@ -341,4 +350,193 @@ describe('endpoint ownership (F-7)', () => {
     const stillThere = await readEndpoint(files);
     expect(stillThere, '空闲超时不该删掉一个不是自己写的端点文件').toEqual(impostorEndpoint);
   });
+});
+
+describe('runtime dir permissions (N-1)', () => {
+  // 这条必须走 startDaemon，不能只测 writeEndpoint：N-1 这个回归的形状恰恰是
+  // 两处 mkdir 没对齐——daemon.ts 自己在 listen 之前那次 mkdir 曾经没带
+  // mode，只有 writeEndpoint 里的 ensureOwnedDir 带；只测 writeEndpoint 那条
+  // （见 transport.test.ts）测不出 daemon 实际启动路径上的目录权限，之前
+  // 就是这样：那条测试全绿，daemon 编译后跑起来目录却是 755。
+  //
+  // 关键细节：`files`（共享的 beforeEach 变量）的父目录是 `dir`，而 `dir`
+  // 本身是 mkdtempSync 建出来的，mkdtempSync 默认就是 0700——如果直接用
+  // 共享的 `files`，daemon.ts 那次 mkdir 面对的是一个已经存在、模式凑巧
+  // 也是 0700 的目录，mkdir 对它是空操作，测试会在完全没有验证 daemon.ts
+  // 那次 mkdir 的情况下"意外"通过（第一次写这条测试时就是这样：删掉
+  // daemon.ts 里的 mode:0700 之后，这条测试原样全绿）。这里必须指向 `dir`
+  // 底下一个还不存在的子目录，让它的创建、连同它的权限，完全由 daemon.ts
+  // 自己那次 mkdir 决定。
+  const skipReasonN1 =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：POSIX 权限位在这个平台上没有意义；在 WSL/Linux 上验证）'
+      : '';
+  it.skipIf(process.platform === 'win32')(
+    'startDaemon creates the runtime dir 0700 on its own mkdir call, before writeEndpoint ever runs' + skipReasonN1,
+    async () => {
+      const freshRuntimeDir = join(dir, 'not-yet-created');
+      const freshFiles = { infoPath: join(freshRuntimeDir, 'endpoint.json'), socketPath: join(freshRuntimeDir, 'cli.sock') };
+      handle = await startDaemon({ config, logger, files: freshFiles });
+      const mode = statSync(freshRuntimeDir).mode & 0o777;
+      expect(
+        mode,
+        'daemon.ts 里 listen 之前那次 mkdir 必须自己带 mode:0700，不能指望 writeEndpoint 事后补——mkdir 对已存在的目录是空操作',
+      ).toBe(0o700);
+    },
+  );
+});
+
+describe('explicit auth rejection, not "may have executed" (N-4)', () => {
+  it('a stale/wrong token gets a clear AUTH_FAILED, and the daemon keeps serving correctly-authenticated calls', async () => {
+    handle = await startDaemon({ config, logger, files, forceTcp: true });
+    if (handle.endpoint.kind !== 'tcp') throw new Error('forceTcp should force tcp mode');
+
+    // 单独一份端点文件，端口是真的（daemon 真的在监听），令牌是错的——模拟
+    // "daemon 重启换了新令牌，某个调用方手里还是旧端点文件"这种会真实发生
+    // 的竞态。这次请求的字节确实发出去了，但 daemon 会在调用任何工具之前
+    // 就用一句明确的拒绝响应把它挡下来——callDaemon 必须把这个当作"确定
+    // 没有被执行"的认证失败来报，既不能悄悄退回一次性模式（会把一个坏
+    // 令牌的问题吞掉），也不能报成 F-4 那种"可能已经执行了"的模糊错误
+    // （对一个从未被执行过的调用喊"不要重跑 mail_send"是在吓唬调用方）。
+    const staleDir = mkdtempSync(join(tmpdir(), 'cli-stale-'));
+    const staleFiles = { infoPath: join(staleDir, 'endpoint.json'), socketPath: join(staleDir, 'cli.sock') };
+    try {
+      await writeEndpoint(staleFiles, { kind: 'tcp', port: handle.endpoint.port, token: 'stale-token' });
+      await expect(callDaemon({ tool: 'apple_accounts', args: {} }, staleFiles)).rejects.toMatchObject({
+        code: 'AUTH_FAILED',
+      });
+    } finally {
+      rmSync(staleDir, { recursive: true, force: true });
+    }
+
+    const after = await callDaemon({ tool: 'apple_accounts', args: {} }, files);
+    expect(after, '一次被拒绝的连接不该影响 daemon 后续用真令牌的正常服务').toBeDefined();
+  });
+});
+
+describe('no round-trip deadline in production (N-3)', () => {
+  /** 接受连接、读数据、永不回应——模拟一个健康但很慢的工具调用（比如首次
+   *  contacts_search 的全量拉取、一次很大的 mail_search）。走 TCP 而不是
+   *  unix socket，这样两个平台都能跑，不用只在 WSL 上验证。 */
+  async function startHangingListener(): Promise<{ port: number; close: () => Promise<void> }> {
+    // net.Server（不像 http.Server）没有 closeAllConnections，得自己记住
+    // 每一条打进来的连接才能在收尾时主动 destroy——server.close() 本身只是
+    // 停止接受新连接，不会碰已经建立的那些，靠它自己是等不到挂起的 promise
+    // 落定的。
+    const sockets = new Set<net.Socket>();
+    const srv = net.createServer((s) => {
+      sockets.add(s);
+      s.on('data', () => undefined);
+      s.on('close', () => sockets.delete(s));
+    });
+    const port = await new Promise<number>((resolve) => {
+      srv.listen(0, '127.0.0.1', () => {
+        const address = srv.address();
+        resolve(typeof address === 'object' && address !== null ? address.port : 0);
+      });
+    });
+    return {
+      port,
+      close: async () => {
+        for (const s of sockets) s.destroy();
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+      },
+    };
+  }
+
+  it('does not time out a slow-but-alive daemon by default', async () => {
+    const hanging = await startHangingListener();
+    await writeEndpoint(files, { kind: 'tcp', port: hanging.port, token: 'irrelevant-token' });
+
+    let settled = false;
+    const pending = callDaemon({ tool: 'apple_accounts', args: {} }, files)
+      .then(() => {
+        settled = true;
+      })
+      .catch(() => {
+        settled = true;
+      });
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(
+      settled,
+      '生产路径不该有任何硬编的往返超时——一次健康但慢的调用不该在几百毫秒内被当成失败',
+    ).toBe(false);
+
+    // 收尾：先主动断开连接（daemon 那头没有超时，得靠这个让挂起的 promise
+    // 真正落定），再等它 settle，不带着一个永远不会 resolve 的 promise
+    // 退出测试。
+    await hanging.close();
+    await pending;
+  });
+
+  it('an injected round-trip timeout still fires and is reported as sent-unknown (test-only knob)', async () => {
+    const hanging = await startHangingListener();
+    try {
+      await writeEndpoint(files, { kind: 'tcp', port: hanging.port, token: 'irrelevant-token' });
+      await expect(
+        callDaemon({ tool: 'apple_accounts', args: {} }, files, { roundTripMs: 200 }),
+      ).rejects.toMatchObject({ code: 'UPSTREAM_ERROR' });
+    } finally {
+      await hanging.close();
+    }
+  });
+});
+
+describe('idle timer requires authentication (F-6 guard)', () => {
+  it('an unauthenticated tcp connection does not reset the idle timer', async () => {
+    handle = await startDaemon({ config, logger, files, forceTcp: true, idleMs: 300 });
+    if (handle.endpoint.kind !== 'tcp') throw new Error('forceTcp should force tcp mode');
+    const port = handle.endpoint.port;
+
+    // 每 80ms 敲一次门，不带令牌，一直敲到 idleMs（300ms）过去——如果
+    // resetIdle 在令牌校验之前就跑了，这些连接会一直给空闲计时器续命，
+    // daemon 永远不会因为空闲而退出。
+    const knock = setInterval(() => {
+      const c = net.connect(port, '127.0.0.1', () => {
+        c.write(JSON.stringify({ tool: 'apple_accounts', args: {} }) + String.fromCharCode(10));
+      });
+      c.on('error', () => undefined);
+      c.on('data', () => undefined);
+    }, 80);
+
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    clearInterval(knock);
+
+    const stillListening = await new Promise<boolean>((resolve) => {
+      const c = net.connect(port, '127.0.0.1');
+      c.once('connect', () => {
+        c.destroy();
+        resolve(true);
+      });
+      c.once('error', () => resolve(false));
+    });
+    expect(
+      stillListening,
+      '没带令牌的连接不该续上空闲计时器；daemon 应当已经因为空闲超时退出了',
+    ).toBe(false);
+  });
+});
+
+describe('unix socket conflict (Concern 1 / CONFLICT path)', () => {
+  const skipReasonConflict =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：永远走 TCP，端口由 OS 随机分配，没有 unix socket 路径可抢占；在 WSL/Linux 上验证）'
+      : '';
+  it.skipIf(process.platform === 'win32')(
+    'refuses to steal a socket path that a live daemon is still listening on' + skipReasonConflict,
+    async () => {
+      handle = await startDaemon({ config, logger, files });
+      if (handle.endpoint.kind !== 'unix') {
+        throw new Error('canUseUnixSocket() 应当在非 win32 平台上为 true——见 transport.test.ts 里对它的直接断言');
+      }
+
+      // 模拟"端点文件被删了，但监听者还活着"：父进程的 waitForDaemonReady(0)
+      // 探测不到端点，认为没人在跑，于是尝试再起一个——这正是 Concern 1
+      // 提到的、之前完全没有测试碰过的 CONFLICT 路径。
+      unlinkSync(files.infoPath);
+
+      await expect(startDaemon({ config, logger, files })).rejects.toMatchObject({ code: 'CONFLICT' });
+    },
+  );
 });

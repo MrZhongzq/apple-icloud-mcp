@@ -110,14 +110,34 @@ describe('endpointFiles', () => {
 });
 
 describe('运行时目录权限', () => {
-  it.skipIf(process.platform === 'win32')(
-    'creates the runtime dir 0700, not the OS default',
-    async () => {
-      await writeEndpoint(files, { kind: 'unix', path: files.socketPath });
-      const mode = statSync(dirname(files.infoPath)).mode & 0o777;
-      expect(mode, '运行时目录必须是 0700——它是 endpoint.json 的父目录，目录权限不够，chmod 600 单独也挡不住同机的其他用户遍历进来').toBe(0o700);
-    },
-  );
+  // vitest 的 it.skipIf 本身不带"打印原因"的参数，这里把原因直接写进测试名——
+  // 跳过的这条在报告里应该看得出"为什么"、以及"这个属性其实在别处被验证过
+  // （daemon.test.ts 里 startDaemon 那条真正跑起 daemon 的用例）"，而不是一行
+  // 光秃秃的 "1 skipped"。
+  //
+  // 这条测的是 writeEndpoint 自己的目录准备逻辑（ensureOwnedDir），不是
+  // startDaemon 实际启动 daemon 时那条独立的 mkdir 调用——那条单独在
+  // daemon.test.ts 的 "runtime dir permissions (N-1)" 里用 startDaemon 覆盖，
+  // 因为 N-1 这个回归恰恰是"两处 mkdir 没对齐"：daemon.ts 自己那次 mkdir
+  // 没带 mode，只有 writeEndpoint 这条带；只测这一条不会抓到那个回归。
+  const skipReason =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：POSIX 权限位在这个平台上没有意义；在 WSL/Linux 上验证，见下方 it 与 daemon.test.ts 的对应用例）'
+      : '';
+  it.skipIf(process.platform === 'win32')('writeEndpoint creates the runtime dir 0700, not the OS default' + skipReason, async () => {
+    // `dir`（beforeEach 里 mkdtempSync 建出来的）本身默认就是 0700——如果
+    // 直接用 files（父目录就是 dir），writeEndpoint 面对的是一个已经存在、
+    // 模式凑巧也是 0700 的目录，ensureOwnedDir 的 mkdir 对它是空操作，这条
+    // 断言即使在 ensureOwnedDir 完全不设 mode 的情况下也会通过（验证过：
+    // 去掉 transport.ts 里那个 mode: 0o700，这条测试原样全绿）。必须指向
+    // dir 底下一个还不存在的子目录，让创建动作、连同它的权限，真的由
+    // writeEndpoint 自己决定。
+    const freshDir = join(dir, 'not-yet-created');
+    const freshFiles = { infoPath: join(freshDir, 'endpoint.json'), socketPath: join(freshDir, 'cli.sock') };
+    await writeEndpoint(freshFiles, { kind: 'unix', path: freshFiles.socketPath });
+    const mode = statSync(freshDir).mode & 0o777;
+    expect(mode, '运行时目录必须是 0700——它是 endpoint.json 的父目录，目录权限不够，chmod 600 单独也挡不住同机的其他用户遍历进来').toBe(0o700);
+  });
 
   it('writeEndpoint succeeds against a freshly-created runtime dir on every platform', async () => {
     // Windows 上没有 process.getuid，owner 校验直接放行；这里确认无论平台，

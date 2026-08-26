@@ -150,7 +150,15 @@ export async function startDaemon(deps: {
   // 孤儿进程在自己的空闲超时里删掉后起者仍然活着的端点。
   const ownerId = generateOwnerId();
 
-  await mkdir(join(files.infoPath, '..'), { recursive: true });
+  // N-1: 必须在建目录这一步就把 mode 定死，不能建完再补 chmod——mkdir
+  // 对已存在的目录是空操作（后面 listenUnixSocket 里的 chmodSync 只管 socket
+  // 文件本身，不管它的父目录），补救式的权限收紧会漏掉 mkdir 到 chmod 之间
+  // 那个真实存在的窗口，也漏掉目录本来就已经存在的情形。
+  // N-1: 必须在建目录这一步就把 mode 定死，不能建完再补 chmod——mkdir
+  // 对已存在的目录是空操作（后面 listenUnixSocket 里的 chmodSync 只管 socket
+  // 文件本身，不管它的父目录），补救式的权限收紧会漏掉 mkdir 到 chmod 之间
+  // 那个真实存在的窗口，也漏掉目录本来就已经存在的情形。
+  await mkdir(join(files.infoPath, '..'), { recursive: true, mode: 0o700 });
 
   const sessions = createSessionStore({
     ttlMs: config.sessionTtlMs,
@@ -251,13 +259,19 @@ export async function startDaemon(deps: {
         return;
       }
 
-      // TCP 路径没有文件权限可依赖：令牌不对（或没带）立刻断开，不回任何数据——
-      // 会话背后是一个已登录的 iCloud 连接，宁可什么都不说也不能给探测者留信息。
-      // 这条检查必须先于任何 resetIdle：否则任何能连上回环端口的本地进程，
-      // 不用带令牌，光靠隔三差五开一个连接就能让 daemon（连同它握着的已登录
+      // TCP 路径没有文件权限可依赖：令牌不对（或没带）立刻拒绝。这条检查
+      // 必须先于任何 resetIdle：否则任何能连上回环端口的本地进程，不用带
+      // 令牌，光靠隔三差五开一个连接就能让 daemon（连同它握着的已登录
       // iCloud 会话）永远不超时。
+      //
+      // 拒绝前先回一句明确的错误，而不是直接 destroy 什么都不说：调用方
+      // （callDaemon）需要能把"令牌不对，这次请求确定没被执行"和"请求发
+      // 出去之后连接就断了，不知道有没有被执行"区分开——后者按 F-4 的规则
+      // 必须报错、不能重跑写操作；前者如果也报同一种"可能已执行"的错误，
+      // 对着一个连从未执行过的请求喊"不要重跑 mail_send"是在吓唬调用方。
       if (usesToken && !tokensMatch(parsed.token, token)) {
-        socket.destroy();
+        writeLine(socket, { error: { code: 'AUTH_FAILED', message: '令牌不对，拒绝这次连接' } });
+        socket.end();
         return;
       }
 

@@ -229,6 +229,6 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
     return { exitCode: 0, stdout: JSON.stringify(daemonResult.value, null, 2) + NEWLINE, stderr: '' };
   }
 
-  deps.logger.warn('daemon unavailable, falling back to a one-shot session', { tool: resolved.toolName });
+  deps.logger.warn('守护进程不可用，本次退回一次性会话', { tool: resolved.toolName });
   return executeAndFormat(deps, resolved.toolName, resolved.args);
 }

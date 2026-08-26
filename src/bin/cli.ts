@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync } from 'node:fs';
+import { existsSync, openSync, closeSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import dotenv from 'dotenv';
@@ -11,7 +11,7 @@ import { collectTools } from '../cli/registry.js';
 import { runCliDaemonFirst, formatFailure, multiAccountRefusal } from '../cli/dispatch.js';
 import { startDaemon } from '../cli/daemon.js';
 import { stopDaemon, waitForDaemonReady } from '../cli/client.js';
-import { DAEMON_RUN_MARKER } from '../cli/transport.js';
+import { DAEMON_RUN_MARKER, endpointFiles, ensureOwnedDir } from '../cli/transport.js';
 import type { Endpoint } from '../cli/transport.js';
 
 const NEWLINE = String.fromCharCode(10);
@@ -167,21 +167,34 @@ async function main(): Promise<void> {
       exitUsageError('无法确定当前脚本路径，无法启动守护进程');
     }
 
+    // 子进程的 stderr 必须落在一个文件里，不能是父进程手里的一条 pipe——
+    // `detached` 子进程本来就该比父进程活得久（父进程等就绪确认完就会
+    // exit(0)），而 pipe 的读端归父进程所有：父进程一退出，子进程下一次往
+    // stderr 写东西就会撞上 EPIPE，没人接这个信号的话就是一个未捕获异常，
+    // daemon 直接死掉。这不是假设——默认 LOG_LEVEL 是 info，
+    // `contacts/cache.ts` 首次 `contacts_search` 就会在 info 级别写一行日志，
+    // 相当于"cli start 之后的第一次真实调用就会把 daemon 干掉"。文件是
+    // fd，子进程独立持有自己的一份，父进程退不退出都不影响它。运行时目录
+    // 用之前必须先建好（0700，和 daemon 自己启动时用的是同一个目录），
+    // 不能假设它已经存在。
+    const files = endpointFiles();
+    const runtimeDir = path.dirname(files.infoPath);
+    await ensureOwnedDir(runtimeDir);
+    const logPath = path.join(runtimeDir, 'daemon.log');
+    // 'w'：每次 start 都截断重写，避免上一次失败的残留日志和这一次的诊断
+    // 信息混在一起，误导排查。
+    const logFd = openSync(logPath, 'w', 0o600);
+
     // `detached: true` + `unref()`：子进程脱离这个父进程的进程组，父进程退出
-    // 后子进程继续活着。stderr 用 'pipe' 而不是 'ignore'——子进程失败的唯一
-    // 反馈渠道曾经就是"5 秒之后超时，打印一句没有实际信息的提示"；这里在
-    // 父进程还醒着、还在轮询就绪状态的这段时间里，把子进程的 stderr 收集
-    // 起来，失败时原样带出去。
+    // 后子进程继续活着。
     const child = spawn(process.execPath, [scriptPath, DAEMON_RUN_MARKER], {
       detached: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', logFd],
     });
     child.unref();
-
-    let childStderr = '';
-    child.stderr?.on('data', (chunk: Buffer) => {
-      childStderr += chunk.toString('utf8');
-    });
+    // fd 已经被子进程继承（复制）走了，父进程这份可以立刻关掉——不关的话
+    // 父进程会一直占着这个文件描述符，直到自己退出。
+    closeSync(logFd);
 
     let childFailure: string | undefined;
     child.once('error', (err) => {
@@ -212,12 +225,14 @@ async function main(): Promise<void> {
     const endpoint = await Promise.race([waitForDaemonReady(undefined, START_TIMEOUT_MS), childExited.then(() => undefined)]);
 
     if (!endpoint) {
+      let logTail = '';
+      try {
+        logTail = readFileSync(logPath, 'utf8').trim();
+      } catch {
+        // 日志文件本身读不到就算了，不能让诊断信息的读取失败盖过原本的报错。
+      }
       const detail =
-        childFailure !== undefined
-          ? NEWLINE + childFailure + (childStderr.trim().length > 0 ? NEWLINE + childStderr.trim() : '')
-          : childStderr.trim().length > 0
-            ? NEWLINE + childStderr.trim()
-            : '';
+        (childFailure !== undefined ? NEWLINE + childFailure : '') + (logTail.length > 0 ? NEWLINE + logTail : '');
       exitUsageError(`守护进程未能在 ${START_TIMEOUT_MS}ms 内就绪；用 cli stop 清理残留状态后重试` + detail);
     }
     await flush(process.stdout, `守护进程已启动，监听于 ${describeEndpoint(endpoint)}` + NEWLINE);
