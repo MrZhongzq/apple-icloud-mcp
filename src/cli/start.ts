@@ -5,6 +5,9 @@ import { waitForDaemonReady as waitForDaemonReadyDefault } from './client.js';
 import { DAEMON_RUN_MARKER, endpointFiles, ensureOwnedDir } from './transport.js';
 import type { Endpoint, EndpointFiles } from './transport.js';
 
+// 与本目录其余文件一致：不写反斜杠转义序列（本项目已因此折叠过六次）。
+const NEWLINE = String.fromCharCode(10);
+
 /**
  * `child_process.spawn` 的全部真实签名很宽，但 `startDaemonProcess` 只用得到
  * `unref`/`once('error')`/`once('exit')` 这几个方法——把注入点收窄成这一个
@@ -129,7 +132,7 @@ export async function startDaemonProcess(deps: StartDaemonProcessDeps): Promise<
       // 日志文件本身读不到就算了，不能让诊断信息的读取失败盖过原本的报错。
     }
     const detail =
-      (childFailure !== undefined ? childFailure : '') + (logTail.length > 0 ? (childFailure ? '\n' : '') + logTail : '');
+      (childFailure !== undefined ? childFailure : '') + (logTail.length > 0 ? (childFailure ? NEWLINE : '') + logTail : '');
     return { kind: 'child-failed', detail };
   }
 
