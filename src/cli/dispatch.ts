@@ -6,6 +6,7 @@ import type { ClientTimeouts } from './client.js';
 import type { AppConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
 import type { CollectedTool } from './registry.js';
+import { configFingerprint, endpointFiles, readEndpoint } from './transport.js';
 import type { EndpointFiles } from './transport.js';
 
 const NEWLINE = String.fromCharCode(10);
@@ -56,6 +57,32 @@ export function formatFailure(err: unknown): string {
   }
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/**
+ * 把守护进程回来的 `{ error: { message, hint } }` 载荷渲染成**和 `formatFailure`
+ * 一模一样**的纯文本。
+ *
+ * 为什么需要它：用法错误（工具没跑，退出码 1）在一次性路径上是一个被抛出来的
+ * `AppError`，由 `formatFailure` 渲染成两行中文；同一个失败经过守护进程时，它在
+ * 那边就已经被 `toErrorPayload` 拍平成了 JSON 载荷。退出码上一轮已经统一过了，
+ * 渲染没有——于是同一条命令、同一个错误，跑没跑过 `cli start` 决定了用户看到的是
+ * 中文两行还是一坨 JSON。更糟的是文档教的是"stderr 上的 `{"error":…}` 信封意味着
+ * 退出码 2（工具跑了、iCloud 这么回答）"，而这里的 JSON 恰恰意味着工具**没跑**。
+ *
+ * 认不出这个形状时原样回退到 JSON——那至少不会丢信息。
+ */
+export function formatErrorPayload(value: unknown): string {
+  if (value !== null && typeof value === 'object' && 'error' in value) {
+    const error = (value as { error: unknown }).error;
+    if (error !== null && typeof error === 'object') {
+      const { message, hint } = error as { message?: unknown; hint?: unknown };
+      if (typeof message === 'string') {
+        return typeof hint === 'string' && hint.length > 0 ? `${message}${NEWLINE}提示：${hint}` : message;
+      }
+    }
+  }
+  return JSON.stringify(value, null, 2);
 }
 
 /**
@@ -240,9 +267,19 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
   const resolved = resolveCall(deps, argv);
   if (resolved.kind === 'outcome') return resolved.outcome;
 
+  const files = deps.files ?? endpointFiles();
+  // 有没有端点文件，必须在 callDaemon **之前**问：连不上僵死端点时 callDaemon
+  // 会顺手把文件删掉，事后再问永远得到"没有"——而"你启动过 daemon、它已经没了"
+  // 恰恰是唯一值得说一句的那种情况。
+  const hadEndpoint = (await readEndpoint(files)) !== undefined;
+
   let daemonResult;
   try {
-    daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files, deps.timeouts);
+    daemonResult = await callDaemon(
+      { tool: resolved.toolName, args: resolved.args, configFingerprint: configFingerprint(deps.config) },
+      deps.files,
+      deps.timeouts,
+    );
   } catch (err) {
     return { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE };
   }
@@ -252,7 +289,8 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
     // 回答（2）。一次性路径上这类失败是 executeAndFormat 的 catch 收的，同样是 1；
     // 两条路必须给出同一个退出码，否则同一条命令会因为"有没有 cli start"而分叉。
     if (daemonResult.usageError) {
-      return { exitCode: 1, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
+      // 渲染也必须和一次性路径一致，不只是退出码——见 formatErrorPayload。
+      return { exitCode: 1, stdout: '', stderr: formatErrorPayload(daemonResult.value) + NEWLINE };
     }
     if (daemonResult.isError) {
       return { exitCode: 2, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
@@ -260,6 +298,14 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
     return { exitCode: 0, stdout: JSON.stringify(daemonResult.value, null, 2) + NEWLINE, stderr: '' };
   }
 
-  deps.logger.warn('守护进程不可用，本次退回一次性会话', { tool: resolved.toolName });
+  // 只在"确实有过一个端点"时才说。从没跑过 cli start 的用户——也就是绝大多数
+  // 命令——本来就该走一次性模式，对他们每条命令都喊一句"守护进程不可用"，等于
+  // 把唯一值得注意的那种情况（你启动过、它死了、你正在悄悄重新付握手）淹没在
+  // 默认状态的噪声里。一个值表示两种意思，正是本阶段在测试里修过四次的形状。
+  if (hadEndpoint) {
+    deps.logger.warn('守护进程的端点文件还在，但连不上——它可能已经被杀掉或崩溃了；本次退回一次性会话', {
+      tool: resolved.toolName,
+    });
+  }
   return executeAndFormat(deps, resolved.toolName, resolved.args);
 }

@@ -140,6 +140,13 @@ describe('runCliDaemonFirst', () => {
     expect(outcome.exitCode, 'daemon 那边参数没过校验 → 用法错误 → 1').toBe(1);
     expect(outcome.stdout, '工具没跑，stdout 上不该有结果').toBe('');
     expect(outcome.stderr).toContain('unseen');
+    // 退出码上一轮统一了，渲染没有：同一个失败在一次性路径上是两行中文
+    // （formatFailure），经过 daemon 时曾经是一坨 JSON。文档教的是"stderr 上
+    // 出现 {error:…} 信封 = 退出码 2、工具跑过了"，所以这里吐 JSON 会让按
+    // stderr 形状判断"工具跑没跑"的脚本恰好在有 daemon 时得到相反的答案。
+    expect(outcome.stderr.startsWith('工具 mail_search 的参数不合法'), '必须和一次性路径同样的纯文本渲染').toBe(true);
+    expect(outcome.stderr, '不该是 JSON 信封').not.toContain('"error"');
+    expect(outcome.stderr).toContain('提示：');
     expect(calls(), '不能因为一次用法错误就落回一次性模式重跑一遍').toBe(0);
   });
 

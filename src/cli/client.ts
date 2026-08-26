@@ -13,6 +13,9 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
 export interface CallRequest {
   tool: string;
   args: Record<string, unknown>;
+  /** 调用方这一刻的配置指纹（`transport.ts::configFingerprint`）。守护进程拿它
+   *  和自己启动时冻住的那份比，对不上就拒绝服务并说明原因。探活请求不带。 */
+  configFingerprint?: string;
 }
 
 /** 调用方（主要是测试）可以覆盖的超时旋钮。生产路径从不传 `roundTripMs`——
@@ -224,6 +227,7 @@ export async function callDaemon(
   }
 
   const wire: Record<string, unknown> = { tool: req.tool, args: req.args };
+  if (req.configFingerprint !== undefined) wire.configFingerprint = req.configFingerprint;
   if (endpoint.kind === 'tcp') wire.token = endpoint.token;
 
   const outcome = await roundTrip(attempt.socket, wire, timeouts?.roundTripMs);

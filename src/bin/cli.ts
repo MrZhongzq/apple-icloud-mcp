@@ -25,7 +25,17 @@ const NEWLINE = String.fromCharCode(10);
 function loadDotEnvIfPresent(): void {
   const envPath = path.resolve(process.cwd(), '.env');
   if (existsSync(envPath)) {
-    dotenv.config({ path: envPath, override: false });
+    // `quiet: true` 不是可有可无的整洁：没有它，dotenv 会往 **stdout** 打一行
+    // `◇ injected env (3) from .env // tip: …`，而这个入口的 stdout 只允许有
+    // 结果 JSON——一行横幅就让 `out=$(cli mail_search …); echo "$out" | jq` 这
+    // 类用法直接 SyntaxError。
+    //
+    // 另外两个入口没这个问题纯属侥幸：它们写的是 `import 'dotenv/config'`，
+    // 那条路径经过 dotenv 的 cli-options 层，那里把 `quiet` 默认成了 'true'。
+    // 显式调用 `dotenv.config({...})` 不继承那个默认值。**不要把它删掉，也不要
+    // 指望任何默认值**——同一个包的两种引入方式给的默认值不一样，这正是它当初
+    // 溜过去的原因。
+    dotenv.config({ path: envPath, override: false, quiet: true });
   }
 }
 
@@ -97,6 +107,22 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // `stop` 必须排在 loadConfig **之前**。它只是去敲已经在跑的那个守护进程的门，
+  // 关一个 socket 不需要任何凭据。放在 loadConfig 之后（早先就是那样，理由是
+  // "和其余分支共享同一套启动顺序"）的后果是：`.env` 一坏——变量名打错、密码
+  // 轮换到一半——`cli stop` 就先在配置校验上退出 1，而那个仍然活着、仍然握着
+  // 一条已认证 IMAP 连接的守护进程就再也停不掉了，只能等它自己空闲超时。而
+  // SKILL.md 恰恰告诉无人值守的 agent「把 cli stop 无条件放在收尾处」，`set -e`
+  // 下那一句还会把整个清理流程一起中断。需要凭据才能做的事，`stop` 一件都没有。
+  if (first === 'stop') {
+    const stopped = await stopDaemon();
+    await flush(process.stdout, (stopped ? '守护进程已停止' : '没有正在运行的守护进程') + NEWLINE);
+    // 退出码恒为 0：没有守护进程在跑不是一次失败，是这条命令想要的终态之一——
+    // `cli stop` 常出现在清理脚本或 `set -e` 的收尾处，一个本来就无事可做的
+    // 清理步骤不该让脚本因此中断。
+    process.exit(0);
+  }
+
   let config;
   try {
     config = loadConfig(process.env);
@@ -127,18 +153,6 @@ async function main(): Promise<void> {
     process.once('SIGINT', () => void handle.close());
     process.once('SIGTERM', () => void handle.close());
     return;
-  }
-
-  // `stop` 不需要 config 描述的账号信息——它只是去敲已经在跑的那个守护进程的门，
-  // 让它自己清理退出。放在 config/logger 之后而不是之前，只是为了和其余分支
-  // 共享同一套"先读配置、打印 notices"的启动顺序，不代表它真的依赖 config 的内容。
-  if (first === 'stop') {
-    const stopped = await stopDaemon();
-    await flush(process.stdout, (stopped ? '守护进程已停止' : '没有正在运行的守护进程') + NEWLINE);
-    // 退出码恒为 0：没有守护进程在跑不是一次失败，是这条命令想要的终态之一——
-    // `cli stop` 常出现在清理脚本或 `set -e` 的收尾处，一个本来就无事可做的
-    // 清理步骤不该让脚本因此中断。
-    process.exit(0);
   }
 
   if (first === 'start') {
@@ -217,18 +231,27 @@ async function main(): Promise<void> {
   // 这条路径不走 daemon：批量模式本来就自己建一个会话跑完全部操作，daemon 能
   // 省下的那次握手它已经省了。有守护进程在跑时两者互不影响（各自持有自己的会话）。
   if (first === 'batch') {
-    const opsPath = argv[1];
-    if (opsPath === undefined) {
-      exitUsageError('用法：cli batch <ops.json> [--stop-on-error]');
-    }
-
+    // 位置无关地解析：`cli batch --stop-on-error ops.json` 和
+    // `cli batch ops.json --stop-on-error` 都对。早先按固定位置读（argv[1] 是
+    // 路径、其余是 flag），前一种写法会指着 `ops.json` 说"未知参数"——把唯一
+    // 写对了的那个参数当成错的。
     let stopOnError = false;
-    for (const token of argv.slice(2)) {
+    let opsPath: string | undefined;
+    for (const token of argv.slice(1)) {
       if (token === '--stop-on-error') {
         stopOnError = true;
         continue;
       }
-      exitUsageError(`未知参数：${token}${NEWLINE}用法：cli batch <ops.json> [--stop-on-error]`);
+      if (token.startsWith('--')) {
+        exitUsageError(`未知参数：${token}${NEWLINE}用法：cli batch <ops.json> [--stop-on-error]`);
+      }
+      if (opsPath !== undefined) {
+        exitUsageError(`只能给一个 ops 文件，但收到了两个：${opsPath} 和 ${token}${NEWLINE}用法：cli batch <ops.json> [--stop-on-error]`);
+      }
+      opsPath = token;
+    }
+    if (opsPath === undefined) {
+      exitUsageError('用法：cli batch <ops.json> [--stop-on-error]');
     }
 
     let opsText: string;

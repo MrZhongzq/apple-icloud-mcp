@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { runCli, listCliTools, CLI_MANAGED_SESSION_TOOLS } from '../../../src/cli/dispatch.js';
+import { runCli, listCliTools, CLI_MANAGED_SESSION_TOOLS, formatErrorPayload, formatFailure } from '../../../src/cli/dispatch.js';
+import { AppError } from '../../../src/core/errors.js';
 import type { RunCliDeps } from '../../../src/cli/dispatch.js';
 import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig, AccountConfig } from '../../../src/core/config.js';
@@ -181,6 +182,28 @@ describe('structured tool error exits 2 through the real dispatch path', () => {
   });
 });
 
+describe('formatErrorPayload', () => {
+  // 用法错误（工具没跑）在一次性路径上是一个抛出来的 AppError，由 formatFailure
+  // 渲染成两行中文；同一个失败经过守护进程时已经被拍平成了 JSON 载荷。退出码
+  // 上一轮统一过了，渲染没有——于是同一条命令、同一个错误，跑没跑过 cli start
+  // 决定了用户看到中文还是一坨 JSON，而文档教的是"stderr 上的 {error:…} 信封
+  // 意味着退出码 2、工具跑过了"，恰恰相反。
+  it('renders a daemon error payload exactly the way formatFailure renders the thrown one', () => {
+    const err = new AppError('INVALID_INPUT', '工具 mail_read 的参数不合法：format：bad', { hint: '用 cli mail_read --help' });
+    const payload = { error: { code: 'INVALID_INPUT', message: err.message, retryable: false, hint: err.hint } };
+    expect(formatErrorPayload(payload)).toBe(formatFailure(err));
+  });
+
+  it('renders a payload without a hint the same way too', () => {
+    const err = new AppError('INTERNAL', '出错了');
+    expect(formatErrorPayload({ error: { code: 'INTERNAL', message: '出错了' } })).toBe(formatFailure(err));
+  });
+
+  it('falls back to JSON for a shape it does not recognise, rather than losing it', () => {
+    expect(formatErrorPayload({ something: 'else' })).toContain('something');
+  });
+});
+
 describe('multi-account refusal', () => {
   const twoAccountConfig = configWith([
     account({ id: 'account_1', label: 'a@icloud.com', email: 'a@icloud.com', sender: 'a@icloud.com' }),
@@ -193,8 +216,16 @@ describe('multi-account refusal', () => {
     expect(outcome.stdout).toBe('');
     expect(outcome.stderr).toContain('a@icloud.com');
     expect(outcome.stderr).toContain('b@icloud.com');
-    expect(outcome.stderr, '要说明这个入口一次只服务一个账号').toContain('一个账号');
-    expect(outcome.stderr, '要给出拆分 .env 的建议').toContain('.env');
+    // 断言要钉在**只有这条 guard 会产生**的文字上。`batch.test.ts` 那一侧已经
+    // 修过：删掉 guard 之后 `findAccount` 会抛「配置了多个账号，必须指定 account」，
+    // 泛化的子串（'一个账号'、'.env'）今天之所以还能红，只是因为那条替代消息
+    // 碰巧写的是"多个账号"、碰巧没提 .env——是措辞的巧合，不是被钉住的性质。
+    // 两段文案的区别是实质的：guard 给的是可执行的下一步，findAccount 叫人
+    // "指定 account"，而 account 这个参数命令行根本不接受。
+    expect(outcome.stderr, '必须是 CLI 自己的拒绝文案，不是 findAccount 的替身').toContain(
+      '把不同账号拆分到各自的 .env 文件里',
+    );
+    expect(outcome.stderr).toContain('已配置 2 个账号');
   });
 
   it('still lets apple_accounts run with multiple accounts configured', async () => {

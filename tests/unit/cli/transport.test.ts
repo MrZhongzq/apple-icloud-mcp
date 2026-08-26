@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, chmodSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir, userInfo } from 'node:os';
 import {
-  endpointFiles, canUseUnixSocket, writeEndpoint, readEndpoint, clearEndpoint,
+  endpointFiles, canUseUnixSocket, writeEndpoint, readEndpoint, clearEndpoint, ensureOwnedDir, configFingerprint,
 } from '../../../src/cli/transport.js';
 
 let dir: string;
@@ -26,15 +26,26 @@ describe('endpoint file', () => {
     expect(await readEndpoint(files)).toEqual({ kind: 'tcp', port: 12345, token: 'sekrit' });
   });
 
-  it('writes the endpoint file 0600, since it carries the tcp token', async () => {
+  // 这条曾经写成"win32 就在函数体里 expect(existsSync).toBe(true) 然后 return"。
+  // 两个问题：函数体内提前 return 会被 runner 报成**通过**而不是跳过（本阶段
+  // 因此明令禁止这种写法），而那半个断言在 mode 是 0666 时同样成立——也就是
+  // 在 Windows 上这条测试的名字不是它检查的东西。改成 skipIf + 写进名字的原因。
+  const modeSkipReason =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：Node 在这个平台上只把 mode 映射成只读属性，0600 无从验证；真正的检查在 WSL/Linux 上跑）'
+      : '';
+  it.skipIf(process.platform === 'win32')(
+    'writes the endpoint file 0600, since it carries the tcp token' + modeSkipReason,
+    async () => {
+      await writeEndpoint(files, { kind: 'tcp', port: 1, token: 'sekrit' });
+      const mode = statSync(files.infoPath).mode & 0o777;
+      expect(mode, '端点文件里有 TCP 令牌，权限放宽等于把会话交出去').toBe(0o600);
+    },
+  );
+
+  it('writes the endpoint file on every platform, whatever the mode means there', async () => {
     await writeEndpoint(files, { kind: 'tcp', port: 1, token: 'sekrit' });
-    if (process.platform === 'win32') {
-      // Windows 上 POSIX 权限位无意义，这里只断言文件存在；真正的检查在 WSL/Linux 上跑
-      expect(existsSync(files.infoPath)).toBe(true);
-      return;
-    }
-    const mode = statSync(files.infoPath).mode & 0o777;
-    expect(mode, '端点文件里有 TCP 令牌，权限放宽等于把会话交出去').toBe(0o600);
+    expect(existsSync(files.infoPath)).toBe(true);
   });
 
   it('returns undefined when there is no endpoint file', async () => {
@@ -148,10 +159,83 @@ describe('运行时目录权限', () => {
     expect(mode, '运行时目录必须是 0700——它是 endpoint.json 的父目录，目录权限不够，chmod 600 单独也挡不住同机的其他用户遍历进来').toBe(0o700);
   });
 
+  const existingSkipReason =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：POSIX 权限位在这个平台上没有意义；在 WSL/Linux 上验证）'
+      : '';
+  it.skipIf(process.platform === 'win32')(
+    'tightens a runtime dir that already exists with a looser mode' + existingSkipReason,
+    async () => {
+      // 上面那条只覆盖"目录还不存在"这一支，而且它自己的注释就点名了另一支的
+      // 存在（mkdir 对已存在的目录是空操作）。性质跨两支，测试只盖了眼前这支——
+      // 这正是本阶段那份失败形状目录里的第 6 种，而且发生在为修 N-1 而写的测试里。
+      // 触发条件不冷僻：.env.example 建议的 MCP_CLI_RUNTIME_DIR=/var/tmp/... 落在
+      // 一个人人可写的 sticky 目录里，很可能早就被建出来了。
+      const existing = join(dir, 'already-here');
+      mkdirSync(existing, { mode: 0o755 });
+      chmodSync(existing, 0o755); // umask 可能让 mkdir 的 mode 不完全生效，显式定一次
+      expect(statSync(existing).mode & 0o777, '前提：这个目录一开始不是 0700').not.toBe(0o700);
+
+      await ensureOwnedDir(existing);
+      expect(statSync(existing).mode & 0o777, '目录已经存在也必须被收紧到 0700').toBe(0o700);
+    },
+  );
+
+  const ownerSkipReason =
+    process.platform === 'win32'
+      ? '（在 win32 上跳过：这个平台没有 uid，assertOwnedByCurrentUser 按设计直接放行——那里靠的是每用户的 %TEMP% ACL）'
+      : '';
+  it.skipIf(process.platform === 'win32')(
+    'refuses a runtime dir owned by another user' + ownerSkipReason,
+    async () => {
+      // 这条检查是 F-3 装上的四条访问控制性质之一，此前**一个测试都没有**：
+      // 把它整个删掉，整个 CLI 套件依然全绿。它挡的是：攻击者在共享 /tmp 里
+      // 抢先建出运行时目录、放一份自己的 endpoint.json，于是我们连到他的
+      // 监听者，把真实的工具参数（包括 mail_send 的正文）交给他。
+      // /tmp 归 root、测试进程不是 root，所以不需要 chown 就能构造。
+      await expect(ensureOwnedDir('/tmp')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    },
+  );
+
   it('writeEndpoint succeeds against a freshly-created runtime dir on every platform', async () => {
     // Windows 上没有 process.getuid，owner 校验直接放行；这里确认无论平台，
     // writeEndpoint 在一个全新目录上都能正常工作，不会因为缺了 uid 概念而抛。
     await expect(writeEndpoint(files, { kind: 'unix', path: files.socketPath })).resolves.toBeUndefined();
+  });
+});
+
+describe('configFingerprint', () => {
+  const account = {
+    id: 'account_1', label: 'a', email: 'a@icloud.com', sender: 'a@icloud.com', appPassword: 'p1',
+    capabilities: {
+      mailRead: true, mailWrite: false, calendarRead: true, calendarWrite: false,
+      remindersRead: true, remindersWrite: false, contactsRead: true, contactsWrite: false,
+    },
+  };
+  const cfg = (overrides: Record<string, unknown> = {}) =>
+    ({
+      accounts: [{ ...account, ...overrides }],
+      sessionTtlMs: 1, imapIdleTimeoutMs: 1, logLevel: 'error', deprecations: [], notices: [],
+    }) as never;
+
+  it('changes when a capability changes', () => {
+    const before = configFingerprint(cfg());
+    const after = configFingerprint(cfg({ capabilities: { ...account.capabilities, mailWrite: true } }));
+    expect(after, '打开 ALLOW_MAIL_WRITE_1 之后守护进程必须被认出是旧的').not.toBe(before);
+  });
+
+  it('changes when the app password is rotated', () => {
+    expect(configFingerprint(cfg({ appPassword: 'p2' })), '轮换密码后守护进程还在拿旧密码认证').not.toBe(
+      configFingerprint(cfg()),
+    );
+  });
+
+  it('is stable for the same config', () => {
+    expect(configFingerprint(cfg())).toBe(configFingerprint(cfg()));
+  });
+
+  it('never contains the password itself — it travels over the socket', () => {
+    expect(configFingerprint(cfg({ appPassword: 'super-secret-value' }))).not.toContain('super-secret');
   });
 });
 

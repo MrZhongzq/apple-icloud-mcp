@@ -1,10 +1,11 @@
 import { mkdtempSync, lstatSync } from 'node:fs';
-import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { AppError } from '../core/errors.js';
+import type { AppConfig } from '../core/config.js';
 
 /**
  * 一个端点：daemon 正在监听的地方。unix 模式下只有一条 socket 路径；
@@ -77,7 +78,8 @@ export function canUseUnixSocket(): Promise<boolean> {
 }
 
 /**
- * 建目录（0700）并确认它真的归当前用户所有，已存在但属于别人时拒绝往下走。
+ * 建目录并把它收紧到 0700，确认它真的归当前用户所有，已存在但属于别人时拒绝往下走。
+ * 注意"收紧"是**两步**（mkdir 的 mode + 事后 chmod），不是一步——见函数体里的解释。
  * 0700 单独就足以关掉两类问题：unix socket 在 `listen`→`chmod` 之间那扇短暂
  * 敞开的窗口（父目录不允许别人遍历，chmod 之前谁都进不来），以及往
  * `endpoint.json` 里放置符号链接偷读 TCP 令牌的招数（写入需要目录写权限）。
@@ -89,7 +91,31 @@ export function canUseUnixSocket(): Promise<boolean> {
  */
 export async function ensureOwnedDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  // `mkdir` 的 `mode` **只在真的创建目录时生效**：目录已经存在时 `recursive: true`
+  // 是一次空操作，模式一个位都不会动。于是一个预先存在的 0755 运行时目录会原样
+  // 留着 0755——而 0700 这道父目录闸门在本文件和 daemon.ts 里被反复描述成主要
+  // 防线，文件权限只是纵深防御。触发条件不是什么冷僻情形，恰恰是文档里给出的
+  // 那个旋钮：`.env.example` 建议的 `MCP_CLI_RUNTIME_DIR=/var/tmp/apple-icloud-mcp-cli`
+  // 落在一个所有人可写的 sticky 目录里，很可能早就被建出来了。
+  //
+  // 所以创建之后再显式收紧一次。顺序是先校验所有权、再 chmod：反过来的话，
+  // 一个属于别人的目录会先撞上 chmod 的 EPERM，用户拿到的是一句底层 errno，
+  // 而不是"运行时目录属于另一个用户，拒绝使用"这句说得清该怎么办的话。
   assertOwnedByCurrentUser(dir);
+  await tightenDirMode(dir);
+}
+
+/**
+ * 把目录收紧到 0700。Windows 上没有对应物（`chmod` 只映射到只读属性），
+ * 直接跳过——那个平台上的隔离靠的是每用户的 `%TEMP%` ACL，见 currentUserTag。
+ */
+async function tightenDirMode(dir: string): Promise<void> {
+  if (process.getuid === undefined) return;
+  try {
+    await chmod(dir, 0o700);
+  } catch {
+    // 目录刚被别人删掉之类的竞态：后续的读写会以更具体的错误收场，这里不重复报。
+  }
 }
 
 /** Windows 没有 uid 概念，这条检查在该平台上没有对应物，直接放行。 */
@@ -198,6 +224,35 @@ export function generateToken(): string {
  */
 export function generateOwnerId(): string {
   return randomBytes(16).toString('hex');
+}
+
+/**
+ * 当前配置的指纹，用来发现"守护进程比 .env 旧"。
+ *
+ * 守护进程在 `cli start` 那一刻把配置**冻住**：工具表、每个账号的读写权限、
+ * 以及用来登录的凭据，全部停在那一刻。而每条普通命令的客户端都会重新读一遍
+ * `.env`。两边一旦不一致，症状全是"看起来在正常工作、答案却是错的"：
+ * `cli --list` 列出一个守护进程随后回"未知工具"的工具；打开了
+ * `ALLOW_MAIL_WRITE_1` 之后 `mail_send` 仍然 `PERMISSION_DENIED`，提示还叫你
+ * 去设置那个已经设好的变量；`apple_accounts`——那个专门用来报告"当前配置成
+ * 什么样"的工具——报告的是旧配置。轮换了 App 专用密码更糟：守护进程会继续
+ * 拿旧密码去认证，直到 15 分钟空闲超时。
+ *
+ * 所以客户端每次请求都把这个指纹带上，守护进程拿它和自己启动时算的那个比。
+ * 对不上就**拒绝服务这次请求**并说清原因，而不是拿旧配置给出一个错误答案。
+ *
+ * 指纹里不含密码明文，只含它的摘要：换了密码指纹就会变，但这个值会随请求
+ * 写进 socket，不能让它本身泄露凭据。
+ */
+export function configFingerprint(config: AppConfig): string {
+  const material = config.accounts.map((account) => ({
+    id: account.id,
+    email: account.email,
+    sender: account.sender,
+    password: createHash('sha256').update(account.appPassword).digest('hex'),
+    capabilities: account.capabilities,
+  }));
+  return createHash('sha256').update(JSON.stringify(material)).digest('hex').slice(0, 16);
 }
 
 /**

@@ -1,5 +1,4 @@
 import net from 'node:net';
-import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chmodSync, unlinkSync } from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
@@ -8,12 +7,14 @@ import { createSessionStore } from '../core/session.js';
 import { createProviders } from '../providers/icloud/index.js';
 import { findAccount } from '../core/config.js';
 import { collectTools } from './registry.js';
-import { invokeTool, ToolArgsError } from './execute.js';
+import { invokeTool, CliUsageError } from './execute.js';
 import { listCliTools } from './dispatch.js';
 import {
   canUseUnixSocket,
   clearEndpoint,
+  configFingerprint,
   DAEMON_STOP_COMMAND,
+  ensureOwnedDir,
   endpointFiles,
   generateOwnerId,
   generateToken,
@@ -27,6 +28,12 @@ import type { Endpoint, EndpointFiles } from './transport.js';
 const NEWLINE = String.fromCharCode(10);
 const DEFAULT_IDLE_MS = 15 * 60_000;
 
+/** 配置漂移的说明与下一步。两处（指纹不符、工具表里没有）共用同一段文案。 */
+const DRIFT_MESSAGE =
+  '这个守护进程是在当前 .env 之前启动的，它的工具表、读写权限和凭据都停在启动那一刻，' +
+  '和你现在的配置已经不一致了。它不会拿旧配置替你回答，因为那样给出的答案是错的却看不出来。';
+const DRIFT_HINT = '先 cli stop 再 cli start，让守护进程重新读一遍配置；只跑一两条命令的话直接 cli stop，退回一次性模式即可';
+
 export interface DaemonHandle {
   endpoint: Endpoint;
   close(): Promise<void>;
@@ -36,6 +43,9 @@ interface WireRequest {
   token?: string;
   tool: string;
   args: Record<string, unknown>;
+  /** 客户端这一刻的配置指纹（见 transport.ts::configFingerprint）。
+   *  探活请求不带它——那时还没有配置可谈——所以缺省表示"不检查"。 */
+  configFingerprint?: string;
 }
 
 function isWireRequest(value: unknown): value is WireRequest {
@@ -151,11 +161,20 @@ export async function startDaemon(deps: {
   // 孤儿进程在自己的空闲超时里删掉后起者仍然活着的端点。
   const ownerId = generateOwnerId();
 
-  // N-1: 必须在建目录这一步就把 mode 定死，不能建完再补 chmod——mkdir
-  // 对已存在的目录是空操作（后面 listenUnixSocket 里的 chmodSync 只管 socket
-  // 文件本身，不管它的父目录），补救式的权限收紧会漏掉 mkdir 到 chmod 之间
-  // 那个真实存在的窗口，也漏掉目录本来就已经存在的情形。
-  await mkdir(join(files.infoPath, '..'), { recursive: true, mode: 0o700 });
+  // N-1: 运行时目录必须在**监听之前**就是 0700 且确实归自己所有。
+  //
+  // 走 ensureOwnedDir 而不是自己 mkdir：一是 `mkdir` 的 mode 对已存在的目录
+  // 是空操作（那里需要事后 chmod，见 transport.ts 里的解释），二是所有权校验
+  // 必须发生在 `server.listen` + `chmodSync(socket)` 之前——早先这里只做裸
+  // mkdir，第一次校验所有权要等到后面的 writeEndpoint，也就是 socket 已经
+  // 建好、chmod 过之后。正常流程里父进程（start.ts）会先校验一遍，所以这只
+  // 影响直接 `node dist/bin/cli.js __cli_daemon_run__` 的人——而那恰恰是排查
+  // 问题的维护者会做的事。
+  await ensureOwnedDir(join(files.infoPath, '..'));
+
+  // 这个 daemon 冻住的那份配置的指纹。客户端每次请求都带上它自己刚算的那个，
+  // 对不上就说明 .env 已经变了、这个 daemon 比它旧（见 configFingerprint）。
+  const myFingerprint = configFingerprint(config);
 
   const sessions = createSessionStore({
     ttlMs: config.sessionTtlMs,
@@ -179,6 +198,30 @@ export async function startDaemon(deps: {
     if (socket.writable) socket.write(JSON.stringify(payload) + NEWLINE);
   }
 
+  /**
+   * 会话过期后的重建，单飞。
+   *
+   * 早先是"销毁当前会话、建一个新的"两行直写。两个并发请求同时拿到
+   * SESSION_EXPIRED 时，它们各自建一个新会话，只有后赋值的那个还能被引用到，
+   * 先建的那个连同它的 IMAP/SMTP provider 留在 store 里没人再碰——而 daemon
+   * 从不 sweep，于是它一直活到进程退出。触发条件不冷僻：把
+   * SESSION_TTL_MINUTES 设得比 15 分钟的空闲窗口更短是这段代码自己承认的
+   * 合理加固选择。
+   */
+  let rebuilding: Promise<void> | undefined;
+  async function rebuildSession(stale: { id: string }): Promise<void> {
+    if (session !== stale) return; // 已经有人替换过了，直接用新的重试
+    if (!rebuilding) {
+      rebuilding = (async () => {
+        await sessions.destroy(stale.id).catch(() => undefined);
+        session = sessions.create(account);
+      })().finally(() => {
+        rebuilding = undefined;
+      });
+    }
+    await rebuilding;
+  }
+
   function isSessionExpiredPayload(value: unknown): boolean {
     if (value === null || typeof value !== 'object') return false;
     const error = (value as { error?: unknown }).error;
@@ -191,13 +234,27 @@ export async function startDaemon(deps: {
     retried = false,
   ): Promise<{ value: unknown; isError: boolean; usageError?: boolean }> {
     try {
+      // 配置漂移检查必须排在最前面：它解释了下面几乎所有能出的问题（未知工具、
+      // 权限不对、凭据是旧的），而且它给出的下一步是可执行的。
+      if (req.configFingerprint !== undefined && req.configFingerprint !== myFingerprint) {
+        throw new CliUsageError('INVALID_INPUT', DRIFT_MESSAGE, { hint: DRIFT_HINT });
+      }
+
       const tool = tools.get(req.tool);
       if (!tool) {
-        throw new AppError('NOT_FOUND', `未知工具：${req.tool}`, { hint: '用 --list 查看全部可用工具' });
+        // 走到这里意味着客户端的工具表里有、守护进程的没有——而客户端的
+        // `resolveCall` 已经拿它自己那份（刚读的 .env 生成的）表校验过工具名了。
+        // 所以真正的原因永远是"守护进程比配置旧"，不是"你打错了"。上面那条指纹
+        // 检查通常会先拦住；这条是它的兜底（比如探活请求不带指纹）。
+        // 提示绝不能写"用 --list 查看全部可用工具"——用户刚从 --list 里看到了它。
+        throw new CliUsageError('NOT_FOUND', `守护进程不认识工具 ${req.tool}：${DRIFT_MESSAGE}`, { hint: DRIFT_HINT });
       }
+      // 记下这次用的是哪个会话对象：并发请求同时撞上 SESSION_EXPIRED 时，
+      // rebuildSession 靠它判断"我要重建的那个是不是已经被别人换掉了"。
+      const stale = session;
       const args: Record<string, unknown> = { ...req.args };
       if ('session_id' in tool.config.inputSchema) {
-        args.session_id = session.id;
+        args.session_id = stale.id;
       }
       // 走 invokeTool 而不是直接 tool.handler：那里是 CLI 三条执行路径共用的收口点，
       // 参数校验（对着工具自己的 schema）和 content 信封的拆解都在那一处。早先这里
@@ -213,8 +270,7 @@ export async function startDaemon(deps: {
       // 胡同，直到 15 分钟空闲超时替用户收场。这里自己重建一次会话再重试，
       // 对调用方完全透明；只重试一次，不递归，真出问题就正常报错。
       if (result.isError && !retried && isSessionExpiredPayload(value)) {
-        await sessions.destroy(session.id).catch(() => undefined);
-        session = sessions.create(account);
+        await rebuildSession(stale);
         return handleRequest(req, true);
       }
 
@@ -228,7 +284,7 @@ export async function startDaemon(deps: {
       // （退出码 1），不是 iCloud 的回答（退出码 2）。不带这个标志的话，同一条写错
       // 参数的命令会因为"有没有跑 cli start"而落在两个不同的退出码上，而脚本正是
       // 按退出码分支的。
-      if (err instanceof ToolArgsError) {
+      if (err instanceof CliUsageError) {
         return { value: toErrorPayload(err), isError: true, usageError: true };
       }
       return { value: toErrorPayload(err), isError: true };
@@ -325,7 +381,16 @@ export async function startDaemon(deps: {
     endpoint = { kind: 'tcp', port: address.port, token };
   }
 
-  await writeEndpoint(files, endpoint, ownerId);
+  // 监听已经起来了：从这里往后任何一次抛出都必须先把 listener 关掉，否则
+  // 嵌入式/测试用法里会留下一个没人引用、也没人能关的监听 socket（独立
+  // daemon 进程靠 main().catch 退出，掩盖了这一点）。
+  try {
+    await writeEndpoint(files, endpoint, ownerId);
+  } catch (err) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await sessions.destroyAll().catch(() => undefined);
+    throw err;
+  }
   resetIdle();
 
   async function shutdown(): Promise<void> {
@@ -333,7 +398,12 @@ export async function startDaemon(deps: {
     closed = true;
     if (idleTimer) clearTimeout(idleTimer);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await sessions.destroy(session.id).catch(() => undefined);
+    // destroyAll 而不是 destroy(session.id)：`session` 是一个可变闭包变量，
+    // SESSION_EXPIRED 的重建路径会替换它。下面的 rebuildSession 已经把并发
+    // 重建收敛成单飞，但"只销毁当前那一个"这种写法本身就假设了历史上从没有
+    // 别的会话存在过——一旦哪天多出第二条重建路径，漏掉的那个会话会带着它
+    // 的 IMAP/SMTP 连接一直留到进程退出。destroyAll 对这条不变式不作任何假设。
+    await sessions.destroyAll().catch(() => undefined);
 
     // 只清理还认得出是自己写的那份端点文件：如果竞态中输给了另一个后起的
     // cli start，端点文件此刻描述的是那个仍然活着的 daemon，绝不能把它删

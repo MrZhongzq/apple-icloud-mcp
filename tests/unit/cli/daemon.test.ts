@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import net from 'node:net';
 import { startDaemon } from '../../../src/cli/daemon.js';
 import { callDaemon, stopDaemon, waitForDaemonReady } from '../../../src/cli/client.js';
-import { writeEndpoint, readEndpoint, DAEMON_STOP_COMMAND } from '../../../src/cli/transport.js';
+import { writeEndpoint, readEndpoint, DAEMON_STOP_COMMAND, configFingerprint } from '../../../src/cli/transport.js';
+
+const NEWLINE = String.fromCharCode(10);
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig } from '../../../src/core/config.js';
 
@@ -133,6 +137,111 @@ describe('daemon lifecycle', () => {
     expect(bad?.isError, '未知工具应当作为一次失败的调用返回，而不是打死守护进程').toBe(true);
     const after = await callDaemon({ tool: 'apple_accounts', args: {} }, files);
     expect(after, '一次坏调用之后守护进程必须还活着').toBeDefined();
+  });
+});
+
+/**
+ * 直接对着 socket 说话的裸客户端。`callDaemon` 一条连接只发一条请求（那正是
+ * 被测的那条规则），所以要验证"第二条不该被执行"就必须绕过它自己写字节。
+ */
+function rawSend(endpoint: { kind: 'unix'; path: string } | { kind: 'tcp'; port: number; token: string }, lines: string[]): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    const socket =
+      endpoint.kind === 'unix' ? net.connect(endpoint.path) : net.connect(endpoint.port, '127.0.0.1');
+    let received = '';
+    socket.on('data', (c: Buffer) => (received += c.toString('utf8')));
+    socket.on('error', reject);
+    socket.on('close', () => resolvePromise(received));
+    socket.on('connect', () => {
+      socket.write(lines.join(NEWLINE) + NEWLINE);
+    });
+  });
+}
+
+/** 给裸请求补上 TCP 模式需要的令牌（unix 模式下 token 字段会被忽略）。 */
+function wireLine(endpoint: { kind: string; token?: string }, body: Record<string, unknown>): string {
+  return JSON.stringify(endpoint.kind === 'tcp' ? { ...body, token: endpoint.token } : body);
+}
+
+describe('daemon wire protocol', () => {
+  it('executes only the first request on a connection, never a pipelined second', async () => {
+    // F-20 的那条修复（`if (handled) return;`）此前**零覆盖**：把它删掉，整个
+    // 套件依旧全绿。没有它，管道进来的第二条请求会真的被执行——第二个
+    // mail_send 真的会把信发出去——而它的响应被 writeLine 的 socket.writable
+    // 检查悄悄丢掉，也就是"真的干了、还没人知道"。
+    //
+    // 两条请求必须落在**两个 data 事件**里，而且第二条要在第一条还没处理完
+    // 时到达——把两行塞进同一个 chunk 是测不出这条守卫的：那样只会触发一次
+    // data 事件，剩下半个缓冲区没有后续事件去消费它，删掉守卫照样全绿
+    // （实测过）。所以这里用一个由测试自己放行的闸门把第一条请求卡住。
+    handle = await startDaemon({ config, logger, files });
+    const ep = handle.endpoint;
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    listFolders.mockImplementationOnce(async () => {
+      await gate;
+      return { folders: [], failures: [] };
+    });
+
+    const line = wireLine(ep, { tool: 'mail_folders', args: {} }) + NEWLINE;
+    const socket = ep.kind === 'unix' ? net.connect(ep.path) : net.connect(ep.port, '127.0.0.1');
+    let received = '';
+    socket.on('data', (c: Buffer) => (received += c.toString('utf8')));
+    socket.on('error', () => undefined); // 第二次写可能撞上对端已关闭，不是本条测试关心的
+
+    const closed = new Promise<void>((r) => socket.on('close', () => r()));
+    await new Promise<void>((r) => socket.on('connect', () => r()));
+
+    socket.write(line); // 第一条：会卡在 gate 上
+    await delay(30);
+    socket.write(line); // 第二条：独立的 data 事件，第一条还没处理完
+    await delay(30);
+    release();
+    await closed;
+
+    const replies = received.split(NEWLINE).filter((l) => l.length > 0);
+    expect(replies, '一条连接只回一条').toHaveLength(1);
+    expect(listFolders, '管道进来的第二条绝不该被执行——哪怕它带着真实副作用').toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unknown args key that arrives over the socket', async () => {
+    // 这是 invokeTool 里那道 strict 兜底**唯一**端到端可达的入口：flags.ts 只
+    // 按 schema 生成 flag，batch 的整批校验查过键名，而 daemon 直接拿 req.args
+    // 用（isWireRequest 只检查 tool 是不是字符串）。也就是说在这条路上它不是
+    // 兜底，是唯一的检查。
+    handle = await startDaemon({ config, logger, files });
+    const ep = handle.endpoint;
+
+    const received = await rawSend(ep as never, [wireLine(ep, { tool: 'mail_folders', args: { limt: 5 } })]);
+    const reply = JSON.parse(received.trim()) as { isError: boolean; usageError?: boolean; value: { error: { message: string } } };
+
+    expect(reply.usageError, '参数错是用法错误：工具没跑，退出码该是 1 而不是 2').toBe(true);
+    expect(reply.value.error.message).toContain('limt');
+    expect(listFolders, '参数没过校验，工具一次都不该被调用').not.toHaveBeenCalled();
+  });
+
+  it('refuses to serve a client whose config fingerprint does not match its own', async () => {
+    // 守护进程在 cli start 那一刻把配置冻住。不检查的话，它会拿旧的工具表、
+    // 旧的读写权限、旧的凭据回答——每一种都是"看起来在正常工作、答案却是错的"。
+    handle = await startDaemon({ config, logger, files });
+    const ep = handle.endpoint;
+
+    const stale = await rawSend(ep as never, [
+      wireLine(ep, { tool: 'apple_accounts', args: {}, configFingerprint: 'not-the-one-it-started-with' }),
+    ]);
+    const reply = JSON.parse(stale.trim()) as { usageError?: boolean; value: { error: { message: string; hint: string } } };
+    expect(reply.usageError, '拿旧配置回答不是 iCloud 的答复，是一次用法错误').toBe(true);
+    expect(reply.value.error.message, '必须说出真正的原因：这个 daemon 比 .env 旧').toContain('之前启动的');
+    expect(reply.value.error.hint, '必须给出可执行的下一步').toContain('cli stop');
+
+    // 指纹对得上时照常服务；否则上面那条断言可以靠"永远拒绝"作弊满足。
+    const fresh = await rawSend(ep as never, [
+      wireLine(ep, { tool: 'apple_accounts', args: {}, configFingerprint: configFingerprint(config) }),
+    ]);
+    expect((JSON.parse(fresh.trim()) as { isError: boolean }).isError).toBe(false);
   });
 });
 

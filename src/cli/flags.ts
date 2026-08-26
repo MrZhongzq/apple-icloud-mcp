@@ -152,10 +152,14 @@ function parseScalar(spec: FlagSpec, raw: string): unknown {
 export function parseFlags(specs: FlagSpec[], argv: string[]): Record<string, unknown> {
   const byFlag = new Map<string, FlagSpec>();
   const byUnsetFlag = new Map<string, FlagSpec>();
+  const byNegatedFlag = new Map<string, FlagSpec>();
   for (const spec of specs) {
     byFlag.set(spec.flag, spec);
     if (spec.nullable) {
       byUnsetFlag.set('--unset-' + spec.key, spec);
+    }
+    if (spec.kind === 'boolean') {
+      byNegatedFlag.set('--no-' + spec.key, spec);
     }
   }
 
@@ -172,6 +176,20 @@ export function parseFlags(specs: FlagSpec[], argv: string[]): Record<string, un
     const unsetSpec = byUnsetFlag.get(token);
     if (unsetSpec) {
       unsetKeys.add(unsetSpec.key);
+      i += 1;
+      continue;
+    }
+
+    // `--no-<key>`：布尔参数的 false。没有它的话，三态布尔里"显式 false"这一态
+    // 在命令行上根本写不出来——`reminders_list --completed` 是"只看已完成"，
+    // 而"只看未完成"（`completed: false`）无从表达，而那是提醒事项最常见的一个
+    // 查询。同样地 `calendar_list_events --expand_recurring` 默认就是 true，
+    // 想要 false（拿重复事件的主体而不是展开的每一次）也没有写法。
+    // 优先于普通 flag 匹配，理由和 `--unset-` 一样：否则会先被当成未知参数。
+    const negatedSpec = byNegatedFlag.get(token);
+    if (negatedSpec) {
+      result[negatedSpec.key] = false;
+      setKeys.add(negatedSpec.key);
       i += 1;
       continue;
     }
@@ -224,11 +242,23 @@ export function renderHelp(name: string, config: ToolConfig, specs: FlagSpec[]):
 
   for (const spec of specs) {
     const requiredLabel = spec.required ? '必填' : '可选';
-    // choices 存在时展示具体取值（如 <text|html|both>），否则退回类型名。
-    const typeLabel = spec.choices ? spec.choices.join('|') : spec.kind;
-    let line = spec.flag + ' <' + typeLabel + '>  ' + requiredLabel;
+    // 布尔参数不吃值——写成 `--x <boolean>` 会被读成"要跟一个值"，照做
+    // （`--permanent true`）得到的是 `未知参数：true`。帮助必须印出解析器真正
+    // 接受的写法：出现即 true，`--no-x` 即 false。帮助由 schema 生成的意义就在
+    // 于它不会和真实行为漂移；一份和解析器矛盾的帮助比没有帮助更糟。
+    let line: string;
+    if (spec.kind === 'boolean') {
+      line = spec.flag + ' | --no-' + spec.key + '  ' + requiredLabel;
+    } else {
+      // choices 存在时展示具体取值（如 <text|html|both>），否则退回类型名。
+      const typeLabel = spec.choices ? spec.choices.join('|') : spec.kind;
+      line = spec.flag + ' <' + typeLabel + '>  ' + requiredLabel;
+    }
     if (spec.description) line += '  ' + spec.description;
     lines.push(line);
+    if (spec.kind === 'boolean') {
+      lines.push('  ' + spec.flag + ' 置为 true，--no-' + spec.key + ' 置为 false，整个省略则不传该字段');
+    }
     if (spec.nullable) {
       lines.push('  --unset-' + spec.key + '  传此项以清除该字段（设为 null）');
     }

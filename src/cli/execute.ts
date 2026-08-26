@@ -68,13 +68,28 @@ function parseToolJson(toolName: string, text: string): unknown {
 }
 
 /**
- * 参数没通过工具自己的 schema。单独一个类型，是因为它和"工具执行后报错"
- * 必须落在不同的退出码上：工具**根本没跑**，这是一次用法错误（退出 1），
- * 不是 iCloud 那边的回答（退出 2）。守护进程那条路要把这个区别带过线，
- * 见 `daemon.ts` 的 `usageError` 与 `client.ts` 的 `DaemonResult`。
+ * "工具根本没跑，这是调用方的用法问题"这一类失败。单独一个类型，是因为它和
+ * "工具执行后报错"必须落在不同的退出码上：用法错误退出 1，iCloud 的回答退出 2。
+ * 守护进程那条路要把这个区别带过线，见 `daemon.ts` 的 `usageError`
+ * 与 `client.ts` 的 `DaemonResult`。
  */
-export class ToolArgsError extends AppError {}
+export class CliUsageError extends AppError {}
 
+/** 参数没通过工具自己的 schema——最常见的一种用法错误。 */
+export class ToolArgsError extends CliUsageError {}
+
+/**
+ * 把 zod 的 issue 列成一行。
+ *
+ * **这里刻意保留 zod 自己的英文原文，不翻译。** 一张 issue code → 中文的映射表
+ * 是 zod 拥有的那份真相的第二个副本，而且它的失效方式比英文更糟：zod 任何一个
+ * minor 版本都可能加新的 issue code，落到映射表的兜底分支上，于是本来正确的英文
+ * 变成一句**自信而错误**的中文。真正要紧的信息本来就在项目自己的文案里——字段
+ * 路径由本函数补在前面，`工具 X 的参数不合法：` 和中文 hint 由下面那个函数包上；
+ * 留在英文里的只有"为什么不合法"，而 zod 在那部分给的恰恰是调用方最需要的东西
+ * （`expected one of "text"|"html"|"both"`、`Unrecognized key: "limt"` 会把合法
+ * 取值一并列出来）。不要"顺手"把它翻译掉。
+ */
 function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
   return issues
     .map((issue) => {
@@ -97,9 +112,15 @@ function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
  * schema——`inputSchema` 是 ZodRawShape，工具注册时交给 SDK 的也是同一个对象。
  *
  * 用 strict 而不是默认的剥离行为：多出来的键必须**拒绝**，不能悄悄丢掉。丢掉一个
- * 参数正是这一阶段反复在清除的那种"看起来成功了、其实干了别的事"。上游两条路
- * （`flags.ts` 只按 schema 生成 flag；`batch.ts` 的整批校验查键名）都已经挡过一次，
- * 所以这里的 strict 是一道**永远不该被触发的兜底**——真触发了，说明上游漏了。
+ * 参数正是这一阶段反复在清除的那种"看起来成功了、其实干了别的事"。
+ *
+ * 注意这道 strict 在三条路上的地位并不一样。flag 路径（`flags.ts` 只按 schema
+ * 生成 flag，`parseFlags` 见到任何未知 token 就抛）和批量路径（`planBatch` 拿
+ * `Object.keys(inputSchema)` 逐个校验）上游都已经挡过一次，那两条路上它是永远
+ * 不该被触发的兜底。但**守护进程的 socket 是第三条入口**：`daemon.ts` 直接拿
+ * `req.args` 用，`isWireRequest` 只检查 `tool` 是不是字符串——那条路上它不是
+ * 兜底，是**唯一**的检查，而且端到端可达（见 daemon.test.ts 里那条经 socket
+ * 送进未知键的用例）。删掉它就等于把 socket 那条路上的未知参数静默丢掉。
  */
 export function validateToolArgs(tool: CollectedTool, args: Record<string, unknown>): Record<string, unknown> {
   const schema = z.strictObject(tool.config.inputSchema);

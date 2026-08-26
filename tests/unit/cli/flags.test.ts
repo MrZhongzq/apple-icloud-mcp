@@ -18,6 +18,34 @@ const sample = cfg({
   subject: z.string(),
 });
 
+describe('boolean flags', () => {
+  // 布尔参数只能置 true 的话，三态布尔里"显式 false"这一态在命令行上根本
+  // 写不出来。这不是理论问题：`reminders_list --completed` 是"只看已完成"，
+  // 而"只看未完成"——提醒事项最常见的那个查询——无从表达；
+  // `calendar_list_events --expand_recurring` 默认 true，想要 false 同理。
+  const boolCfg = cfg({ completed: z.boolean().optional(), other: z.string().optional() });
+
+  it('sets true when the flag is present', () => {
+    expect(parseFlags(deriveFlags(boolCfg), ['--completed'])).toEqual({ completed: true });
+  });
+
+  it('sets false for --no-<key>', () => {
+    expect(parseFlags(deriveFlags(boolCfg), ['--no-completed'])).toEqual({ completed: false });
+  });
+
+  it('omits the field entirely when neither form is given — the third state', () => {
+    expect(parseFlags(deriveFlags(boolCfg), [])).toEqual({});
+  });
+
+  it('still rejects a value after a boolean flag, since it never consumes one', () => {
+    expect(() => parseFlags(deriveFlags(boolCfg), ['--completed', 'true'])).toThrow(/true/);
+  });
+
+  it('does not invent --no- for non-boolean flags', () => {
+    expect(() => parseFlags(deriveFlags(boolCfg), ['--no-other'])).toThrow(/--no-other/);
+  });
+});
+
 describe('deriveFlags', () => {
   it('never exposes session_id, which the CLI injects itself', () => {
     const keys = deriveFlags(sample).map((f) => f.key);
@@ -141,6 +169,16 @@ describe('renderHelp', () => {
     expect(text).toContain('--unset-note');
     expect(text).toMatch(/--subject[^\n]*必填|必填[^\n]*--subject/);
     expect(text, '帮助里不该出现由 CLI 注入的参数').not.toContain('--session_id');
+  });
+
+  it('shows what the parser actually accepts for a boolean, not a value placeholder', () => {
+    // 早先印的是 `--unseen <boolean>`，读起来像"要跟一个值"；照做
+    // （`--unseen true`）得到的是 `未知参数：true`、退出码 1。帮助由 schema
+    // 生成的全部意义就在于它不会和真实行为漂移——一份和解析器矛盾的帮助
+    // 比没有帮助更糟，和 daemon 那条"用 --list 查看"的提示是同一种毛病。
+    const text = renderHelp('mail_search', sample, deriveFlags(sample));
+    expect(text, '布尔参数不吃值').not.toContain('--unseen <boolean>');
+    expect(text).toContain('--unseen | --no-unseen');
   });
 
   it('lists every allowed value for an enum flag, not just <string>', () => {
