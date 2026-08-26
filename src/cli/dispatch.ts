@@ -1,9 +1,11 @@
 import { AppError } from '../core/errors.js';
 import { deriveFlags, parseFlags, renderHelp } from './flags.js';
 import { executeOnce, type SessionFactory } from './execute.js';
+import { callDaemon } from './client.js';
 import type { AppConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
 import type { CollectedTool } from './registry.js';
+import type { EndpointFiles } from './transport.js';
 
 const NEWLINE = String.fromCharCode(10);
 
@@ -61,8 +63,12 @@ function renderToolList(tools: Map<string, CollectedTool>): string {
   return lines.join(NEWLINE) + NEWLINE;
 }
 
-/** 多账号拒绝时列出账号，帮调用方看清现在配置了什么，而不是丢一句干巴巴的报错。 */
-function multiAccountRefusal(config: AppConfig): string {
+/**
+ * 多账号拒绝时列出账号，帮调用方看清现在配置了什么，而不是丢一句干巴巴的报错。
+ * 导出给 `bin/cli.ts` 的 `start` 子命令复用——daemon 同样一次只服务一个账号，
+ * 拒绝文案不该在两处各写一份、日后各自漂移。
+ */
+export function multiAccountRefusal(config: AppConfig): string {
   const names = config.accounts.map((a) => a.label).join('、');
   return (
     `已配置 ${config.accounts.length} 个账号（${names}）：命令行的一次性执行模式一次只服务一个账号，` +
@@ -86,57 +92,68 @@ export interface RunCliOutcome {
   stderr: string;
 }
 
+/** `resolveCall` 的结果：要么已经是终态输出（usage 错误、--list、--help、排除、多账号拒绝、
+ *  flag 解析失败），要么是一次已经解析好、可以真正执行的调用。 */
+type ResolvedCall = { kind: 'outcome'; outcome: RunCliOutcome } | { kind: 'call'; toolName: string; args: Record<string, unknown> };
+
 /**
- * `cli --list` / `cli <tool> --help` / `cli <tool> [flags...]` 的实际分派逻辑。
- * 只返回退出码和该写到 stdout/stderr 的文本，不做任何真正的 I/O 或
- * `process.exit`——那些副作用留给 `bin/cli.ts`，这样这里可以被直接单测，
- * 而且测的就是真正跑在生产路径上的这份代码，不是它的另一份重写。
- *
- * 调用方必须保证 `argv[0]` 已经不是顶层的 `undefined`/`--help`/`-h`——那两种
- * 不需要 config 就该能显示用法，由 `bin/cli.ts` 在建 config 之前处理掉。
+ * 把 argv 解析成"该直接输出什么"或"该执行哪个工具、带什么参数"，不做任何执行。
+ * `runCli`（一次性模式）和 `runCliDaemonFirst`（先试 daemon 再退回一次性）共享
+ * 这同一段解析——两者的区别只在于拿到一个已解析调用之后怎么执行它，解析规则
+ * （排除名单、多账号拒绝、flag 校验……）必须完全一致，不能有第二份copy。
  */
-export async function runCli(deps: RunCliDeps, argv: string[]): Promise<RunCliOutcome> {
-  const { config, logger } = deps;
+function resolveCall(deps: Pick<RunCliDeps, 'config' | 'tools'>, argv: string[]): ResolvedCall {
+  const { config } = deps;
   const visibleTools = listCliTools(deps.tools);
 
   const toolName = argv[0];
   if (toolName === undefined) {
-    return { exitCode: 1, stdout: '', stderr: '缺少工具名，用 cli --list 查看全部工具' + NEWLINE };
+    return { kind: 'outcome', outcome: { exitCode: 1, stdout: '', stderr: '缺少工具名，用 cli --list 查看全部工具' + NEWLINE } };
   }
 
   if (toolName === '--list') {
-    return { exitCode: 0, stdout: renderToolList(visibleTools), stderr: '' };
+    return { kind: 'outcome', outcome: { exitCode: 0, stdout: renderToolList(visibleTools), stderr: '' } };
   }
 
   if (CLI_MANAGED_SESSION_TOOLS.has(toolName)) {
-    return { exitCode: 1, stdout: '', stderr: SESSION_MANAGED_MESSAGE + NEWLINE };
+    return { kind: 'outcome', outcome: { exitCode: 1, stdout: '', stderr: SESSION_MANAGED_MESSAGE + NEWLINE } };
   }
 
   const tool = visibleTools.get(toolName);
   if (!tool) {
-    return { exitCode: 1, stdout: '', stderr: `未知工具：${toolName}${NEWLINE}用 cli --list 查看全部工具${NEWLINE}` };
+    return {
+      kind: 'outcome',
+      outcome: { exitCode: 1, stdout: '', stderr: `未知工具：${toolName}${NEWLINE}用 cli --list 查看全部工具${NEWLINE}` },
+    };
   }
 
   const rest = argv.slice(1);
   const specs = deriveFlags(tool.config);
 
   if (rest[0] === '--help' || rest[0] === '-h') {
-    return { exitCode: 0, stdout: renderHelp(toolName, tool.config, specs) + NEWLINE, stderr: '' };
+    return { kind: 'outcome', outcome: { exitCode: 0, stdout: renderHelp(toolName, tool.config, specs) + NEWLINE, stderr: '' } };
   }
 
   // apple_accounts 不需要账号解析（它就是用来看配置了哪些账号的），其余工具在
   // 多账号配置下一律拒绝——沉默地挑第一个账号是错的，宁可让调用方自己拆分 .env。
   if (toolName !== 'apple_accounts' && config.accounts.length > 1) {
-    return { exitCode: 1, stdout: '', stderr: multiAccountRefusal(config) };
+    return { kind: 'outcome', outcome: { exitCode: 1, stdout: '', stderr: multiAccountRefusal(config) } };
   }
 
   let args: Record<string, unknown>;
   try {
     args = parseFlags(specs, rest);
   } catch (err) {
-    return { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE };
+    return { kind: 'outcome', outcome: { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE } };
   }
 
+  return { kind: 'call', toolName, args };
+}
+
+/** 已解析调用的一次性执行路径：建隐式会话、跑、销毁——`executeOnce` 本身的行为。 */
+async function executeAndFormat(deps: RunCliDeps, toolName: string, args: Record<string, unknown>): Promise<RunCliOutcome> {
+  const { config, logger } = deps;
+  const visibleTools = listCliTools(deps.tools);
   try {
     const result = await executeOnce(
       { config, logger, tools: visibleTools, sessionFactory: deps.sessionFactory },
@@ -149,4 +166,53 @@ export async function runCli(deps: RunCliDeps, argv: string[]): Promise<RunCliOu
   } catch (err) {
     return { exitCode: 1, stdout: '', stderr: formatFailure(err) + NEWLINE };
   }
+}
+
+/**
+ * `cli --list` / `cli <tool> --help` / `cli <tool> [flags...]` 的实际分派逻辑。
+ * 只返回退出码和该写到 stdout/stderr 的文本，不做任何真正的 I/O 或
+ * `process.exit`——那些副作用留给 `bin/cli.ts`，这样这里可以被直接单测，
+ * 而且测的就是真正跑在生产路径上的这份代码，不是它的另一份重写。
+ *
+ * 调用方必须保证 `argv[0]` 已经不是顶层的 `undefined`/`--help`/`-h`——那两种
+ * 不需要 config 就该能显示用法，由 `bin/cli.ts` 在建 config 之前处理掉。
+ *
+ * 这条路径永远走隐式会话（建立 → 执行 → 销毁），不管有没有 daemon 在跑。
+ * 需要"有 daemon 就用它"的调用方用 `runCliDaemonFirst`。
+ */
+export async function runCli(deps: RunCliDeps, argv: string[]): Promise<RunCliOutcome> {
+  const resolved = resolveCall(deps, argv);
+  if (resolved.kind === 'outcome') return resolved.outcome;
+  return executeAndFormat(deps, resolved.toolName, resolved.args);
+}
+
+export interface RunCliDaemonDeps extends RunCliDeps {
+  /** 测试注入的端点文件位置；生产环境省略，用默认的临时目录路径。 */
+  files?: EndpointFiles;
+}
+
+/**
+ * `bin/cli.ts` 真正对外暴露的 `cli <tool>` 分派：先试有没有一个活着的守护进程，
+ * 能连上就用它已经建好的会话执行（省下这次调用本该重做的 TCP+TLS+AUTH 握手）；
+ * 连不上——没启动、被杀掉、端点文件是僵死的——`callDaemon` 会自己清理端点文件
+ * 并返回 `undefined`，这里随即原样退回 `executeAndFormat` 的一次性模式。
+ *
+ * 用法解析（--list/--help/排除名单/多账号拒绝/flag 校验）与 `runCli` 共享同一个
+ * `resolveCall`，只在"已经解析出一个要执行的调用"之后才分叉成两条执行路径——
+ * 这条顺序不能反：先跑一次性模式、daemon 只是"顺便"，会让常驻会话形同虚设，
+ * 每条命令还是在从头登录，而命令本身照样能跑通、没有任何症状。
+ */
+export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]): Promise<RunCliOutcome> {
+  const resolved = resolveCall(deps, argv);
+  if (resolved.kind === 'outcome') return resolved.outcome;
+
+  const daemonResult = await callDaemon({ tool: resolved.toolName, args: resolved.args }, deps.files);
+  if (daemonResult) {
+    if (daemonResult.isError) {
+      return { exitCode: 2, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
+    }
+    return { exitCode: 0, stdout: JSON.stringify(daemonResult.value, null, 2) + NEWLINE, stderr: '' };
+  }
+
+  return executeAndFormat(deps, resolved.toolName, resolved.args);
 }

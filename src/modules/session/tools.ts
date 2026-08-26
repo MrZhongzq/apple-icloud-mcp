@@ -17,7 +17,7 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
     {
       title: '列出已配置的 iCloud 账号',
       description:
-        '返回服务端配置的账号及其读写权限。无需登录即可调用，用于在多账号时确定 apple_login 的 account 参数。',
+        '返回服务端配置的账号及其读写权限。无需登录即可调用，用于在多账号时确认当前有哪些账号可用（MCP 客户端据此决定 apple_login 的 account 参数）。',
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },

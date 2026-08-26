@@ -7,7 +7,9 @@ import { createLogger } from '../core/logger.js';
 import { createSessionStore } from '../core/session.js';
 import { createProviders } from '../providers/icloud/index.js';
 import { collectTools } from '../cli/registry.js';
-import { runCli, formatFailure } from '../cli/dispatch.js';
+import { runCliDaemonFirst, formatFailure, multiAccountRefusal } from '../cli/dispatch.js';
+import { startDaemon } from '../cli/daemon.js';
+import { stopDaemon } from '../cli/client.js';
 
 const NEWLINE = String.fromCharCode(10);
 
@@ -58,7 +60,11 @@ function renderUsage(): string {
     NEWLINE +
     '  cli <tool> --help          查看某个工具的参数' +
     NEWLINE +
-    '  cli <tool> [flags...]      执行该工具' +
+    '  cli <tool> [flags...]      执行该工具（有守护进程在跑就用它，否则跑一次性会话）' +
+    NEWLINE +
+    '  cli start                  启动守护进程，复用同一个会话直到空闲超时' +
+    NEWLINE +
+    '  cli stop                   停止守护进程' +
     NEWLINE
   );
 }
@@ -90,6 +96,38 @@ async function main(): Promise<void> {
   for (const notice of config.deprecations) logger.warn(notice);
   for (const notice of config.notices) logger.warn(notice);
 
+  // `stop` 不需要 config 描述的账号信息——它只是去敲已经在跑的那个守护进程的门，
+  // 让它自己清理退出。放在 config/logger 之后而不是之前，只是为了和其余分支
+  // 共享同一套“先读配置、打印 notices”的启动顺序，不代表它真的依赖 config 的内容。
+  if (first === 'stop') {
+    const stopped = await stopDaemon();
+    await flush(process.stdout, (stopped ? '守护进程已停止' : '没有正在运行的守护进程') + NEWLINE);
+    process.exit(stopped ? 0 : 1);
+  }
+
+  if (first === 'start') {
+    // 和一次性模式的多账号拒绝同一个理由、同一段文案：守护进程同样只持有
+    // 一个账号的会话，沉默地挑第一个账号是错的。
+    if (config.accounts.length > 1) {
+      exitUsageError(multiAccountRefusal(config));
+    }
+    const handle = await startDaemon({ config, logger });
+    const where =
+      handle.endpoint.kind === 'unix'
+        ? `unix socket ${handle.endpoint.path}`
+        : `127.0.0.1:${handle.endpoint.port}（TCP 回环，需要令牌握手；Windows 沙箱下 unix socket 不可用时的兜底）`;
+    await flush(process.stdout, `守护进程已启动，监听于 ${where}` + NEWLINE);
+    // 不调用 process.exit：daemon 要作为常驻进程活着，监听中的 server 本身就会
+    // 让事件循环保持运行。调用方自己决定要不要用 `&` / nohup 把这个进程放到
+    // shell 的后台——这里只负责“进程活着、直到被 stop 或空闲超时”。
+    const shutdown = (): void => {
+      void handle.close().then(() => process.exit(0));
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    return;
+  }
+
   const sessions = createSessionStore({
     ttlMs: config.sessionTtlMs,
     providerFactory: (account) => createProviders(account, { logger, imapIdleTimeoutMs: config.imapIdleTimeoutMs }),
@@ -100,8 +138,9 @@ async function main(): Promise<void> {
   // sessionFactory 必须返回上面这同一个 `sessions` 实例——`tools` 里的 handler
   // （比如 mail_search）内部是靠这个 store 的 `get(session_id)` 找会话的；
   // executeOnce 若用另一个 store 建会话，注入的 session_id 在 handler 眼里就是
-  // 个不存在的会话。
-  const outcome = await runCli({ config, logger, tools, sessionFactory: () => sessions }, argv);
+  // 个不存在的会话。`runCliDaemonFirst` 在这之外先试一次 callDaemon——有守护
+  // 进程在跑就用它已经建好的会话执行，连不上才落到这条一次性路径。
+  const outcome = await runCliDaemonFirst({ config, logger, tools, sessionFactory: () => sessions }, argv);
 
   await flush(process.stdout, outcome.stdout);
   await flush(process.stderr, outcome.stderr);
