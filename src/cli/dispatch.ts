@@ -31,7 +31,11 @@ const NEWLINE = String.fromCharCode(10);
  */
 export const CLI_MANAGED_SESSION_TOOLS: ReadonlySet<string> = new Set(['apple_login', 'work_done']);
 
-const SESSION_MANAGED_MESSAGE =
+/**
+ * 排除这两个工具时给调用方的解释。导出给 `batch.ts` 复用——批量模式是第二条
+ * 进入执行的路径，同一条排除规则必须在两处都生效，理由文案也不该各写一份。
+ */
+export const SESSION_MANAGED_MESSAGE =
   'apple_login 和 work_done 不是命令行子命令：命令行的一次性执行模式自己管理会话' +
   '（登录、执行、登出都在这一次进程运行期间完成），不需要也不支持调用方显式登录/登出。' +
   '直接运行 cli <tool> [flags...] 即可，会话会在这次调用内自动建立和销毁。';

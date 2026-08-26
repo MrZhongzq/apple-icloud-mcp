@@ -43,7 +43,12 @@ export interface CliSessionStore {
  */
 export type SessionFactory = () => CliSessionStore;
 
-function defaultSessionFactory(config: AppConfig, logger: Logger): SessionFactory {
+/**
+ * 生产默认的会话工厂：新建一个自己的 store。给独立使用 `executeOnce` / `runBatch`
+ * 的场景（如测试）兜底，不是 `bin/cli.ts` 那条生产路径依赖的行为——那条路径总是
+ * 显式传入与 `collectTools` 共享的那个单例（见上面 `SessionFactory` 的注释）。
+ */
+export function defaultSessionFactory(config: AppConfig, logger: Logger): SessionFactory {
   return () =>
     createSessionStore({
       ttlMs: config.sessionTtlMs,
@@ -59,6 +64,25 @@ function parseToolJson(toolName: string, text: string): unknown {
     // 那样调用方拿到的要么是垃圾数据要么是一个静默的 undefined。
     throw new AppError('INTERNAL', `工具 ${toolName} 的返回不是合法 JSON`, { cause: err });
   }
+}
+
+/**
+ * 调一次工具 handler，并把 MCP 的 content 信封拆成 `ExecuteResult`。
+ *
+ * 单独抽出来是因为批量模式（`batch.ts`）要在**同一个**会话里连着调很多次，
+ * 不能复用 `executeOnce`（它每次都建会话、销会话，正是批量模式要省掉的东西）。
+ * 抽成一个共享函数而不是在 batch.ts 里重写一遍，是为了让"空 content"和
+ * "返回不是合法 JSON"这两种畸形返回在两条路径上是同一套处理——两份副本迟早
+ * 会有一份漏掉其中一种，而漏掉的那种在这里的表现是 `undefined` 静默流到 stdout。
+ */
+export async function invokeTool(tool: CollectedTool, args: Record<string, unknown>): Promise<ExecuteResult> {
+  const result = await tool.handler(args);
+  const first = result.content[0];
+  if (!first) {
+    throw new AppError('INTERNAL', `工具 ${tool.name} 返回了空的 content`);
+  }
+  const value = parseToolJson(tool.name, first.text);
+  return { value, isError: result.isError === true };
 }
 
 /**
@@ -99,13 +123,7 @@ export async function executeOnce(
   }
 
   try {
-    const result = await tool.handler(args);
-    const first = result.content[0];
-    if (!first) {
-      throw new AppError('INTERNAL', `工具 ${call.tool} 返回了空的 content`);
-    }
-    const value = parseToolJson(call.tool, first.text);
-    return { value, isError: result.isError === true };
+    return await invokeTool(tool, args);
   } finally {
     // 销毁必须在这里，不能只在成功路径上做——它关的是 IMAP/SMTP 连接，
     // handler 抛异常时同样必须关掉，否则进程退出时还留着一条打开的 socket。

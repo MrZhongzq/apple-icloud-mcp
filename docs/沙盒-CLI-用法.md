@@ -1,0 +1,253 @@
+# 在沙盒里用命令行驱动这台服务器
+
+这份文档写给部署者（你），不是写给 AI 的。AI 读的是 `SKILL.md`。
+
+它讲的是第三条路：**沙盒 CLI**。如果你的 Claude Routine 能用 shell（cowork 沙盒就是这样），那么它不需要域名、不需要证书、不需要 OAuth——直接在沙盒里把这个仓库跑起来，用命令行调用同一批工具即可。远程 HTTP 部署那条路见 [`部署与-Routine-接入.md`](./部署与-Routine-接入.md)。
+
+CLI 暴露的是 **23 个工具**：与 MCP 入口完全相同的那 25 个，减去 `apple_login` 和 `work_done`——命令行自己管理会话（见下文「会话去哪了」），这两个在这里没有意义，调用它们只会得到一个"看起来成功了、其实什么都没发生"的结果，所以直接被排除。业务逻辑一行都没变，同一份 `src/modules`。
+
+---
+
+## 一、跑起来
+
+沙盒里从零开始，五步：
+
+```bash
+git clone <仓库地址> apple-icloud-mcp
+cd apple-icloud-mcp
+npm ci
+npm run build          # 必须——CLI 跑的是 dist/，不是 src/
+```
+
+然后准备 `.env`（放在仓库根目录，和 `package.json` 同级）：
+
+```bash
+cat > .env <<'ENV'
+ICLOUD_ACCOUNT_1=your-name@icloud.com
+ICLOUD_APP_PASSWORD_1=abcd-efgh-ijkl-mnop
+# Apple ID 不是 iCloud 邮箱地址时必须补这一项，否则邮件工具会被自动禁用
+# ICLOUD_SENDER_1=your-alias@icloud.com
+
+# 读默认开、写默认关。要写就显式打开。
+ALLOW_MAIL_WRITE_1=false
+ALLOW_CALENDAR_WRITE_1=false
+ALLOW_REMINDERS_WRITE_1=false
+ALLOW_CONTACTS_WRITE_1=false
+
+LOG_LEVEL=info
+ENV
+```
+
+App 专用密码在 [appleid.apple.com](https://appleid.apple.com) → 登录与安全 → App 专用密码 生成。完整的变量清单见仓库根目录的 `.env.example`。
+
+跑一条命令验证：
+
+```bash
+node dist/bin/cli.js apple_accounts
+```
+
+看到自己的账号和权限表，就说明配置读到了。仓库里也有 `npm run cli` 这个别名，但 npm 会吞掉 `--` 之前的参数，所以得写成 `npm run cli -- --list`；本文一律用 `node dist/bin/cli.js`，少一层坑。
+
+**`.env` 不会覆盖已经存在的环境变量。** CLI 读 `.env` 时用的是 `override: false`——如果沙盒已经把凭据注入进了进程环境，一个过期的 `.env` 不会悄悄把它盖掉。
+
+---
+
+## 二、不要打印 `.env`
+
+**不要 `cat .env`，不要 `env`，不要 `echo $ICLOUD_APP_PASSWORD_1`，也不要打印一条把密码写在里面的命令。**
+
+理由不是"有规定"，而是：**没有任何机制在保护这件事**。你的 shell 输出和 Routine 的对话记录之间没有任何脱敏层，没有东西认得出一个 App 专用密码并把它挡下来，更没有东西能把已经打印出去的东西收回来。"密码没有进对话"从来不是这套系统提供的性质，它只是"每一条被执行过的命令碰巧都不是会打印它的那一条"累积出来的结果。
+
+一条 `cat .env` 写进一个每天运行的 routine，就是从此每天的记录里都有一份密码；补救办法不是改代码，是去 appleid.apple.com 把那个密码吊销、重新生成一个。
+
+要确认某个变量有没有设上，测它非空，别打印它的值：
+
+```bash
+test -n "$ICLOUD_APP_PASSWORD_1" && echo "已设置" || echo "未设置"
+```
+
+---
+
+## 三、两种模式：一次性 和 常驻
+
+### 一次性（默认，什么都不用做）
+
+```bash
+node dist/bin/cli.js mail_search --limit 5
+```
+
+每条命令自己建一个会话、执行、销毁。进程退出时连接一定是关掉的，不残留。代价是每条命令都要重做一次 TCP + TLS + IMAP 认证握手。
+
+### 常驻（`start` / `stop`）
+
+```bash
+node dist/bin/cli.js start     # 启动守护进程，等它真的能连上才返回
+node dist/bin/cli.js mail_folders
+node dist/bin/cli.js mail_search --limit 5     # 复用上面那个会话，省掉握手
+node dist/bin/cli.js stop
+```
+
+`start` 之后，普通命令会先去敲守护进程的门；连得上就用它已经建好的会话执行，连不上（没启动、被杀掉、端点文件是僵死的）就自动退回一次性模式，并在 stderr 上说一声——结果照样正确，只是悄悄多付了一次握手，不说清楚没人会知道。`stop` 之后一切退回一次性模式。
+
+**什么时候值得 `start`：** 一次 routine 里要连着调五条以上的命令，或者其中有 `contacts_search`（首次搜索会全量拉取通讯录，实测 1429 张卡片约 4.5 秒；同一会话里之后的搜索约 0.4 秒——这个缓存是**会话内**的，一次性模式下每条命令都会重新付一遍这 4.5 秒）。只跑一两条命令就不必了，`start` 自己的冷启动也要时间。
+
+守护进程空闲 15 分钟自动退出。它一次只服务一个账号——和一次性模式一样，配了多个账号时它会直接拒绝而不是替你猜，把不同账号拆到各自的 `.env` / 各自的沙盒里去跑。
+
+### `daemon.log`：打开 debug 之前先知道这件事
+
+守护进程把自己的 stderr 写到运行时目录下的 `daemon.log`（运行时目录默认在临时目录里，可用 `MCP_CLI_RUNTIME_DIR` 指定）。这个文件：
+
+- 创建时权限是 `600`；
+- **每次 `cli start` 用截断方式重写**（上一次失败的残留日志不会和这一次的诊断信息混在一起）；
+- **运行期间不轮转、没有大小上限**——截断本身就是它唯一的轮转机制。
+
+所以：**`LOG_LEVEL=debug` 下要当心**。debug 级别时 IMAP provider 会把 imapflow 的**每一帧协议数据**都记进这个文件，而日志的脱敏是**按键名**做的（遮蔽形如 `pass`/`password`/`secret`/`token` 的字段），它不认识 imapflow 帧内部的字段名。一个常驻很久的守护进程在 debug 下可以把这个文件写得比你预期大得多，而且里面有你的邮件内容。调试完记得把 `LOG_LEVEL` 调回 `info`，并重启守护进程（下一次 `start` 会把日志截断）。
+
+---
+
+## 四、有哪些工具、每个怎么调
+
+```bash
+node dist/bin/cli.js --list                # 23 个工具，一行一个：名字 + 一句描述
+node dist/bin/cli.js mail_search --help    # 某个工具的全部参数
+```
+
+`--help` 的内容是**从工具自己的 schema 生成的**，不是另写一份文档，所以它不会和真实参数漂移。例如：
+
+```
+$ node dist/bin/cli.js reminders_update --help
+reminders_update
+按 reminder_id 修改提醒事项，patch 中只写需要变更的字段。
+
+--reminder_id <string>  必填  reminders_list 返回的 reminder_id
+--patch <json>  必填
+--expected_etag <string>  可选  乐观锁，可留空
+```
+
+参数写法：
+
+| `--help` 里的类型 | 命令行上怎么写 |
+|---|---|
+| `<string>` | `--folder INBOX` |
+| `<number>` | `--limit 20` |
+| `<boolean>` | `--permanent`（出现即为 true，不吃下一个 token） |
+| `<json>` | 整块 JSON 字符串：`--patch '{"title":"新标题"}'` |
+| `<a\|b\|c>` | 枚举，直接写取值：`--format both` |
+
+非布尔参数一定吃掉下一个 token 作为值，**哪怕它以短横开头**——那是合法值，不是下一个参数。
+
+**没有 `--session_id`，永远不会有。** 会话是 CLI 自己的事，见下文。
+
+### 三态字段与 `--unset-<key>`
+
+有些字段是三态的：给一个值 = 设置，给 `null` = **清除**，整个省略 = 不改动。CLI 对这种字段会额外生成一个 `--unset-<key>`，传它等价于传 `null`：
+
+```bash
+# 假设某工具有一个可为 null 的顶层参数 nickname
+node dist/bin/cli.js some_tool --unset-nickname     # 等价于 nickname: null
+```
+
+同一个字段不能又设置又清除，`--nickname x --unset-nickname` 会被直接拒绝。
+
+**但要注意：当前这 23 个工具里，没有任何一个的顶层参数是三态的。** 三态字段全都长在嵌套对象里——`contacts_update` 的 `nickname`/`organization`/`title`/`note`、`reminders_update` 的 `due` 等等，都在 `--patch` 这个 `<json>` 参数**内部**。所以今天你在任何一份 `--help` 里都看不到 `--unset-` 开头的行；要清除这些字段，就在 JSON 里直接写 `null`：
+
+```bash
+node dist/bin/cli.js contacts_update \
+  --contact_id <id> \
+  --patch '{"nickname":null,"organization":"新公司"}'
+```
+
+上面这条命令的含义是：清除昵称、把公司改掉、其余字段一概不动。`--unset-` 这套机制是为将来某个工具把三态字段提到顶层时准备的，届时它会自动出现在 `--help` 里，不需要改任何文档。
+
+### 会话去哪了
+
+命令行的会话边界是**进程本身**：每次调用在一个隐式会话里跑完就销毁，`session_id` 从不出现在命令行上，也不会出现在批量操作的 JSON 里。因此 `apple_login` 和 `work_done` 被整体排除——`apple_login` 返回的 `session_id` 在进程退出那一刻就不存在了（一个指向空气的句柄），而 `work_done` 只会销毁 CLI 刚建出来、还没被任何工具用过的空会话，然后返回 `{"success": true}` 让你以为关掉了什么。真要关掉常驻会话，用 `cli stop`。
+
+---
+
+## 五、批量模式
+
+一份 JSON 文件描述一串操作，**整批共用一个会话**跑完：
+
+```bash
+node dist/bin/cli.js batch ops.json
+node dist/bin/cli.js batch ops.json --stop-on-error
+```
+
+`ops.json` 的格式是一个数组，每一条是 `{"tool": "...", "args": {...}}`，`args` 不需要时可以整个省略：
+
+```json
+[
+  { "tool": "apple_accounts" },
+  { "tool": "mail_folders" },
+  { "tool": "mail_search", "args": { "folder": "INBOX", "limit": 5, "query": { "unseen": true } } },
+  { "tool": "calendar_list_events", "args": { "start": "2026-09-01T00:00:00+08:00", "end": "2026-09-08T00:00:00+08:00" } }
+]
+```
+
+`args` 里写的是**工具原本的参数结构**（和 MCP 那边一模一样），不是命令行 flag——嵌套对象就直接写嵌套对象，不用像 `--patch` 那样再包一层字符串。
+
+stdout 上是一个 `outcomes` 数组，与操作**一一对应、顺序一致**：
+
+```json
+[
+  { "tool": "mail_folders", "ok": true,  "value": { "folders": [] } },
+  { "tool": "mail_search",  "ok": false, "value": { "error": { "code": "NOT_FOUND", "message": "..." } } }
+]
+```
+
+几条必须知道的行为：
+
+- **整批先校验，全部合法才开始执行。** 一份把第三条工具名拼错的 `ops.json`，不会先把前两条真的执行掉（可能已经发了信、删了邮件）再报错——它一条都不会跑，报错里会告诉你是第几条、错在哪。这条性质是有意的：否则你会很自然地改完拼写重跑一遍，于是前两条执行了两次。
+- **默认不中断。** 某一条失败了，后面的照跑，失败那条的 `ok` 是 `false`。批量里最常见的形态是一串只读查询，其中一条撞上 `NOT_FOUND` 不该让后面十九条都不跑。要「首个失败即停」（写操作串联、后一条依赖前一条成功）就加 `--stop-on-error`，此时返回的数组只到失败那一条为止。
+- **`args` 里不能写 `session_id`。** 会话由 CLI 建立和销毁，你传的 id 不会生效——所以这里是**直接拒绝整批**，而不是悄悄覆盖掉它。悄悄覆盖会让你以为自己传的 id 生效了。
+- **`apple_login` / `work_done` 同样不能出现在批量里**，理由和命令行上一样。
+- 批量模式不走守护进程：它本来就自己建一个会话跑完全部操作，`start` 能省的那次握手它已经省了。守护进程在跑也不冲突，两者各自持有自己的会话。
+
+---
+
+## 六、退出码
+
+| 码 | 含义 | 典型场景 |
+|---|---|---|
+| `0` | 成功 | 工具正常返回；批量模式下全部操作都成功 |
+| `2` | **工具返回了结构化错误** | `PERMISSION_DENIED`、`NOT_FOUND`、`AUTH_FAILED`……；批量模式下至少有一条失败 |
+| `1` | **CLI 自己失败了** | 未知子命令 / 未知工具、参数缺失或类型不对、`.env` 没配好、`ops.json` 读不到或格式非法、批量整批校验没通过、多账号拒绝 |
+
+区分 1 和 2 的意义：**2 是「命令跑通了，iCloud 那边这么回答」，1 是「这条命令根本没跑成」**。1 不该重试（参数不对不会因为重试就变对），2 要看具体错误码——`AUTH_FAILED` 意味着密码失效，重试多少次都一样。
+
+stdout 上**只有结果 JSON**，日志、报错、进度一律走 stderr。所以下面这样是安全的：
+
+```bash
+if out=$(node dist/bin/cli.js mail_search --limit 5 2>/tmp/err.log); then
+  echo "$out" | jq '.messages | length'
+else
+  code=$?
+  if [ "$code" -eq 2 ]; then
+    echo "iCloud 返回了错误：" >&2; cat /tmp/err.log >&2
+  else
+    echo "CLI 自身失败（别重试）：" >&2; cat /tmp/err.log >&2
+  fi
+  exit "$code"
+fi
+```
+
+批量模式下更常见的是逐条看：
+
+```bash
+node dist/bin/cli.js batch ops.json > out.json
+code=$?
+jq -r '.[] | select(.ok | not) | "失败：\(.tool) \(.value.error.code)"' out.json
+exit "$code"
+```
+
+注意 `set -e` 下退出码 2 会直接中断脚本——如果你想自己处理失败的那几条，记得像上面那样用 `if`/`||` 把命令包起来。
+
+---
+
+## 七、几条限制
+
+- **一次只服务一个账号。** 配了多个账号时，除 `apple_accounts` 外的所有命令一律拒绝，不替你猜。把不同账号拆到各自的 `.env` 和各自的沙盒里。
+- **写权限默认关闭。** `ALLOW_*_WRITE_n` 不显式设为 `true` 的话，所有写操作会以 `PERMISSION_DENIED`（退出码 2）失败，错误里会写明该设哪个变量。
+- **Apple ID 不是 iCloud 邮箱地址时，邮件工具会被自动禁用**，除非设置了 `ICLOUD_SENDER_n`。这不是 bug：Apple 的 IMAP 服务器会直接拒绝非 iCloud 域名的用户名，而那个报错长得和"密码被吊销"一模一样，所以宁可在启动时说清楚。启动时 stderr 上会有一条说明。
+- 其余与协议本身相关的限制（不支持备忘录、附件不能收发、重复日程的夏令时漂移等）见 [`部署与-Routine-接入.md`](./部署与-Routine-接入.md) 最后一节，两条路完全一样。

@@ -137,6 +137,10 @@ Everything above assumes a person is reading your output and can answer a questi
 
 **Prefer reads, and be explicit about writes.** A routine that only reads is safe to run on any schedule. A routine that writes is changing the user's real mail, calendar, reminders, or contacts on a timer they are not watching. Say in your output exactly what you changed — what was created, modified, or deleted, with the ids — so the run is auditable after the fact.
 
+**Never print the credential file or the variables it sets.** In a sandbox the password stays out of the conversation only because nothing echoes it — `cat .env`, `env`, `echo $ICLOUD_APP_PASSWORD_1`, and printing a command that embeds it all defeat that. If you need to check whether a variable is set, test that it is non-empty; do not print its value.
+
+That rule is worth stating as a rule because **nothing enforces it**. There is no redaction step between your shell and the transcript, no filter that recognizes an App-Specific Password on its way past, and no mechanism anywhere in this project that can un-print one. "The credentials stayed out of the conversation" is not a property the server provides you — it is only ever the accumulated result of every command you chose to run not being one that printed them. One `cat .env` in a routine that runs daily puts the password into every day's transcript from then on, and the recovery is not a code change: it is the user revoking that password at appleid.apple.com and issuing a new one.
+
 ## Not supported
 
 iCloud Notes cannot be accessed by this server — Apple provides no standard protocol for Notes that works with an App-Specific Password. Do not attempt to read them via `mail_*` tools. Attachments cannot be downloaded (`mail_read` reports metadata only) or sent (`mail_send` has no attach parameter). Contact photos cannot be retrieved — `has_photo` only reports whether one exists.

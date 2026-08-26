@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { loadConfig } from '../core/config.js';
@@ -7,7 +7,8 @@ import { createLogger } from '../core/logger.js';
 import { createSessionStore } from '../core/session.js';
 import { createProviders } from '../providers/icloud/index.js';
 import { collectTools } from '../cli/registry.js';
-import { runCliDaemonFirst, formatFailure, multiAccountRefusal } from '../cli/dispatch.js';
+import { runCliDaemonFirst, formatFailure, multiAccountRefusal, listCliTools } from '../cli/dispatch.js';
+import { parseBatchOps, runBatch } from '../cli/batch.js';
 import { startDaemon } from '../cli/daemon.js';
 import { stopDaemon, waitForDaemonReady } from '../cli/client.js';
 import { startDaemonProcess } from '../cli/start.js';
@@ -64,6 +65,8 @@ function renderUsage(): string {
     '  cli <tool> --help          查看某个工具的参数' +
     NEWLINE +
     '  cli <tool> [flags...]      执行该工具（有守护进程在跑就用它，否则跑一次性会话）' +
+    NEWLINE +
+    '  cli batch <ops.json>       在同一个会话里跑完一串操作；加 --stop-on-error 则首个失败即停' +
     NEWLINE +
     '  cli start                  启动守护进程（后台），直到它真的能连上才返回' +
     NEWLINE +
@@ -204,6 +207,64 @@ async function main(): Promise<void> {
   // executeOnce 若用另一个 store 建会话，注入的 session_id 在 handler 眼里就是
   // 个不存在的会话。`runCliDaemonFirst` 在这之外先试一次 callDaemon——有守护
   // 进程在跑就用它已经建好的会话执行，连不上才落到这条一次性路径。
+  // `cli batch ops.json [--stop-on-error]`：整批操作共用一个会话。放在这里而不是
+  // 前面几个分支旁边，是因为它需要 `sessions` 和 `tools`。
+  //
+  // 传给 runBatch 的是 `listCliTools(tools)` 而不是完整工具表：apple_login /
+  // work_done 的排除在 `batch.ts` 的校验里已经按名字做了一次，这里再滤一次是
+  // 纵深防御——两道门里任何一道都足以挡住，但只留一道时它退化成"没人再检查"。
+  //
+  // 这条路径不走 daemon：批量模式本来就自己建一个会话跑完全部操作，daemon 能
+  // 省下的那次握手它已经省了。有守护进程在跑时两者互不影响（各自持有自己的会话）。
+  if (first === 'batch') {
+    const opsPath = argv[1];
+    if (opsPath === undefined) {
+      exitUsageError('用法：cli batch <ops.json> [--stop-on-error]');
+    }
+
+    let stopOnError = false;
+    for (const token of argv.slice(2)) {
+      if (token === '--stop-on-error') {
+        stopOnError = true;
+        continue;
+      }
+      exitUsageError(`未知参数：${token}${NEWLINE}用法：cli batch <ops.json> [--stop-on-error]`);
+    }
+
+    let opsText: string;
+    try {
+      opsText = readFileSync(path.resolve(process.cwd(), opsPath), 'utf8');
+    } catch (err) {
+      exitUsageError(`读不到批量操作文件 ${opsPath}：${formatFailure(err)}`);
+    }
+
+    let ops;
+    try {
+      ops = parseBatchOps(opsText);
+    } catch (err) {
+      exitUsageError(formatFailure(err));
+    }
+
+    let outcomes;
+    try {
+      outcomes = await runBatch(
+        { config, logger, tools: listCliTools(tools), sessionFactory: () => sessions },
+        ops,
+        { stopOnError },
+      );
+    } catch (err) {
+      // 整批校验没过（未知工具、apple_login/work_done、args 里带 session_id、
+      // 多账号）——一条都没执行，这是 CLI 自身的失败，退出码 1。
+      await flush(process.stderr, formatFailure(err) + NEWLINE);
+      process.exit(1);
+    }
+
+    await flush(process.stdout, JSON.stringify(outcomes, null, 2) + NEWLINE);
+    // 有任何一条失败就退 2，和一次性模式"工具返回结构化错误"的退出码一致；
+    // 具体哪一条失败在 stdout 的 outcomes 里，逐条带着 ok 和 value。
+    process.exit(outcomes.every((o) => o.ok) ? 0 : 2);
+  }
+
   const outcome = await runCliDaemonFirst({ config, logger, tools, sessionFactory: () => sessions }, argv);
 
   await flush(process.stdout, outcome.stdout);
