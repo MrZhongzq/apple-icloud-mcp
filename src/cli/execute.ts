@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { findAccount, type AccountConfig, type AppConfig } from '../core/config.js';
 import { AppError } from '../core/errors.js';
 import { createSessionStore } from '../core/session.js';
@@ -67,6 +68,55 @@ function parseToolJson(toolName: string, text: string): unknown {
 }
 
 /**
+ * 参数没通过工具自己的 schema。单独一个类型，是因为它和"工具执行后报错"
+ * 必须落在不同的退出码上：工具**根本没跑**，这是一次用法错误（退出 1），
+ * 不是 iCloud 那边的回答（退出 2）。守护进程那条路要把这个区别带过线，
+ * 见 `daemon.ts` 的 `usageError` 与 `client.ts` 的 `DaemonResult`。
+ */
+export class ToolArgsError extends AppError {}
+
+function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
+  return issues
+    .map((issue) => {
+      const path = issue.path.map((seg) => String(seg)).join('.');
+      return path.length > 0 ? `${path}：${issue.message}` : issue.message;
+    })
+    .join('；');
+}
+
+/**
+ * 用工具**自己的** schema 校验一次参数。
+ *
+ * 这条检查存在，是因为命令行这条路上没有别人会做它：stdio 与 HTTP 两个入口的
+ * 参数校验发生在 MCP SDK 里——SDK 拿 `inputSchema` 解析完再调 handler——而 CLI
+ * 直接调 `collectTools` 收集到的那个 handler，SDK 那一层根本不在路径上。于是同一批
+ * handler 在两个入口有前置条件、在第三个入口没有，而它们是**按"有"写的**：
+ * `{"limit":"five"}` 只是看得见的那一角，真正没有症状的是拿字符串去做算术或索引。
+ *
+ * `z.strictObject(tool.config.inputSchema)` 不是 schema 的第二份副本，它**就是**那份
+ * schema——`inputSchema` 是 ZodRawShape，工具注册时交给 SDK 的也是同一个对象。
+ *
+ * 用 strict 而不是默认的剥离行为：多出来的键必须**拒绝**，不能悄悄丢掉。丢掉一个
+ * 参数正是这一阶段反复在清除的那种"看起来成功了、其实干了别的事"。上游两条路
+ * （`flags.ts` 只按 schema 生成 flag；`batch.ts` 的整批校验查键名）都已经挡过一次，
+ * 所以这里的 strict 是一道**永远不该被触发的兜底**——真触发了，说明上游漏了。
+ */
+export function validateToolArgs(tool: CollectedTool, args: Record<string, unknown>): Record<string, unknown> {
+  const schema = z.strictObject(tool.config.inputSchema);
+  const result = schema.safeParse(args);
+  if (result.success) {
+    // 返回解析结果而不是原始对象，是为了和 MCP 入口拿到的东西一致：SDK 交给
+    // handler 的就是解析产物。今天两者在结构上完全相同（25 个工具的 schema 里
+    // 没有任何 default/transform/coerce），所以这不改变任何现有行为；但日后
+    // 谁给某个字段加了 `.default()`，CLI 会和 MCP 一样应用它，而不是悄悄分叉。
+    return result.data as Record<string, unknown>;
+  }
+  throw new ToolArgsError('INVALID_INPUT', `工具 ${tool.name} 的参数不合法：${describeIssues(result.error.issues)}`, {
+    hint: `用 cli ${tool.name} --help 查看该工具接受哪些参数；参数没通过校验时工具没有被执行`,
+  });
+}
+
+/**
  * 调一次工具 handler，并把 MCP 的 content 信封拆成 `ExecuteResult`。
  *
  * 单独抽出来是因为批量模式（`batch.ts`）要在**同一个**会话里连着调很多次，
@@ -76,7 +126,12 @@ function parseToolJson(toolName: string, text: string): unknown {
  * 会有一份漏掉其中一种，而漏掉的那种在这里的表现是 `undefined` 静默流到 stdout。
  */
 export async function invokeTool(tool: CollectedTool, args: Record<string, unknown>): Promise<ExecuteResult> {
-  const result = await tool.handler(args);
+  // 校验放在这里、而不是各调用方各写一遍：一次性模式（executeOnce）、批量模式
+  // （batch.ts）和守护进程（daemon.ts）三条路全部经过这一个函数，这是 CLI 里
+  // 唯一一个"handler 即将被调用"的收口点。而且它在 session_id 注入**之后**——
+  // 注入进去的那个值也要像别的参数一样被检查，不能成为全场唯一没人验过的字段。
+  const checked = validateToolArgs(tool, args);
+  const result = await tool.handler(checked);
   const first = result.content[0];
   if (!first) {
     throw new AppError('INTERNAL', `工具 ${tool.name} 返回了空的 content`);

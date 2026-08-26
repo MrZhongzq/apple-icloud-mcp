@@ -326,6 +326,26 @@ describe('runBatch', () => {
     expect(out.map((o) => o.ok)).toEqual([true]);
   });
 
+  it('rejects a wrong-typed args value up front, before any op runs', async () => {
+    const { map, calls } = makeTools();
+    const { factory } = makeSessionFactory();
+    map.set('mail_search', {
+      name: 'mail_search',
+      config: { description: 'x', inputSchema: { session_id: z.string(), limit: z.number().optional() } },
+      handler: async () => ({ content: [{ type: 'text', text: '{}' }] }),
+    });
+    // 值的类型校验和工具名校验是同一条规则的两半：第三条的类型错误不能等前两条
+    // 真的执行完才被发现。而且这是**抛出去**（退出码 1，工具没跑），不是变成
+    // 一条 ok:false 的 outcome（退出码 2，那是 iCloud 的回答）。
+    await expect(
+      runBatch({ config, logger, tools: map, sessionFactory: factory }, [
+        { tool: 'apple_accounts' },
+        { tool: 'mail_search', args: { limit: 'five' } },
+      ]),
+    ).rejects.toThrow(/limit/);
+    expect(calls, '整批带类型错误时，前面那条合法操作也一次都不该执行').toEqual([]);
+  });
+
   it('returns an empty result for an empty op list without touching a session', async () => {
     const { map } = makeTools();
     const { factory, created } = makeSessionFactory();

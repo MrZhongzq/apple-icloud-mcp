@@ -1,6 +1,6 @@
 import { findAccount } from '../core/config.js';
 import { AppError, toErrorPayload } from '../core/errors.js';
-import { defaultSessionFactory, invokeTool } from './execute.js';
+import { defaultSessionFactory, invokeTool, validateToolArgs } from './execute.js';
 import { CLI_MANAGED_SESSION_TOOLS, SESSION_MANAGED_MESSAGE, multiAccountRefusal } from './dispatch.js';
 import type { SessionFactory, CliSessionStore } from './execute.js';
 import type { AppConfig } from '../core/config.js';
@@ -211,11 +211,22 @@ export async function runBatch(deps: RunBatchDeps, ops: readonly BatchOp[], opts
 
   const outcomes: BatchOutcome[] = [];
   try {
-    for (const { op, tool, needsSession } of planned) {
+    // 第二遍整批校验，这次带上已经注入的 session_id，对着工具**自己的** schema 走一遍。
+    // 为什么要在循环之前单独跑一遍，而不是靠 `invokeTool` 里那次：`invokeTool` 是
+    // 逐条调用时才校验的，第三条的类型错误要等前两条**真的执行完**才会被发现——正是
+    // 这个模块开头那段"整批先校验"的注释在讲的东西，只不过换成了值的类型而不是工具名。
+    // 参数没通过校验时工具没有被执行，所以这里是抛出去（退出码 1），不是变成一条
+    // ok:false 的 outcome（退出码 2）。
+    const argsFor = planned.map(({ op, tool, needsSession }) => {
       const args: Record<string, unknown> = { ...op.args };
       if (needsSession && sessionId !== undefined) {
         args.session_id = sessionId;
       }
+      return validateToolArgs(tool, args);
+    });
+
+    for (const [index, { op, tool }] of planned.entries()) {
+      const args = argsFor[index] ?? {};
 
       let outcome: BatchOutcome;
       try {

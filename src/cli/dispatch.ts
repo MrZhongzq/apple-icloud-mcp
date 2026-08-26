@@ -248,6 +248,12 @@ export async function runCliDaemonFirst(deps: RunCliDaemonDeps, argv: string[]):
   }
 
   if (daemonResult) {
+    // 参数没通过工具自己的 schema：工具没跑，这是用法错误（1），不是 iCloud 的
+    // 回答（2）。一次性路径上这类失败是 executeAndFormat 的 catch 收的，同样是 1；
+    // 两条路必须给出同一个退出码，否则同一条命令会因为"有没有 cli start"而分叉。
+    if (daemonResult.usageError) {
+      return { exitCode: 1, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
+    }
     if (daemonResult.isError) {
       return { exitCode: 2, stdout: '', stderr: JSON.stringify(daemonResult.value, null, 2) + NEWLINE };
     }

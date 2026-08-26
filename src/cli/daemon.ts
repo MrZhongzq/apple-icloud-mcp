@@ -8,6 +8,7 @@ import { createSessionStore } from '../core/session.js';
 import { createProviders } from '../providers/icloud/index.js';
 import { findAccount } from '../core/config.js';
 import { collectTools } from './registry.js';
+import { invokeTool, ToolArgsError } from './execute.js';
 import { listCliTools } from './dispatch.js';
 import {
   canUseUnixSocket,
@@ -185,7 +186,10 @@ export async function startDaemon(deps: {
     return (error as { code?: unknown }).code === 'SESSION_EXPIRED';
   }
 
-  async function handleRequest(req: WireRequest, retried = false): Promise<{ value: unknown; isError: boolean }> {
+  async function handleRequest(
+    req: WireRequest,
+    retried = false,
+  ): Promise<{ value: unknown; isError: boolean; usageError?: boolean }> {
     try {
       const tool = tools.get(req.tool);
       if (!tool) {
@@ -195,29 +199,38 @@ export async function startDaemon(deps: {
       if ('session_id' in tool.config.inputSchema) {
         args.session_id = session.id;
       }
-      const result = await tool.handler(args);
-      const first = result.content[0];
-      if (!first) {
-        throw new AppError('INTERNAL', `工具 ${req.tool} 返回了空的 content`);
-      }
-      const value: unknown = JSON.parse(first.text);
+      // 走 invokeTool 而不是直接 tool.handler：那里是 CLI 三条执行路径共用的收口点，
+      // 参数校验（对着工具自己的 schema）和 content 信封的拆解都在那一处。早先这里
+      // 自己复制了一遍拆信封的代码、并且**不做任何参数校验**——于是同一条命令，
+      // 跑了 cli start 的时候没有校验、没跑的时候有，一个只在常驻模式下存在的漏洞。
+      const invoked = await invokeTool(tool, args);
+      const value: unknown = invoked.value;
+      const result = { isError: invoked.isError };
 
       // 常驻会话可能比 SESSION_TTL_MINUTES 活得更久——把 TTL 设得比空闲超时
       // 更短是完全合理的加固选择，不该因此把 daemon 变成一个每次都报
       // SESSION_EXPIRED、提示"调用 apple_login"（CLI 明确拒绝的工具）的死
       // 胡同，直到 15 分钟空闲超时替用户收场。这里自己重建一次会话再重试，
       // 对调用方完全透明；只重试一次，不递归，真出问题就正常报错。
-      if (result.isError === true && !retried && isSessionExpiredPayload(value)) {
+      if (result.isError && !retried && isSessionExpiredPayload(value)) {
         await sessions.destroy(session.id).catch(() => undefined);
         session = sessions.create(account);
         return handleRequest(req, true);
       }
 
-      return { value, isError: result.isError === true };
+      return { value, isError: result.isError };
     } catch (err) {
       // 未知工具、空 content 等 daemon 自己发现的问题，和工具内部已经被 wrapTool
       // 捕获过的错误统一走同一条 toErrorPayload——调用方（callDaemon）不需要
       // 区分"工具报的错"和"daemon 层发现的错"，两者对它而言都是一次失败的调用。
+      //
+      // 唯一需要过线的区别是"参数没通过校验"：工具**根本没跑**，那是一次用法错误
+      // （退出码 1），不是 iCloud 的回答（退出码 2）。不带这个标志的话，同一条写错
+      // 参数的命令会因为"有没有跑 cli start"而落在两个不同的退出码上，而脚本正是
+      // 按退出码分支的。
+      if (err instanceof ToolArgsError) {
+        return { value: toErrorPayload(err), isError: true, usageError: true };
+      }
       return { value: toErrorPayload(err), isError: true };
     }
   }

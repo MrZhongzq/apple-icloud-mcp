@@ -10,6 +10,7 @@ import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig } from '../../../src/core/config.js';
 import type { CollectedTool } from '../../../src/cli/registry.js';
 import type { SessionFactory } from '../../../src/cli/execute.js';
+import { z } from 'zod';
 
 /**
  * "先试守护进程、连不上再退回一次性模式" 是 daemon 存在的全部意义——省下的是
@@ -71,7 +72,24 @@ function localToolsWithProbe(): { tools: Map<string, CollectedTool>; calls: () =
       return { content: [{ type: 'text', text: JSON.stringify([{ email: 'local-fallback@icloud.com' }]) }] };
     },
   };
-  return { tools: new Map([['apple_accounts', appleAccounts]]), calls: () => calls };
+  // 本地这份 mail_search 的 schema 只需要宽松到能让 flags.ts 把 --query 解析成
+  // 一块 JSON；真正做类型校验的是 daemon 自己那份真实 schema（query.unseen 是
+  // boolean）。两份故意不同，这条测试测的就是"daemon 那边会不会校验"。
+  const mailSearch: CollectedTool = {
+    handler: async () => ({ content: [{ type: 'text', text: JSON.stringify({ messages: [] }) }] }),
+    name: 'mail_search',
+    config: {
+      description: 'x',
+      inputSchema: { session_id: z.string(), query: z.object({ unseen: z.unknown().optional() }).optional() },
+    },
+  };
+  return {
+    tools: new Map([
+      ['apple_accounts', appleAccounts],
+      ['mail_search', mailSearch],
+    ]),
+    calls: () => calls,
+  };
 }
 
 let dir: string;
@@ -102,6 +120,27 @@ describe('runCliDaemonFirst', () => {
     const value = JSON.parse(outcome.stdout) as Array<{ email: string }>;
     expect(value[0]?.email, '结果必须来自 daemon 的真实账号数据，不是本地的一次性 fallback').toBe('a@icloud.com');
     expect(calls(), '守护进程在跑时，本地一次性 handler 绝不该被调用——那正是常驻模式本该省掉的握手').toBe(0);
+  });
+
+  it('a schema violation served by the daemon exits 1, not 2 — the tool never ran', async () => {
+    // 参数校验是 MCP SDK 在另外两个入口替 handler 做的前置条件；CLI 直接调
+    // handler，所以这条检查现在在 invokeTool 里，而 daemon 也必须走那里。
+    // 退出码必须是 1（用法错误，工具没跑），不是 2（iCloud 的回答）——否则同一条
+    // 写错参数的命令会因为"有没有跑过 cli start"落在两个不同的退出码上，而脚本
+    // 正是按退出码分支的。
+    handle = await startDaemon({ config, logger, files });
+
+    const { tools, calls } = localToolsWithProbe();
+    const outcome = await runCliDaemonFirst({ config, logger, tools, sessionFactory: fakeSessionFactory(), files }, [
+      'mail_search',
+      '--query',
+      '{"unseen":"yes"}',
+    ]);
+
+    expect(outcome.exitCode, 'daemon 那边参数没过校验 → 用法错误 → 1').toBe(1);
+    expect(outcome.stdout, '工具没跑，stdout 上不该有结果').toBe('');
+    expect(outcome.stderr).toContain('unseen');
+    expect(calls(), '不能因为一次用法错误就落回一次性模式重跑一遍').toBe(0);
   });
 
   it('falls back to the local one-shot handler when no daemon is reachable', async () => {

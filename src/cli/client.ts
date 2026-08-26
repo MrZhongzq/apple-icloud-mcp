@@ -25,6 +25,9 @@ export interface ClientTimeouts {
 interface WireResult {
   value: unknown;
   isError: boolean;
+  /** 参数没通过工具自己的 schema：工具根本没跑，这是用法错误而不是工具的回答。
+   *  见 daemon.ts 里设置它的地方。老 daemon 不发这个字段，读作 false 即可。 */
+  usageError?: boolean;
 }
 
 function isWireResult(value: unknown): value is WireResult {
@@ -195,11 +198,21 @@ export function roundTrip(socket: net.Socket, payload: unknown, timeoutMs?: numb
  * 一次性模式，用户体验是"命令行变慢了"，却没有任何线索指向原因；但别的
  * 连接失败（`EMFILE` 等）清理端点文件则可能把一个活的 daemon 变成孤儿。
  */
+/**
+ * `callDaemon` 的结果：`ExecuteResult` 再加一个"这是用法错误"的标志。
+ * 单独一个类型而不是把 `usageError` 塞进 `ExecuteResult`，是因为只有守护进程
+ * 这条路需要它——另外两条路上参数校验失败是直接抛出来的（`ToolArgsError`），
+ * 根本没有"用一个返回值表示它"的必要。
+ */
+export interface DaemonResult extends ExecuteResult {
+  usageError: boolean;
+}
+
 export async function callDaemon(
   req: CallRequest,
   files?: EndpointFiles,
   timeouts?: ClientTimeouts,
-): Promise<ExecuteResult | undefined> {
+): Promise<DaemonResult | undefined> {
   const f = files ?? endpointFiles();
   const endpoint = await readEndpoint(f);
   if (!endpoint) return undefined;
@@ -215,7 +228,11 @@ export async function callDaemon(
 
   const outcome = await roundTrip(attempt.socket, wire, timeouts?.roundTripMs);
   if (outcome.kind === 'ok') {
-    return { value: outcome.value.value, isError: outcome.value.isError };
+    return {
+      value: outcome.value.value,
+      isError: outcome.value.isError,
+      usageError: outcome.value.usageError === true,
+    };
   }
   if (outcome.kind === 'rejected') {
     throw new AppError('AUTH_FAILED', `守护进程拒绝了这次请求：${outcome.message}`, {
