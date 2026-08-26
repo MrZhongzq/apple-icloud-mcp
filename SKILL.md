@@ -1,6 +1,6 @@
 ---
 name: apple-icloud-mcp-skill
-description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts, over stdio or remote Streamable HTTP + OAuth).
+description: Usage contract for AI clients calling the Apple iCloud MCP server (Mail + Calendar + Reminders + Contacts, over stdio or remote Streamable HTTP + OAuth), including the rules that replace it when running unattended in a scheduled routine.
 ---
 
 # Apple iCloud MCP Server — AI Client Contract
@@ -116,6 +116,26 @@ Every failed call returns `{ error: { code, message, hint?, retryable } }` with 
 | `RATE_LIMITED` | iCloud is throttling requests. | Wait briefly and retry; `retryable` is `true`. Do not tight-loop. |
 | `UPSTREAM_ERROR` | iCloud itself is unavailable or returned an unexpected error. | If `retryable` is `true`, retry once after a short delay; otherwise report the failure to the user. |
 | `INTERNAL` | Unexpected server-side failure. | Do not retry more than once. Report the failure; details are intentionally not exposed here (they're in the server's stderr log). |
+
+## Running unattended (routines, schedules, background jobs)
+
+Everything above assumes a person is reading your output and can answer a question. In a scheduled routine nobody is. The rules below replace, not supplement, the "tell the user" wording in the error table when you are running unattended.
+
+**There is nobody to ask, so never wait for an answer.** If a decision would normally need confirmation, either take the safe branch and say so in your output, or stop and report. Do not proceed on a guess and do not stall.
+
+**Always reach `work_done`, including on failure.** A session holds a live IMAP connection. If you abandon a run without calling it, that connection stays open until the idle TTL expires, and a routine that runs every hour with a 30-minute TTL will stack sessions. Treat it the way you would a `finally` block: whatever happened, close the session before your run ends.
+
+**One login per run.** `session_id` does not survive between runs — a routine that stored one from last time will get `SESSION_EXPIRED` on its first call. Call `apple_login` at the start of each run and `work_done` at the end of it.
+
+**Writes need a guard against repeating themselves.** A routine runs again tomorrow with the same instructions. Nothing in this server deduplicates, so "create an event for the standup" run daily creates a new event daily. Before any create, search for what you are about to create and skip if it is already there. If you cannot search for it reliably, prefer reporting what you would have created over creating it.
+
+**Failure is a report, not a retry loop.** The recovery column tells you when a retry is appropriate (`retryable: true`, `SESSION_EXPIRED` after a fresh login) and those still apply — once. Everything else ends the run with a clear statement of what failed and what a human would need to do. Repeatedly hammering a failing call across scheduled runs is how an account gets rate-limited or locked.
+
+**Errors that need a human are the end of the run.** `AUTH_FAILED` means the App-Specific Password is dead — every later run will fail the same way, so say exactly that rather than retrying. `PERMISSION_DENIED` naming an environment variable means the server's configuration has to change and be restarted; no amount of retrying inside the routine will help. In both cases, name the specific thing a person must do.
+
+**The first `contacts_search` in a session is slow by design.** iCloud cannot filter contacts server-side, so the first call pulls everything into a session-local cache — measured at about 4.5 seconds for 1,429 contacts, with later searches in the same session around 0.4 seconds. Do not treat that first call as a hang or a timeout, and do not retry it while it is running.
+
+**Prefer reads, and be explicit about writes.** A routine that only reads is safe to run on any schedule. A routine that writes is changing the user's real mail, calendar, reminders, or contacts on a timer they are not watching. Say in your output exactly what you changed — what was created, modified, or deleted, with the ids — so the run is auditable after the fact.
 
 ## Not supported
 
