@@ -98,8 +98,10 @@ export function createSmtpProvider(account: AccountConfig, deps: SmtpProviderDep
         });
         return {
           messageId: info.messageId,
-          accepted: info.accepted.map(String),
-          rejected: info.rejected.map(String),
+          // nodemailer 10 自带的通用 SentMessageInfo 把这两项声明为可选（它覆盖所有 transport）；
+          // SMTP transport 实际总会给出，缺省按空数组处理。
+          accepted: (info.accepted ?? []).map(String),
+          rejected: (info.rejected ?? []).map(String),
         };
       } catch (err) {
         throw mapSmtpError(err);
