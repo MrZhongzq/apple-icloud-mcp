@@ -35,9 +35,18 @@ export interface CalDavProvider {
  * "重新调用 calendar_list_events" 指向的是一个根本不存在的工具。需要给恢复提示时就把
  * 两个列举类工具都点名，让模型用手上有的那个。
  */
+/**
+ * tsdav 登录（createDAVClient）遇到 401 时抛的是**不带 status** 的普通 Error，消息形如
+ * "Invalid credentials: PROPFIND https://caldav.icloud.com/ returned 401 Unauthorized"。
+ * 只看 status 的话，密码失效会落进兜底分支，被报成 retryable 的 "CalDAV 操作失败"。
+ */
+const TSDAV_LOGIN_401 = /^Invalid credentials: .* returned 401\b/;
+
 export function mapCalDavError(err: unknown): AppError {
   if (err instanceof AppError) return err;
-  const status = (err as { status?: number }).status;
+  const status =
+    (err as { status?: number }).status ??
+    (err instanceof Error && TSDAV_LOGIN_401.test(err.message) ? 401 : undefined);
 
   if (status === 401) {
     return new AppError('AUTH_FAILED', 'iCloud 拒绝了 CalDAV 访问凭据', {

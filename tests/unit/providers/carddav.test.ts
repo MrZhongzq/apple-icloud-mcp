@@ -227,6 +227,22 @@ describe('createCardDavProvider', () => {
     expect((err as AppError).hint ?? '').toContain('contacts_');
   });
 
+  // 真实 tsdav 登录遇到 401 时抛的是不带 status 的普通 Error（消息逐字取自 tsdav 2.3.1 对真实
+  // iCloud 的输出）。只看 status 的映射会把密码失效报成 retryable 的 "CardDAV 操作失败"。
+  it("maps tsdav's status-less login 401 to AUTH_FAILED, not a retryable UPSTREAM_ERROR", async () => {
+    const provider = createCardDavProvider({
+      account,
+      createClient: vi
+        .fn()
+        .mockRejectedValue(
+          new Error('Invalid credentials: PROPFIND https://contacts.icloud.com/ returned 401 Unauthorized'),
+        ) as never,
+    });
+    const err = await provider.listAddressBooks().catch((e: unknown) => e as AppError);
+    expect((err as AppError).code).toBe('AUTH_FAILED');
+    expect((err as AppError).retryable).toBe(false);
+  });
+
   it('turns a rejected fetch into a retryable UPSTREAM_ERROR', async () => {
     const provider = providerWith(
       fakeClient({ fetchAddressBooks: vi.fn().mockRejectedValue(new Error('socket hang up')) }),

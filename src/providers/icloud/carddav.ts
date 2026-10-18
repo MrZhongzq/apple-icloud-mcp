@@ -41,9 +41,14 @@ export interface CardDavProvider {
  * 阶段 2a 的整分支审查发现 caldav.ts 的提示全是日历口径，导致提醒事项失败时
  * 指引模型去调一个未注册的日历工具。这里从一开始就只提通讯录。
  */
+/** 与 caldav.ts 同一处 tsdav 行为：登录 401 抛的是不带 status 的普通 Error，需从消息认出来。 */
+const TSDAV_LOGIN_401 = /^Invalid credentials: .* returned 401\b/;
+
 export function mapCardDavError(err: unknown): AppError {
   if (err instanceof AppError) return err;
-  const status = (err as { status?: number }).status;
+  const status =
+    (err as { status?: number }).status ??
+    (err instanceof Error && TSDAV_LOGIN_401.test(err.message) ? 401 : undefined);
 
   if (status === 401) {
     return new AppError('AUTH_FAILED', 'iCloud 拒绝了 CardDAV 访问凭据', {

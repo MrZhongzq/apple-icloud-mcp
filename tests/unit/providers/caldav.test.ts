@@ -8,6 +8,23 @@ describe('mapCalDavError', () => {
     expect(mapped.code).toBe('AUTH_FAILED');
   });
 
+  // 上一条喂的是 { status: 401 }——真实 tsdav 在登录路径上从不产生这种对象。createDAVClient
+  // 遇到 401 抛的是一个不带 status 的普通 Error（下面的消息逐字取自 tsdav 2.3.1 对真实 iCloud
+  // 的输出），于是密码失效被报成 retryable 的 UPSTREAM_ERROR "CalDAV 操作失败"，让调用方去重试
+  // 一个重试多少次都不会好的错误。这条测试用真实形状，而不是自带被测性质的 fixture。
+  it("maps tsdav's status-less login 401 to AUTH_FAILED, not a retryable UPSTREAM_ERROR", () => {
+    const mapped = mapCalDavError(
+      new Error('Invalid credentials: PROPFIND https://caldav.icloud.com/ returned 401 Unauthorized'),
+    );
+    expect(mapped.code).toBe('AUTH_FAILED');
+    expect(mapped.retryable).toBe(false);
+  });
+
+  it('leaves other status-less discovery failures as UPSTREAM_ERROR', () => {
+    const mapped = mapCalDavError(new Error('cannot find principalUrl'));
+    expect(mapped.code).toBe('UPSTREAM_ERROR');
+  });
+
   it('maps 403 to PERMISSION_DENIED with a hint distinct from the env-var-capability hint (I6)', () => {
     // The service layer uses the same PERMISSION_DENIED code for a disabled capability,
     // with a hint naming an env var -- that advice is wrong for a server-side 403 on one
