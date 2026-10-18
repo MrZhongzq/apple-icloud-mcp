@@ -8,6 +8,16 @@ CLI 最多暴露 **23 个工具**：与 MCP 入口完全相同的那 25 个，�
 
 ---
 
+## 〇、先确认沙盒连得上 iCloud
+
+云端沙盒的出网经过代理和域名白名单，而邮件走的 IMAP（993）和 SMTP（587）不是 HTTPS——**能不能连上，取决于环境，不取决于这份代码**。第一次在一个新环境里用之前，先跑一次探针：
+
+```bash
+node scripts/probe-network.mjs     # 不需要 npm ci，不需要 .env，不登录、不读凭据的值
+```
+
+它分别测直连、经代理 CONNECT、原生 fetch（含 `NODE_USE_ENV_PROXY=1`）三条路，最后给出结论：邮件和日历/提醒/通讯录各自能不能用、要不要改配置或改代码。登录后 CalDAV/CardDAV 会跳到 `pNN-caldav.icloud.com` 这类主机，所以白名单要写 `*.icloud.com` 通配。
+
 ## 一、跑起来
 
 沙盒里从零开始，五步：
