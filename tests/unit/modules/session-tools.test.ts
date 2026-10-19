@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { registerSessionTools } from '../../../src/modules/session/tools.js';
 import { createLogger } from '../../../src/core/logger.js';
-import { loadConfig, type AppConfig } from '../../../src/core/config.js';
+import { accountFromEnvelopeEnv, loadConfig, type AppConfig } from '../../../src/core/config.js';
 import { AppError } from '../../../src/core/errors.js';
 import type { ToolConfig, ToolResult } from '../../../src/server/types.js';
 import type { SessionStore } from '../../../src/core/session.js';
@@ -373,6 +373,109 @@ describe('apple_login / apple_accounts in remote mode', () => {
     expect(openEnvelope).toHaveBeenCalledWith('ame1.sealed');
     expect(store.create).toHaveBeenCalledWith(envelopeAccount, undefined, undefined);
     expect(JSON.parse(result.content[0]!.text).account).toBe('friend@icloud.com');
+  });
+
+  // 能力全关时的提示要按来源说：env 账号改服务器的环境变量再重启；信封账号只能改自己的 .env、
+  // 重新生成信封——叫一个信封用户去「重启服务」，他既做不到，也没用。
+  it('the no-capability hint is origin-aware, and the env wording is unchanged', async () => {
+    const nothingEnv = {
+      ICLOUD_ACCOUNT_1: 'me@icloud.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ALLOW_MAIL_READ_1: 'false',
+      ALLOW_CALENDAR_READ_1: 'false',
+      ALLOW_REMINDERS_READ_1: 'false',
+      ALLOW_CONTACTS_READ_1: 'false',
+    };
+    const nothing = loadConfig(nothingEnv);
+
+    const envSide = collect();
+    registerSessionTools(envSide.server, {
+      sessions: makeSessions(healthyProviders(), nothing).store,
+      logger: silentLogger,
+      config: nothing,
+    });
+    const envError = JSON.parse((await envSide.tools.get('apple_login')!.handler({})).content[0]!.text).error;
+    expect(envError.code).toBe('PERMISSION_DENIED');
+    expect(envError.message).toBe('账号 me@icloud.com 没有开启任何能力，登录没有意义');
+    expect(envError.hint).toBe(
+      '至少把 ALLOW_MAIL_READ_n / ALLOW_CALENDAR_READ_n / ALLOW_REMINDERS_READ_n / ALLOW_CONTACTS_READ_n 之一设为 true 后重启服务',
+    );
+
+    const lines: string[] = [];
+    const envelopeAccount = { ...nothing.accounts[0]!, email: 'friend@icloud.com', label: 'friend@icloud.com', origin: 'envelope' as const };
+    const envelopeSide = collect();
+    const { store } = makeSessions(healthyProviders(), nothing);
+    registerSessionTools(envelopeSide.server, {
+      sessions: store,
+      logger: createLogger('debug', (line) => lines.push(line)),
+      config: nothing,
+      remote: { envAccountsEnabled: () => false, openEnvelope: () => ({ account: envelopeAccount, notices: [] }) },
+    });
+    const result = await envelopeSide.tools.get('apple_login')!.handler({ envelope: 'ame1.sealed' });
+    const envelopeError = JSON.parse(result.content[0]!.text).error;
+    expect(envelopeError.code).toBe('PERMISSION_DENIED');
+    expect(envelopeError.hint).toBe(
+      '在你自己的 .env 里把 ALLOW_MAIL_READ_1 / ALLOW_CALENDAR_READ_1 / ALLOW_REMINDERS_READ_1 / ALLOW_CONTACTS_READ_1 至少之一设为 true，重新生成信封后再登录',
+    );
+    expect(envelopeError.hint).not.toContain('重启服务');
+    expect(store.create).not.toHaveBeenCalled();
+    // 这条消息会经 wrapTool 进日志：信封账号的邮箱（label 默认就是邮箱）不能跟着进去。
+    expect(lines.join('\n')).not.toContain('friend@icloud.com');
+  });
+
+  it('a successful envelope login never logs the account email', async () => {
+    const lines: string[] = [];
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    const envelopeAccount = { ...config.accounts[0]!, email: 'friend@icloud.com', label: 'friend@icloud.com', origin: 'envelope' as const };
+    registerSessionTools(server, {
+      sessions: store,
+      logger: createLogger('debug', (line) => lines.push(line)),
+      config,
+      remote: { envAccountsEnabled: () => false, openEnvelope: () => ({ account: envelopeAccount, notices: [] }) },
+    });
+
+    const result = await tools.get('apple_login')!.handler({ envelope: 'ame1.sealed' });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0]!.text).account, '调用方自己仍然看得到').toBe('friend@icloud.com');
+    const loginLine = lines.find((line) => line.includes('"login ok"'));
+    expect(loginLine).toBeDefined();
+    expect(JSON.parse(loginLine!).meta).toEqual({ origin: 'envelope', session: 'session-abc' });
+    expect(lines.join('\n')).not.toContain('friend@icloud.com');
+  });
+
+  it('an env login still logs the account as before', async () => {
+    const lines: string[] = [];
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, { sessions: store, logger: createLogger('debug', (line) => lines.push(line)), config });
+    await tools.get('apple_login')!.handler({});
+    const loginLine = lines.find((line) => line.includes('"login ok"'));
+    expect(JSON.parse(loginLine!).meta).toEqual({ account: 'me@icloud.com', session: 'session-abc' });
+  });
+
+  // 端到端走一遍真的解析：信封里一个写错的邮箱，错误照样回给调用方，但日志里只有变量名。
+  it('an envelope whose account fails to parse keeps the value out of the logs', async () => {
+    const lines: string[] = [];
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, {
+      sessions: store,
+      logger: createLogger('debug', (line) => lines.push(line)),
+      config,
+      remote: {
+        envAccountsEnabled: () => false,
+        openEnvelope: () =>
+          accountFromEnvelopeEnv({ ICLOUD_ACCOUNT_1: 'typo-secret-value', ICLOUD_APP_PASSWORD_1: 'fake-pass' }),
+      },
+    });
+
+    const result = await tools.get('apple_login')!.handler({ envelope: 'ame1.sealed' });
+    const error = JSON.parse(result.content[0]!.text).error;
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.message).toBe('信封里的 ICLOUD_ACCOUNT_1 不是合法邮箱');
+    expect(lines.some((line) => line.includes('ICLOUD_ACCOUNT_1')), '日志里仍然看得出是哪个变量').toBe(true);
+    expect(lines.join('\n')).not.toContain('typo-secret-value');
   });
 
   it('an envelope login carries the notices the opener produced', async () => {

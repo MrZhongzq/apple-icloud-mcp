@@ -74,15 +74,32 @@ function clean(raw: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * parseAccount 里那几条会把变量的**值**写进消息的错误。对 env 账号它就是一个普通的 AppError，
+ * 消息与以前逐字相同——值是部署者自己的配置，写进 stderr 有助于排查。信封账号不一样：值来自
+ * 解密后的载荷，而 wrapTool 会把 AppError 的 message 原样记进日志，所以 accountFromEnvelopeEnv
+ * 接住它，换成一条只点名变量的消息。带上 variable/problem 是为了不必回头去解析中文消息。
+ */
+class EnvValueError extends AppError {
+  readonly variable: string;
+  readonly problem: string;
+
+  constructor(variable: string, problem: string, message: string, hint?: string) {
+    super('INVALID_INPUT', message, hint === undefined ? {} : { hint });
+    this.variable = variable;
+    this.problem = problem;
+  }
+}
+
+const BOOL_HINT = '只接受 true/false（或 1/0、yes/no）';
+
 function readBool(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {
   const raw = clean(env[key]);
   if (raw === undefined) return fallback;
   const lowered = raw.toLowerCase();
   if (lowered === 'true' || lowered === '1' || lowered === 'yes') return true;
   if (lowered === 'false' || lowered === '0' || lowered === 'no') return false;
-  throw new AppError('INVALID_INPUT', `环境变量 ${key} 的值无法识别：${raw}`, {
-    hint: '只接受 true/false（或 1/0、yes/no）',
-  });
+  throw new EnvValueError(key, '的值无法识别', `环境变量 ${key} 的值无法识别：${raw}`, BOOL_HINT);
 }
 
 function readInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -129,7 +146,7 @@ function parseAccount(
     });
   }
   if (!emailSchema.safeParse(email).success) {
-    throw new AppError('INVALID_INPUT', `ICLOUD_ACCOUNT${suffix} 不是合法邮箱：${email}`);
+    throw new EnvValueError(`ICLOUD_ACCOUNT${suffix}`, '不是合法邮箱', `ICLOUD_ACCOUNT${suffix} 不是合法邮箱：${email}`);
   }
 
   const sender = clean(env[`ICLOUD_SENDER${suffix}`]) ?? email;
@@ -233,7 +250,20 @@ export function accountFromEnvelopeEnv(env: Record<string, unknown>): { account:
     const value = env[key];
     if (typeof value === 'string') filtered[key] = value;
   }
-  const parsed = parseAccount(filtered, 1);
+  let parsed: ReturnType<typeof parseAccount>;
+  try {
+    parsed = parseAccount(filtered, 1);
+  } catch (err) {
+    // 同一个错误码、同一个变量名，只是不带值：信封载荷不能经 wrapTool 的日志漏出去。
+    // 其余 parseAccount 错误（缺账号、缺密码）本来就只含变量名，原样抛出。
+    if (err instanceof EnvValueError) {
+      const fix = `在你自己的 .env 里改好 ${err.variable} 后重新生成信封`;
+      throw new AppError(err.code, `信封里的 ${err.variable} ${err.problem}`, {
+        hint: err.hint === undefined ? fix : `${err.hint}；${fix}`,
+      });
+    }
+    throw err;
+  }
   if (!parsed) {
     throw new AppError('INVALID_INPUT', '信封里没有账号信息', {
       hint: '确认 .env 里设置了 ICLOUD_ACCOUNT_1 与 ICLOUD_APP_PASSWORD_1 后重新生成信封',

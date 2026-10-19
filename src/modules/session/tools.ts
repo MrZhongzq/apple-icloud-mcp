@@ -122,6 +122,13 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       const needsCardDav = caps.contactsRead || caps.contactsWrite;
 
       if (!needsImap && !needsCalDav && !needsCardDav) {
+        // 信封账号：变量在用户自己的 .env 里，「重启服务」既做不到也没用（与 capabilityHint 同一口径）；
+        // 消息也不带 label——它默认就是邮箱，而 wrapTool 会把这条消息记进日志。
+        if (account.origin === 'envelope') {
+          throw new AppError('PERMISSION_DENIED', '信封里的账号没有开启任何能力，登录没有意义', {
+            hint: '在你自己的 .env 里把 ALLOW_MAIL_READ_1 / ALLOW_CALENDAR_READ_1 / ALLOW_REMINDERS_READ_1 / ALLOW_CONTACTS_READ_1 至少之一设为 true，重新生成信封后再登录',
+          });
+        }
         throw new AppError('PERMISSION_DENIED', `账号 ${account.label} 没有开启任何能力，登录没有意义`, {
           hint: '至少把 ALLOW_MAIL_READ_n / ALLOW_CALENDAR_READ_n / ALLOW_REMINDERS_READ_n / ALLOW_CONTACTS_READ_n 之一设为 true 后重启服务',
         });
@@ -141,7 +148,11 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
         throw err;
       }
 
-      logger.info('login ok', { account: account.email, session: session.id });
+      // 信封账号的邮箱来自解密后的载荷，不进日志；env 账号是部署者自己的配置，照旧记下。
+      logger.info(
+        'login ok',
+        account.origin === 'envelope' ? { origin: 'envelope', session: session.id } : { account: account.email, session: session.id },
+      );
       return {
         session_id: session.id,
         account: account.email,

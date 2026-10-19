@@ -74,6 +74,56 @@ describe('accountFromEnvelopeEnv', () => {
   });
 });
 
+// 信封里的值是解密后的载荷，一个字节都不能进日志；而 wrapTool 会把 AppError 的 message 原样记下来。
+// 所以信封账号解析失败时，错误消息只能点名变量，不能带出它的值。env 账号的消息保持原样（下一组）。
+describe('accountFromEnvelopeEnv error messages name the variable, never its value', () => {
+  const catchError = (env: Record<string, unknown>) => {
+    try {
+      accountFromEnvelopeEnv(env);
+    } catch (err) {
+      return err as { code?: string; message: string; hint?: string };
+    }
+    throw new Error('expected accountFromEnvelopeEnv to throw');
+  };
+
+  it('a bad email', () => {
+    const err = catchError({ ICLOUD_ACCOUNT_1: 'not-an-email-secret-value', ICLOUD_APP_PASSWORD_1: 'p' });
+    expect(err.code).toBe('INVALID_INPUT');
+    expect(err.message).toBe('信封里的 ICLOUD_ACCOUNT_1 不是合法邮箱');
+    expect(err.message).not.toContain('secret-value');
+    expect(err.hint).toContain('重新生成信封');
+    expect(err.hint ?? '').not.toContain('secret-value');
+  });
+
+  it('a bad boolean', () => {
+    const err = catchError({ ...okEnv, ALLOW_CALENDAR_WRITE_1: 'yess-secret-value' });
+    expect(err.code).toBe('INVALID_INPUT');
+    expect(err.message).toBe('信封里的 ALLOW_CALENDAR_WRITE_1 的值无法识别');
+    expect(err.message).not.toContain('secret-value');
+    expect(err.hint).toContain('true/false');
+    expect(err.hint).toContain('重新生成信封');
+    expect(err.hint ?? '').not.toContain('secret-value');
+  });
+});
+
+describe('env account parse errors stay byte-identical', () => {
+  it('a bad email still quotes the value', () => {
+    expect(() => loadConfig({ ICLOUD_ACCOUNT_1: 'bad', ICLOUD_APP_PASSWORD_1: 'p' })).toThrow(
+      expect.objectContaining({ code: 'INVALID_INPUT', message: 'ICLOUD_ACCOUNT_1 不是合法邮箱：bad' }),
+    );
+  });
+
+  it('a bad boolean still quotes the value', () => {
+    expect(() => loadConfig({ ...okEnv, ALLOW_CALENDAR_WRITE_1: 'yess' })).toThrow(
+      expect.objectContaining({
+        code: 'INVALID_INPUT',
+        message: '环境变量 ALLOW_CALENDAR_WRITE_1 的值无法识别：yess',
+        hint: '只接受 true/false（或 1/0、yes/no）',
+      }),
+    );
+  });
+});
+
 describe('capabilityHint', () => {
   it('differs by origin', () => {
     const env = { ...accountFromEnvelopeEnv(okEnv).account };
