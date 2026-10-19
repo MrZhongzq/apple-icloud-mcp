@@ -233,9 +233,29 @@ function createMcpRouteHandler(deps: {
     // 顺序有讲究：先吊销令牌，已签发的令牌就再也建不出新会话和新 transport；然后才清掉已有的，
     // 免得刚清完又被一个还没吊销的令牌建出一条。（调用方此前已停用或删除这把密钥，
     // 它也换不到新令牌——那一半由 verifyAccessToken / /access-login 保证，不在这里。）
-    const families = await deps.store.revokeFamiliesByAccessKey(keyId);
+    //
+    // 吊销是先改内存、再落盘。落盘抛错时令牌在内存里已经删掉了，可要是让这个错误直接冒出去，
+    // 下面两步就被跳过：会话活到 TTL，transport 留在表里。所以先把清场做完，再把错误抛给调用方
+    // （管理页因此回 500，主人知道没存上）。
+    let families: string[] = [];
+    let revokeFailed = false;
+    let revokeError: unknown;
+    try {
+      families = await deps.store.revokeFamiliesByAccessKey(keyId);
+    } catch (err) {
+      revokeFailed = true;
+      revokeError = err;
+    }
     const destroyedSessions = await deps.sessions.destroyMatching((s) => s.ownerKeyId === keyId);
     const closedTransports = await closeTransportsOwnedBy(keyId);
+    if (revokeFailed) {
+      deps.logger.error('access key cut off, but persisting the token revocation failed', {
+        destroyedSessions,
+        closedTransports,
+        detail: revokeError instanceof Error ? revokeError.name : typeof revokeError,
+      });
+      throw revokeError;
+    }
     deps.logger.info('access key cut off', {
       revokedFamilies: families.length,
       destroyedSessions,

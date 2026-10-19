@@ -190,7 +190,17 @@ export function createAdminRouter(deps: AdminRouterDeps): express.Router {
     const id = String(req.params.id);
     // 先停用再切断：顺序反过来，切断之后、停用之前那一刻，这把密钥还能在授权页上
     // 换出一次新的授权，切断就白做了。
-    if (!(await store.setAccessKeyEnabled(id, false))) {
+    let found: boolean;
+    try {
+      found = await store.setAccessKeyEnabled(id, false);
+    } catch (err) {
+      // setAccessKeyEnabled 只会在找到密钥、改完内存之后，于落盘时失败：此刻内存里它已经停用，
+      // 再点一次「停用」也只会走同一条路。所以切断必须现在就做，不能跟着这个错误一起被跳过；
+      // 做完再把原错误抛出去，让主人看到 500、知道没存上。
+      await deps.cutOffAccessKey(id);
+      throw err;
+    }
+    if (!found) {
       notFound(res);
       return;
     }
@@ -241,9 +251,14 @@ export function createAdminRouter(deps: AdminRouterDeps): express.Router {
     }
     const enabled = raw === 'true';
     const wasEnabled = store.getSettings().envAccountsEnabled;
-    await store.setEnvAccountsEnabled(enabled);
-    // 只有「从开到关」才需要清场：已经在用 env 账号的会话不会因为开关变了就自己消失。
-    if (wasEnabled && !enabled) await deps.onEnvAccountsDisabled();
+    try {
+      await store.setEnvAccountsEnabled(enabled);
+    } finally {
+      // 只有「从开到关」才需要清场：已经在用 env 账号的会话不会因为开关变了就自己消失。
+      // 放在 finally 里：开关是先改内存、再落盘，落盘失败时内存里已经是「关」，主人再点一次
+      // 时 wasEnabled 是 false、不会再清场——这一次跳过，那些会话就要活到 TTL。错误照样往上抛。
+      if (wasEnabled && !enabled) await deps.onEnvAccountsDisabled();
+    }
     logger.info('env accounts setting changed', { enabled });
     res.redirect(303, '/admin');
   });

@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer as createNodeServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
@@ -87,6 +87,12 @@ interface TestServer {
   onEnvAccountsDisabled: () => Promise<void>;
   /** 只有 `withEnvelope: true` 时才有：服务端的信封密钥对，测试拿它的公钥封信封。 */
   keyring?: EnvelopeKeyring;
+  /**
+   * 让令牌存储从此落盘失败：把存储文件换成一个同名的非空目录，之后每次 rename(tmp, path) 都失败
+   * （Windows 上 EPERM，Linux 上 EISDIR）。内存里的状态照常改动——要模拟的正是「先改了内存，
+   * 落盘时才失败」。不用 chmod 把目录设成只读，是因为那在 Windows 上不起作用。
+   */
+  breakPersistence: () => void;
   close: () => Promise<void>;
 }
 
@@ -104,7 +110,8 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
   const dir = mkdtempSync(join(tmpdir(), 'http-e2e-'));
   dirs.push(dir);
 
-  const store = createAuthStore({ path: join(dir, 'tokens.json.enc'), key: randomBytes(32), logger });
+  const storePath = join(dir, 'tokens.json.enc');
+  const store = createAuthStore({ path: storePath, key: randomBytes(32), logger });
   await store.load();
   await store.setEnvAccountsEnabled(options.envAccountsEnabled ?? true);
   const { record: keyRecord, plaintext: accessKey } = await store.createAccessKey('e2e');
@@ -192,6 +199,11 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
     cutOffAccessKey,
     onEnvAccountsDisabled,
     keyring,
+    breakPersistence() {
+      rmSync(storePath, { force: true });
+      mkdirSync(storePath);
+      writeFileSync(join(storePath, 'occupied'), 'x');
+    },
     async close() {
       await closeAll();
       await sessions.destroyAll();
@@ -409,6 +421,32 @@ async function mcpDelete(base: string, accessToken: string, mcpSessionId: string
   });
   await res.text();
   return res.status;
+}
+
+/** 管理页的 POST 要求 Origin 恰好是 PUBLIC_URL 的 origin（startServer 里的 publicUrl）。 */
+const ADMIN_ORIGIN = 'http://127.0.0.1:19999';
+
+/** 以管理员身份登录 /admin，返回 cookie 头的值。管理页会话只在内存里，令牌存储坏了也照样能登录。 */
+async function adminLogin(base: string): Promise<string> {
+  const res = await fetch(`${base}/admin/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ADMIN_ORIGIN },
+    redirect: 'manual',
+    body: new URLSearchParams({ password: ADMIN_PASSWORD }).toString(),
+  });
+  expect(res.status, '管理员登录').toBe(303);
+  const cookie = (res.headers.get('set-cookie') ?? '').split(';')[0] as string;
+  expect(cookie).toMatch(/^amcp_admin=/);
+  return cookie;
+}
+
+function adminPost(base: string, cookie: string, path: string, form: Record<string, string> = {}): Promise<Response> {
+  return fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: ADMIN_ORIGIN, cookie },
+    redirect: 'manual',
+    body: new URLSearchParams(form).toString(),
+  });
 }
 
 describe('oauth chain end to end (real provider, real store, real port)', () => {
@@ -831,6 +869,76 @@ describe('multi-person isolation', () => {
       expect(listed.names).toContain('apple_login');
       expect(listed.names).toContain('mail_send');
       expect(listed.names).toContain('contacts_search');
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+// 停用密钥、切断密钥、关 env 开关，都是先改内存、再落盘。落盘失败时内存已经是新状态（密钥已停用、
+// 开关已关），主人再点一次也不会重做清场——所以清场不能排在落盘之后、跟着它一起被跳过。
+// 这里断言的都是 SessionStore 和 transport 表的真实状态，并且请求本身仍然报错，让主人知道没存上。
+describe('teardown survives a failing persist', () => {
+  it('disabling a key on /admin still destroys its sessions and transports, and the request errors', async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      await loginThroughMcpWithTransport(srv.base, a.body.access_token as string);
+      const loginB = await loginThroughMcpWithTransport(srv.base, b.body.access_token as string);
+      expect(srv.sessions.size()).toBe(2);
+      const cookie = await adminLogin(srv.base);
+
+      srv.breakPersistence();
+      const res = await adminPost(srv.base, cookie, `/admin/keys/${a.accessKeyId}/disable`);
+      await res.text();
+      expect(res.status, '落盘失败必须让主人看到错误，而不是一个看似成功的 303').toBe(500);
+
+      expect(srv.sessions.size(), "A 的会话必须当场消失，只剩 B 的").toBe(1);
+      expect(srv.sessions.get(loginB.sessionId, b.accessKeyId).id).toBe(loginB.sessionId);
+      expect(srv.closedProviders, 'A 的 IMAP 连接必须真的关掉').toContain('imap');
+      expect(
+        await srv.sweepIdleTransports(Date.now() + appConfig.sessionTtlMs + 1_000),
+        'A 的 transport 已在切断时关闭摘除，表里只剩 B 的',
+      ).toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('cutOffAccessKey still destroys sessions and closes transports when revoking fails to persist, then rejects', async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      await loginThroughMcpWithTransport(srv.base, a.body.access_token as string);
+      expect(srv.sessions.size()).toBe(1);
+
+      srv.breakPersistence();
+      await expect(srv.cutOffAccessKey(a.accessKeyId), '错误仍然要抛给调用方').rejects.toThrow();
+
+      expect(srv.sessions.size(), '会话必须当场消失').toBe(0);
+      expect(srv.closedProviders).toContain('imap');
+      expect(await srv.sweepIdleTransports(Date.now() + appConfig.sessionTtlMs + 1_000), 'transport 已关闭摘除').toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('switching env accounts off on /admin still destroys env sessions, and the request errors', async () => {
+    const srv = await startServer({ envAccountsEnabled: true });
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      await loginThroughMcp(srv.base, a.body.access_token as string);
+      expect(srv.sessions.size()).toBe(1);
+      const cookie = await adminLogin(srv.base);
+
+      srv.breakPersistence();
+      const res = await adminPost(srv.base, cookie, '/admin/settings/env-accounts', { enabled: 'false' });
+      await res.text();
+      expect(res.status, '落盘失败必须让主人看到错误').toBe(500);
+
+      expect(srv.sessions.size(), 'env 账号建立的会话必须当场消失，不能活到 TTL').toBe(0);
+      expect(srv.closedProviders).toContain('imap');
     } finally {
       await srv.close();
     }
