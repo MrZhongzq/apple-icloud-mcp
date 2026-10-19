@@ -1,6 +1,6 @@
 import { AppError } from '../../core/errors.js';
 import { decodeRef, decodeUrl, encodeUrl } from '../../core/ids.js';
-import type { AccountConfig } from '../../core/config.js';
+import { capabilityHint, type AccountConfig } from '../../core/config.js';
 import {
   applyContactPatch,
   buildVCard,
@@ -83,12 +83,11 @@ function matchesQuery(contact: Contact, query: string): boolean {
 
 export function createContactService(deps: ContactServiceDeps): ContactService {
   const { account, carddav, cache } = deps;
-  const suffix = account.id.split('_')[1];
 
   const requireRead = (): void => {
     if (!account.capabilities.contactsRead) {
       throw new AppError('PERMISSION_DENIED', '该账号的通讯录读取权限未开启', {
-        hint: `设置环境变量 ALLOW_CONTACTS_READ_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_CONTACTS_READ'),
       });
     }
   };
@@ -96,7 +95,7 @@ export function createContactService(deps: ContactServiceDeps): ContactService {
   const requireWrite = (): void => {
     if (!account.capabilities.contactsWrite) {
       throw new AppError('PERMISSION_DENIED', '该账号的通讯录写入权限未开启', {
-        hint: `设置环境变量 ALLOW_CONTACTS_WRITE_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_CONTACTS_WRITE'),
       });
     }
   };

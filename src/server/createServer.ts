@@ -18,23 +18,25 @@ export interface ServerDeps {
   config: AppConfig;
   sessions: SessionStore;
   logger: Logger;
+  /** 远程入口：账号在登录时才出现，注册阶段看不到能力，所以四个模块一律注册，权限留给每次调用时按会话判断。 */
+  registerAllModules?: boolean;
 }
 
 export function registerAllTools(server: ToolRegistrar, deps: ServerDeps): void {
-  const { config, sessions, logger } = deps;
+  const { config, sessions, logger, registerAllModules } = deps;
 
   registerSessionTools(server, { sessions, logger, config });
 
-  const anyMail = config.accounts.some(
+  const anyMail = registerAllModules === true || config.accounts.some(
     (a) => a.capabilities.mailRead || a.capabilities.mailWrite,
   );
-  const anyCalendar = config.accounts.some(
+  const anyCalendar = registerAllModules === true || config.accounts.some(
     (a) => a.capabilities.calendarRead || a.capabilities.calendarWrite,
   );
-  const anyReminders = config.accounts.some(
+  const anyReminders = registerAllModules === true || config.accounts.some(
     (a) => a.capabilities.remindersRead || a.capabilities.remindersWrite,
   );
-  const anyContacts = config.accounts.some(
+  const anyContacts = registerAllModules === true || config.accounts.some(
     (a) => a.capabilities.contactsRead || a.capabilities.contactsWrite,
   );
 

@@ -1,6 +1,6 @@
 import { AppError } from '../../core/errors.js';
 import { decodeRef, decodeUrl, encodeUrl } from '../../core/ids.js';
-import type { AccountConfig } from '../../core/config.js';
+import { capabilityHint, type AccountConfig } from '../../core/config.js';
 import {
   applyTodoPatch,
   buildTodoObject,
@@ -57,12 +57,11 @@ function parseDueBound(label: string, value?: string): Date | undefined {
 
 export function createReminderService(deps: ReminderServiceDeps): ReminderService {
   const { account, caldav } = deps;
-  const suffix = account.id.split('_')[1];
 
   const requireRead = (): void => {
     if (!account.capabilities.remindersRead) {
       throw new AppError('PERMISSION_DENIED', '该账号的提醒事项读取权限未开启', {
-        hint: `设置环境变量 ALLOW_REMINDERS_READ_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_REMINDERS_READ'),
       });
     }
   };
@@ -70,7 +69,7 @@ export function createReminderService(deps: ReminderServiceDeps): ReminderServic
   const requireWrite = (): void => {
     if (!account.capabilities.remindersWrite) {
       throw new AppError('PERMISSION_DENIED', '该账号的提醒事项写入权限未开启', {
-        hint: `设置环境变量 ALLOW_REMINDERS_WRITE_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_REMINDERS_WRITE'),
       });
     }
   };

@@ -137,4 +137,18 @@ describe('registerAllTools', () => {
     registerAllTools(server, { config, sessions, logger });
     expect(names).toContain('mail_search');
   });
+
+  it('registerAllModules registers all 25 tools with zero accounts', () => {
+    const { server, names } = collect();
+    const config = loadConfig({}, { allowNoAccounts: true });
+    registerAllTools(server, { config, sessions, logger, registerAllModules: true });
+    expect(names).toHaveLength(25);
+  });
+
+  it('without registerAllModules zero accounts registers only the 3 session tools', () => {
+    const { server, names } = collect();
+    const config = loadConfig({}, { allowNoAccounts: true });
+    registerAllTools(server, { config, sessions, logger });
+    expect([...names].sort()).toEqual(['apple_accounts', 'apple_login', 'work_done']);
+  });
 });

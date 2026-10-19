@@ -118,6 +118,7 @@ async function startServer(): Promise<TestServer> {
     tokenStorePath: join(dir, 'tokens.json.enc'),
     encryptionKey: randomBytes(32),
     trustProxy: false,
+    envelopeKeyPath: '/tmp/envelope-key.json.enc',
   };
 
   const { app, closeAll, sweepIdleTransports } = createHttpApp({

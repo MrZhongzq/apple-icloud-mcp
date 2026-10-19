@@ -22,6 +22,8 @@ export interface AccountConfig {
   label: string;
   appPassword: string;
   capabilities: Capabilities;
+  /** 账号从哪里来：env = 服务进程自己的环境变量；envelope = 用户登录时带来的信封。未设置等同于 env。 */
+  origin?: 'env' | 'envelope';
 }
 
 export interface AppConfig {
@@ -168,7 +170,7 @@ function parseAccount(
   };
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
+export function loadConfig(env: NodeJS.ProcessEnv, options: { allowNoAccounts?: boolean } = {}): AppConfig {
   const { env: merged, deprecations } = applyLegacy(env);
 
   const accounts: AccountConfig[] = [];
@@ -181,7 +183,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     }
   }
 
-  if (accounts.length === 0) {
+  // 远程入口的账号来自用户登录时的信封，进程自己可以一个账号都没有；stdio/CLI 仍然必须有。
+  if (accounts.length === 0 && !options.allowNoAccounts) {
     throw new AppError('INVALID_INPUT', '没有配置任何 iCloud 账号', {
       hint: '至少设置 ICLOUD_ACCOUNT_1 与 ICLOUD_APP_PASSWORD_1，可参考仓库根目录的 .env.example',
     });
@@ -203,6 +206,51 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     deprecations,
     notices,
   };
+}
+
+/** 信封里允许携带的变量：正好是账号 1 的 12 个变量，其余一律丢弃。 */
+export const ENVELOPE_ENV_KEYS: readonly string[] = [
+  'ICLOUD_ACCOUNT_1',
+  'ICLOUD_APP_PASSWORD_1',
+  'ICLOUD_SENDER_1',
+  'ICLOUD_LABEL_1',
+  'ALLOW_MAIL_READ_1',
+  'ALLOW_MAIL_WRITE_1',
+  'ALLOW_CALENDAR_READ_1',
+  'ALLOW_CALENDAR_WRITE_1',
+  'ALLOW_REMINDERS_READ_1',
+  'ALLOW_REMINDERS_WRITE_1',
+  'ALLOW_CONTACTS_READ_1',
+  'ALLOW_CONTACTS_WRITE_1',
+];
+
+/** 把信封里的 env 变成账号。必须走 parseAccount：iCloud 发信域名保护与"写权限默认关"都在那里，
+ *  这里另写一份就会让信封账号绕开它们。先按白名单过滤，是为了让信封里夹带的
+ *  ICLOUD_ACCOUNT_2、LOG_LEVEL 之类无法影响解析。 */
+export function accountFromEnvelopeEnv(env: Record<string, unknown>): { account: AccountConfig; notices: string[] } {
+  const filtered: NodeJS.ProcessEnv = {};
+  for (const key of ENVELOPE_ENV_KEYS) {
+    const value = env[key];
+    if (typeof value === 'string') filtered[key] = value;
+  }
+  const parsed = parseAccount(filtered, 1);
+  if (!parsed) {
+    throw new AppError('INVALID_INPUT', '信封里没有账号信息', {
+      hint: '确认 .env 里设置了 ICLOUD_ACCOUNT_1 与 ICLOUD_APP_PASSWORD_1 后重新生成信封',
+    });
+  }
+  return {
+    account: { ...parsed.account, origin: 'envelope' },
+    notices: parsed.notice ? [parsed.notice] : [],
+  };
+}
+
+/** 权限被拒时的恢复提示。env 账号改服务端环境变量；信封账号只能改自己的 .env 重新生成信封。 */
+export function capabilityHint(account: AccountConfig, stem: string): string {
+  if (account.origin === 'envelope') {
+    return `在你自己的 .env 里把 ${stem}_1 设为 true，重新生成信封后再登录`;
+  }
+  return `设置环境变量 ${stem}_${account.id.split('_')[1]}=true 后重启服务`;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +275,8 @@ export interface HttpConfig {
    * 耗光，把整条授权流程锁死。两种部署都真实存在，所以这件事只能由部署方声明，不能猜。
    */
   trustProxy: boolean;
+  /** 信封私钥文件（用 TOKEN_ENCRYPTION_KEY 加密）。默认与令牌存储放在同一目录。 */
+  envelopeKeyPath: string;
 }
 
 const DEFAULT_HTTP_PORT = 17733;
@@ -339,6 +389,8 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv): HttpConfig {
     tokenStorePath,
     encryptionKey,
     trustProxy: readBool(env, 'TRUST_PROXY', false),
+    envelopeKeyPath:
+      clean(env.ENVELOPE_KEY_PATH) ?? path.join(path.dirname(tokenStorePath), 'envelope-key.json.enc'),
   };
 }
 

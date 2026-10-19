@@ -1,7 +1,7 @@
 import { AppError } from '../../core/errors.js';
 import { decodeRef, decodeUrl, encodeRef, encodeUrl } from '../../core/ids.js';
 import type { ResourceRef } from '../../core/ids.js';
-import type { AccountConfig } from '../../core/config.js';
+import { capabilityHint, type AccountConfig } from '../../core/config.js';
 import {
   addExdate,
   applyEventPatch,
@@ -100,12 +100,11 @@ export function toInput(event: CalendarEvent): EventInput {
 
 export function createCalendarService(deps: CalendarServiceDeps): CalendarService {
   const { account, caldav } = deps;
-  const suffix = account.id.split('_')[1];
 
   const requireRead = (): void => {
     if (!account.capabilities.calendarRead) {
       throw new AppError('PERMISSION_DENIED', '该账号的日历读取权限未开启', {
-        hint: `设置环境变量 ALLOW_CALENDAR_READ_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_CALENDAR_READ'),
       });
     }
   };
@@ -113,7 +112,7 @@ export function createCalendarService(deps: CalendarServiceDeps): CalendarServic
   const requireWrite = (): void => {
     if (!account.capabilities.calendarWrite) {
       throw new AppError('PERMISSION_DENIED', '该账号的日历写入权限未开启', {
-        hint: `设置环境变量 ALLOW_CALENDAR_WRITE_${suffix}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_CALENDAR_WRITE'),
       });
     }
   };

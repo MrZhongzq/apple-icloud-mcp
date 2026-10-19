@@ -1,5 +1,5 @@
 import { AppError } from '../../core/errors.js';
-import type { AccountConfig } from '../../core/config.js';
+import { capabilityHint, type AccountConfig } from '../../core/config.js';
 import { makeSnippet, parseEmail, type ParsedEmail } from '../../parsers/mime.js';
 import type { FolderInfo, ImapProvider } from '../../providers/icloud/imap.js';
 import type { OutgoingMessage, SendResult, SmtpProvider } from '../../providers/icloud/smtp.js';
@@ -46,7 +46,7 @@ export function createMailService(deps: MailServiceDeps): MailService {
   const requireRead = (): void => {
     if (!account.capabilities.mailRead) {
       throw new AppError('PERMISSION_DENIED', '该账号的邮件读取权限未开启', {
-        hint: `设置环境变量 ALLOW_MAIL_READ_${account.id.split('_')[1]}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_MAIL_READ'),
       });
     }
   };
@@ -54,7 +54,7 @@ export function createMailService(deps: MailServiceDeps): MailService {
   const requireWrite = (): void => {
     if (!account.capabilities.mailWrite) {
       throw new AppError('PERMISSION_DENIED', '该账号的邮件写入权限未开启', {
-        hint: `设置环境变量 ALLOW_MAIL_WRITE_${account.id.split('_')[1]}=true 后重启服务`,
+        hint: capabilityHint(account, 'ALLOW_MAIL_WRITE'),
       });
     }
   };

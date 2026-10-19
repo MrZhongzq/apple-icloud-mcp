@@ -38,6 +38,7 @@ const httpConfig = {
   // 默认关：直接暴露端口的部署里 X-Forwarded-For 是调用方自己写的，信它等于让任何人
   // 自选限流桶。本仓库自带的 compose 在前面放了 Caddy，那种部署要把它打开。
   trustProxy: false,
+  envelopeKeyPath: '/tmp/envelope-key.json.enc',
 };
 
 /** /admin-login 的窗口上限是 20，多打一次就该看到 429。 */
