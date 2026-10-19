@@ -1,9 +1,9 @@
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { basename, dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { AppError } from '../core/errors.js';
 import type { Logger } from '../core/logger.js';
-import { decryptJson, encryptJson, hashToken } from './crypto.js';
+import { decryptJson, encryptJson, generateToken, hashToken } from './crypto.js';
 
 export interface StoredClient {
   client_id: string;
@@ -36,6 +36,18 @@ export interface StoredToken {
   refresh_expires_at: number;
   /** 该刷新令牌是否已被轮换掉。已轮换的令牌再次出现 = 泄露信号。 */
   rotated: boolean;
+  /** 这族令牌是用哪把访问密钥授权的。旧快照里的令牌没有这个字段，是否放行由 provider 决定。 */
+  access_key_id?: string;
+}
+
+/** 一把访问密钥。只存哈希，明文只在新建那一次返回给调用方。 */
+export interface AccessKeyRecord {
+  id: string;
+  name: string;
+  key_hash: string;
+  created_at: number;
+  enabled: boolean;
+  last_used_at?: number;
 }
 
 export interface AuthStore {
@@ -52,6 +64,21 @@ export interface AuthStore {
   revokeFamily(familyId: string): Promise<string | undefined>;
   revokeByToken(token: string): Promise<string | undefined>;
 
+  createAccessKey(name: string): Promise<{ record: AccessKeyRecord; plaintext: string }>;
+  /** 按 created_at 升序。 */
+  listAccessKeys(): AccessKeyRecord[];
+  getAccessKey(id: string): AccessKeyRecord | undefined;
+  /** 不管 enabled 与否都返回，由调用方判断。 */
+  findAccessKeyByPlaintext(plaintext: string): AccessKeyRecord | undefined;
+  setAccessKeyEnabled(id: string, enabled: boolean): Promise<boolean>;
+  deleteAccessKey(id: string): Promise<boolean>;
+  /** 删掉这把密钥名下的全部令牌记录，返回被删的 family_id（已去重）。 */
+  revokeFamiliesByAccessKey(id: string): Promise<string[]>;
+  /** 内存里每次都更新 last_used_at；落盘同一把密钥至少间隔 60 秒。 */
+  touchAccessKey(id: string, now?: number): void;
+  getSettings(): { envAccountsEnabled: boolean };
+  setEnvAccountsEnabled(enabled: boolean): Promise<void>;
+
   /** 清掉已过期的记录，返回清理条数。 */
   sweep(now?: number): Promise<number>;
   /** 供 HTTP 入口在启动时调用一次，把磁盘内容读进内存。 */
@@ -62,7 +89,13 @@ export interface AuthStore {
 interface StoreSnapshot {
   clients: StoredClient[];
   tokens: StoredToken[];
+  // 以下两个字段是后加的：旧快照里没有，load() 按默认值处理。
+  access_keys?: AccessKeyRecord[];
+  settings?: { env_accounts_enabled: boolean };
 }
+
+/** last_used_at 落盘的最小间隔：每次请求都重写加密快照太贵，丢一分钟精度无所谓。 */
+const TOUCH_PERSIST_INTERVAL_MS = 60_000;
 
 export function createAuthStore(deps: { path: string; key: Buffer; logger: Logger }): AuthStore {
   const { path, key, logger } = deps;
@@ -71,6 +104,10 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
   const tokens: StoredToken[] = [];
   const byAccessHash = new Map<string, StoredToken>();
   const byRefreshHash = new Map<string, StoredToken>();
+  const accessKeys = new Map<string, AccessKeyRecord>();
+  const byKeyHash = new Map<string, AccessKeyRecord>();
+  const lastTouchPersist = new Map<string, number>();
+  let envAccountsEnabled = false;
 
   // 所有写入串行排队，而不是各自捕获快照后并发抢跑同一个目标路径。
   // 队列本身用 .catch 吞掉失败，让某次写入失败不会把后面所有排队的写入一起卡死；
@@ -96,6 +133,8 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
     const snapshot: StoreSnapshot = {
       clients: Array.from(clients.values()),
       tokens: [...tokens],
+      access_keys: Array.from(accessKeys.values()),
+      settings: { env_accounts_enabled: envAccountsEnabled },
     };
     const blob = encryptJson(snapshot, key);
     const dir = dirname(path);
@@ -132,6 +171,7 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         clients.clear();
         tokens.length = 0;
+        loadAccessKeys([], false);
         reindex();
         return;
       }
@@ -143,7 +183,7 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
       snapshot = decryptJson<StoreSnapshot>(raw, key);
     } catch {
       throw new AppError('INTERNAL', '令牌存储无法解密', {
-        hint: 'TOKEN_ENCRYPTION_KEY 可能变了，或存储文件已损坏。删除该文件会让所有客户端重新授权。',
+        hint: `TOKEN_ENCRYPTION_KEY 可能变了，或 ${basename(path)} 已损坏。删除这个文件会清空全部访问密钥与已授权的客户端，所有人都要重新授权；信封密钥对存放在另一个文件里，不受影响。`,
       });
     }
 
@@ -153,7 +193,100 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
     }
     tokens.length = 0;
     tokens.push(...snapshot.tokens);
+    loadAccessKeys(snapshot.access_keys ?? [], snapshot.settings?.env_accounts_enabled ?? false);
     reindex();
+  }
+
+  function loadAccessKeys(records: AccessKeyRecord[], envEnabled: boolean): void {
+    accessKeys.clear();
+    byKeyHash.clear();
+    lastTouchPersist.clear();
+    for (const record of records) {
+      accessKeys.set(record.id, record);
+      byKeyHash.set(record.key_hash, record);
+    }
+    envAccountsEnabled = envEnabled;
+  }
+
+  async function createAccessKey(name: string): Promise<{ record: AccessKeyRecord; plaintext: string }> {
+    const plaintext = `amk_${generateToken()}`;
+    const record: AccessKeyRecord = {
+      id: randomBytes(8).toString('hex'),
+      name,
+      key_hash: hashToken(plaintext),
+      created_at: Date.now(),
+      enabled: true,
+    };
+    accessKeys.set(record.id, record);
+    byKeyHash.set(record.key_hash, record);
+    await persist();
+    return { record, plaintext };
+  }
+
+  function listAccessKeys(): AccessKeyRecord[] {
+    return Array.from(accessKeys.values()).sort((a, b) => a.created_at - b.created_at);
+  }
+
+  function getAccessKey(id: string): AccessKeyRecord | undefined {
+    return accessKeys.get(id);
+  }
+
+  function findAccessKeyByPlaintext(plaintext: string): AccessKeyRecord | undefined {
+    return byKeyHash.get(hashToken(plaintext));
+  }
+
+  async function setAccessKeyEnabled(id: string, enabled: boolean): Promise<boolean> {
+    const record = accessKeys.get(id);
+    if (!record) return false;
+    record.enabled = enabled;
+    await persist();
+    return true;
+  }
+
+  async function deleteAccessKey(id: string): Promise<boolean> {
+    const record = accessKeys.get(id);
+    if (!record) return false;
+    accessKeys.delete(id);
+    byKeyHash.delete(record.key_hash);
+    lastTouchPersist.delete(id);
+    await persist();
+    return true;
+  }
+
+  async function revokeFamiliesByAccessKey(id: string): Promise<string[]> {
+    const toRemove = tokens.filter((t) => t.access_key_id === id);
+    if (toRemove.length === 0) return [];
+    for (const record of toRemove) {
+      removeFromIndexes(record);
+      const idx = tokens.indexOf(record);
+      if (idx !== -1) tokens.splice(idx, 1);
+    }
+    await persist();
+    return Array.from(new Set(toRemove.map((t) => t.family_id)));
+  }
+
+  function touchAccessKey(id: string, now: number = Date.now()): void {
+    const record = accessKeys.get(id);
+    if (!record) return;
+    record.last_used_at = now;
+    const last = lastTouchPersist.get(id);
+    if (last !== undefined && now - last < TOUCH_PERSIST_INTERVAL_MS) return;
+    lastTouchPersist.set(id, now);
+    // fire-and-forget：走同一条写队列；落盘失败不该让一次正常请求失败，只记错误名。
+    persist().catch((err: unknown) => {
+      logger.warn('failed to persist access key last_used_at', {
+        error: err instanceof Error ? err.name : 'unknown',
+      });
+    });
+  }
+
+  function getSettings(): { envAccountsEnabled: boolean } {
+    return { envAccountsEnabled };
+  }
+
+  async function setEnvAccountsEnabled(enabled: boolean): Promise<void> {
+    envAccountsEnabled = enabled;
+    await persist();
   }
 
   async function registerClient(client: Omit<StoredClient, 'created_at'>): Promise<StoredClient> {
@@ -247,6 +380,16 @@ export function createAuthStore(deps: { path: string; key: Buffer; logger: Logge
     rotateRefresh,
     revokeFamily,
     revokeByToken,
+    createAccessKey,
+    listAccessKeys,
+    getAccessKey,
+    findAccessKeyByPlaintext,
+    setAccessKeyEnabled,
+    deleteAccessKey,
+    revokeFamiliesByAccessKey,
+    touchAccessKey,
+    getSettings,
+    setEnvAccountsEnabled,
     sweep,
     load,
   };
