@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { wrapTool } from '../../server/wrap.js';
-import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
-import type { Session } from '../../core/session.js';
+import type { ToolDeps, ToolExtra, ToolRegistrar } from '../../server/types.js';
+import { accessKeyIdFrom, type Session } from '../../core/session.js';
 import type { ReminderService } from './service.js';
 
 export interface ReminderToolDeps extends ToolDeps {
@@ -48,7 +48,7 @@ const patchSchema = z.object(reminderShape).partial();
 
 export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolDeps): void {
   const { sessions, logger, reminderFor } = deps;
-  const serviceOf = (sessionId_: string): ReminderService => reminderFor(sessions.get(sessionId_));
+  const serviceOf = (sessionId_: string, extra?: ToolExtra): ReminderService => reminderFor(sessions.get(sessionId_, accessKeyIdFrom(extra)));
 
   server.registerTool(
     'reminders_lists',
@@ -58,8 +58,8 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
       inputSchema: { session_id: sessionId },
       annotations: { readOnlyHint: true },
     },
-    wrapTool(logger, 'reminders_lists', async (args: { session_id: string }) =>
-      serviceOf(args.session_id).listLists(),
+    wrapTool(logger, 'reminders_lists', async (args: { session_id: string }, extra) =>
+      serviceOf(args.session_id, extra).listLists(),
     ),
   );
 
@@ -97,8 +97,8 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
         due_before?: string;
         due_after?: string;
         limit?: number;
-      }) =>
-        serviceOf(args.session_id).list({
+      }, extra) =>
+        serviceOf(args.session_id, extra).list({
           list_ids: args.list_ids,
           completed: args.completed,
           due_before: args.due_before,
@@ -125,8 +125,8 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
     wrapTool(
       logger,
       'reminders_create',
-      async (args: { session_id: string; list_id?: string; reminder: z.infer<typeof reminderSchema> }) =>
-        serviceOf(args.session_id).create(args.reminder, args.list_id),
+      async (args: { session_id: string; list_id?: string; reminder: z.infer<typeof reminderSchema> }, extra) =>
+        serviceOf(args.session_id, extra).create(args.reminder, args.list_id),
     ),
   );
 
@@ -154,7 +154,7 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
         reminder_id: string;
         patch: z.infer<typeof patchSchema>;
         expected_etag?: string;
-      }) => serviceOf(args.session_id).update(args.reminder_id, args.patch, { expected_etag: args.expected_etag }),
+      }, extra) => serviceOf(args.session_id, extra).update(args.reminder_id, args.patch, { expected_etag: args.expected_etag }),
     ),
   );
 
@@ -173,8 +173,8 @@ export function registerReminderTools(server: ToolRegistrar, deps: ReminderToolD
     wrapTool(
       logger,
       'reminders_delete',
-      async (args: { session_id: string; reminder_id: string; expected_etag?: string }) =>
-        serviceOf(args.session_id).remove(args.reminder_id, { expected_etag: args.expected_etag }),
+      async (args: { session_id: string; reminder_id: string; expected_etag?: string }, extra) =>
+        serviceOf(args.session_id, extra).remove(args.reminder_id, { expected_etag: args.expected_etag }),
     ),
   );
 }

@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { wrapTool } from '../../server/wrap.js';
 import { AppError } from '../../core/errors.js';
-import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
-import type { Session } from '../../core/session.js';
+import type { ToolDeps, ToolExtra, ToolRegistrar } from '../../server/types.js';
+import { accessKeyIdFrom, type Session } from '../../core/session.js';
 import type { MailService } from './service.js';
 
 export interface MailToolDeps extends ToolDeps {
@@ -41,7 +41,7 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
   const { sessions, logger, mailFor } = deps;
 
   /** 每次调用先校验会话（过期即抛 SESSION_EXPIRED），再取该会话的 service。 */
-  const serviceOf = (sessionId: string): MailService => mailFor(sessions.get(sessionId));
+  const serviceOf = (sessionId: string, extra?: ToolExtra): MailService => mailFor(sessions.get(sessionId, accessKeyIdFrom(extra)));
 
   server.registerTool(
     'mail_folders',
@@ -51,8 +51,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
       inputSchema: { session_id: sessionId },
       annotations: { readOnlyHint: true },
     },
-    wrapTool(logger, 'mail_folders', async (args: { session_id: string }) =>
-      serviceOf(args.session_id).listFolders(),
+    wrapTool(logger, 'mail_folders', async (args: { session_id: string }, extra) =>
+      serviceOf(args.session_id, extra).listFolders(),
     ),
   );
 
@@ -80,7 +80,7 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
         query?: Record<string, unknown>;
         limit?: number;
         cursor?: string;
-      }) => {
+      }, extra) => {
         const query = args.query
           ? {
               ...args.query,
@@ -88,7 +88,7 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
               before: toDate(args.query.before as string | undefined, 'before'),
             }
           : undefined;
-        return serviceOf(args.session_id).search({
+        return serviceOf(args.session_id, extra).search({
           folder: args.folder,
           query: query as never,
           limit: args.limit,
@@ -114,8 +114,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
     wrapTool(
       logger,
       'mail_read',
-      async (args: { session_id: string; uid: number; folder?: string; format?: 'text' | 'html' | 'both' }) =>
-        serviceOf(args.session_id).read(args.uid, args.folder, args.format),
+      async (args: { session_id: string; uid: number; folder?: string; format?: 'text' | 'html' | 'both' }, extra) =>
+        serviceOf(args.session_id, extra).read(args.uid, args.folder, args.format),
     ),
   );
 
@@ -148,8 +148,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
         text?: string;
         html?: string;
         in_reply_to?: string;
-      }) =>
-        serviceOf(args.session_id).send({
+      }, extra) =>
+        serviceOf(args.session_id, extra).send({
           to: args.to,
           cc: args.cc,
           bcc: args.bcc,
@@ -182,7 +182,7 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
         uid: number[];
         folder?: string;
         flags: { seen?: boolean; flagged?: boolean };
-      }) => serviceOf(args.session_id).mark(args.uid, args.flags, args.folder),
+      }, extra) => serviceOf(args.session_id, extra).mark(args.uid, args.flags, args.folder),
     ),
   );
 
@@ -202,8 +202,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
     wrapTool(
       logger,
       'mail_move',
-      async (args: { session_id: string; uid: number[]; from_folder: string; to_folder: string }) =>
-        serviceOf(args.session_id).move(args.uid, args.from_folder, args.to_folder),
+      async (args: { session_id: string; uid: number[]; from_folder: string; to_folder: string }, extra) =>
+        serviceOf(args.session_id, extra).move(args.uid, args.from_folder, args.to_folder),
     ),
   );
 
@@ -224,8 +224,8 @@ export function registerMailTools(server: ToolRegistrar, deps: MailToolDeps): vo
     wrapTool(
       logger,
       'mail_delete',
-      async (args: { session_id: string; uid: number[]; folder?: string; permanent?: boolean }) =>
-        serviceOf(args.session_id).remove(args.uid, args.folder, args.permanent),
+      async (args: { session_id: string; uid: number[]; folder?: string; permanent?: boolean }, extra) =>
+        serviceOf(args.session_id, extra).remove(args.uid, args.folder, args.permanent),
     ),
   );
 }

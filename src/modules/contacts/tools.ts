@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { wrapTool } from '../../server/wrap.js';
-import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
-import type { Session } from '../../core/session.js';
+import type { ToolDeps, ToolExtra, ToolRegistrar } from '../../server/types.js';
+import { accessKeyIdFrom, type Session } from '../../core/session.js';
 import type { ContactService } from './service.js';
 import type { ContactInput } from '../../parsers/vcard.js';
 
@@ -79,7 +79,7 @@ const patchSchema = z.object(contactShape).partial();
 
 export function registerContactTools(server: ToolRegistrar, deps: ContactToolDeps): void {
   const { sessions, logger, contactFor } = deps;
-  const serviceOf = (sessionId_: string): ContactService => contactFor(sessions.get(sessionId_));
+  const serviceOf = (sessionId_: string, extra?: ToolExtra): ContactService => contactFor(sessions.get(sessionId_, accessKeyIdFrom(extra)));
 
   server.registerTool(
     'contacts_search',
@@ -103,8 +103,8 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
     wrapTool(
       logger,
       'contacts_search',
-      async (args: { session_id: string; query?: string; address_book_ids?: string[]; limit?: number }) =>
-        serviceOf(args.session_id).search({
+      async (args: { session_id: string; query?: string; address_book_ids?: string[]; limit?: number }, extra) =>
+        serviceOf(args.session_id, extra).search({
           query: args.query,
           address_book_ids: args.address_book_ids,
           limit: args.limit,
@@ -125,8 +125,8 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
       },
       annotations: { readOnlyHint: true },
     },
-    wrapTool(logger, 'contacts_read', async (args: { session_id: string; contact_id: string }) =>
-      serviceOf(args.session_id).read(args.contact_id),
+    wrapTool(logger, 'contacts_read', async (args: { session_id: string; contact_id: string }, extra) =>
+      serviceOf(args.session_id, extra).read(args.contact_id),
     ),
   );
 
@@ -148,8 +148,8 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
     wrapTool(
       logger,
       'contacts_create',
-      async (args: { session_id: string; address_book_id?: string; contact: ContactInput }) =>
-        serviceOf(args.session_id).create(args.contact, args.address_book_id),
+      async (args: { session_id: string; address_book_id?: string; contact: ContactInput }, extra) =>
+        serviceOf(args.session_id, extra).create(args.contact, args.address_book_id),
     ),
   );
 
@@ -178,7 +178,7 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
         contact_id: string;
         patch: z.infer<typeof patchSchema>;
         expected_etag?: string;
-      }) => serviceOf(args.session_id).update(args.contact_id, args.patch, { expected_etag: args.expected_etag }),
+      }, extra) => serviceOf(args.session_id, extra).update(args.contact_id, args.patch, { expected_etag: args.expected_etag }),
     ),
   );
 
@@ -197,8 +197,8 @@ export function registerContactTools(server: ToolRegistrar, deps: ContactToolDep
     wrapTool(
       logger,
       'contacts_delete',
-      async (args: { session_id: string; contact_id: string; expected_etag?: string }) =>
-        serviceOf(args.session_id).remove(args.contact_id, { expected_etag: args.expected_etag }),
+      async (args: { session_id: string; contact_id: string; expected_etag?: string }, extra) =>
+        serviceOf(args.session_id, extra).remove(args.contact_id, { expected_etag: args.expected_etag }),
     ),
   );
 }

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { findAccount, type AppConfig } from '../../core/config.js';
 import { AppError } from '../../core/errors.js';
-import { tokenFamilyIdFrom } from '../../core/session.js';
+import { accessKeyIdFrom, tokenFamilyIdFrom } from '../../core/session.js';
 import { wrapTool } from '../../server/wrap.js';
 import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
 
@@ -65,14 +65,14 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       // 远程 HTTP 入口下，这次调用是被某个 OAuth 访问令牌放行的；把那个令牌所属的家族
       // 登记到会话上，吊销该令牌时 `destroyByToken` 才找得到这条会话并真的关掉它的
       // IMAP/SMTP 连接。stdio 入口没有 authInfo，值为 undefined，行为与以前完全一致。
-      const session = sessions.create(account, tokenFamilyIdFrom(extra));
+      const session = sessions.create(account, tokenFamilyIdFrom(extra), accessKeyIdFrom(extra));
 
       try {
         if (needsImap) await session.providers.imap.verify();
         if (needsCalDav) await session.providers.caldav.verify();
         if (needsCardDav) await session.providers.carddav.verify();
       } catch (err) {
-        await sessions.destroy(session.id);
+        await sessions.destroy(session.id, accessKeyIdFrom(extra));
         throw err;
       }
 
@@ -96,8 +96,8 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       inputSchema: { session_id: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    wrapTool(logger, 'work_done', async (args: { session_id: string }) => ({
-      success: await sessions.destroy(args.session_id),
+    wrapTool(logger, 'work_done', async (args: { session_id: string }, extra) => ({
+      success: await sessions.destroy(args.session_id, accessKeyIdFrom(extra)),
     })),
   );
 }

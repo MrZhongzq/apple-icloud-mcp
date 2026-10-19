@@ -27,13 +27,20 @@ export interface Session {
   /** 建立会话时所属的 OAuth 令牌家族；stdio 入口不传，值为 undefined。
    *  令牌被吊销时，`destroyByToken` 靠这个字段找到该家族名下的全部会话。 */
   tokenFamilyId?: string;
+  /** 建立会话的访问密钥 id；stdio / CLI 入口不传，值为 undefined。
+   *  之后的每次 get/destroy 都要拿调用方的密钥 id 来比对，不一致就当这个会话不存在。 */
+  ownerKeyId?: string;
 }
 
 export interface SessionStore {
-  /** stdio 入口不传第二参数，行为与今天完全一致。 */
-  create(account: AccountConfig, tokenFamilyId?: string): Session;
-  get(id: string): Session;
-  destroy(id: string): Promise<boolean>;
+  /** stdio 入口不传第二、三参数，行为与今天完全一致。 */
+  create(account: AccountConfig, tokenFamilyId?: string, ownerKeyId?: string): Session;
+  /** callerKeyId 与会话的 ownerKeyId 不一致（两边都 undefined 视为一致）时，表现与 id 不存在完全相同。 */
+  get(id: string, callerKeyId?: string): Session;
+  /** 非属主调用返回 false 且不动会话，与 id 不存在时一样。 */
+  destroy(id: string, callerKeyId?: string): Promise<boolean>;
+  /** 销毁所有满足条件的会话（逐个走 destroyById，关闭底层连接），返回销毁数量。 */
+  destroyMatching(predicate: (s: Session) => boolean): Promise<number>;
   /** 吊销令牌时调用：销毁该家族名下全部会话（逐个走 destroy，关闭底层连接），返回销毁数量。 */
   destroyByToken(tokenFamilyId: string): Promise<number>;
   destroyAll(): Promise<void>;
@@ -49,15 +56,32 @@ export interface SessionStore {
  * 拼错了也不会有人报错——只会安静地退回"会话不带家族"，也就是吊销令牌销毁不了会话的那个
  * bug 本身。放在这里而不是 auth/ 下，是为了不让 modules 反向依赖 auth：会话属于哪个令牌
  * 家族本来就是 Session 自己的字段。
+ *
+ * `ACCESS_KEY_ID_KEY` 走的是同一条链路（verifyAccessToken 写入 AuthInfo.extra →
+ * SDK → wrapTool 透传的第二个参数 → 工具里的 accessKeyIdFrom），也放在这里，
+ * 理由和失败方式都一样：键名写错不会有人报错，只会安静退回"调用方没有密钥"，
+ * 于是带密钥的会话和不带密钥的调用方互相对不上，或者更糟——两边都读不到而放行。
  */
 export const TOKEN_FAMILY_KEY = 'tokenFamilyId';
+export const ACCESS_KEY_ID_KEY = 'accessKeyId';
+
+export interface ToolExtraLike {
+  authInfo?: { extra?: Record<string, unknown> | undefined } | undefined;
+}
+
+function stringFromExtra(extra: ToolExtraLike | undefined, key: string): string | undefined {
+  const value = extra?.authInfo?.extra?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
 
 /** 从工具回调的 `extra` 里取出令牌家族 ID；没有（stdio 入口）或类型不对时返回 undefined。 */
-export function tokenFamilyIdFrom(extra?: {
-  authInfo?: { extra?: Record<string, unknown> | undefined } | undefined;
-}): string | undefined {
-  const value = extra?.authInfo?.extra?.[TOKEN_FAMILY_KEY];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+export function tokenFamilyIdFrom(extra?: ToolExtraLike): string | undefined {
+  return stringFromExtra(extra, TOKEN_FAMILY_KEY);
+}
+
+/** 从工具回调的 `extra` 里取出访问密钥 ID；没有（stdio / CLI 入口）或类型不对时返回 undefined。 */
+export function accessKeyIdFrom(extra?: ToolExtraLike): string | undefined {
+  return stringFromExtra(extra, ACCESS_KEY_ID_KEY);
 }
 
 export interface SessionStoreOptions {
@@ -67,6 +91,10 @@ export interface SessionStoreOptions {
 }
 
 const EXPIRED_HINT = '会话已失效，请调用 apple_login 重新获取 session_id 后重试本次操作';
+
+/** 会话不存在与会话归属不符共用这一个错误：调用方不能借此探测别人的 session_id 是否存在。 */
+const unknownSession = (): AppError =>
+  new AppError('SESSION_EXPIRED', '无效的 session_id', { hint: EXPIRED_HINT });
 
 export function createSessionStore(options: SessionStoreOptions): SessionStore {
   const sessions = new Map<string, Session>();
@@ -98,7 +126,7 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
   };
 
   return {
-    create(account, tokenFamilyId) {
+    create(account, tokenFamilyId, ownerKeyId) {
       const timestamp = now();
       const session: Session = {
         id: randomUUID(),
@@ -107,16 +135,16 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
         lastActiveAt: timestamp,
         providers: options.providerFactory(account),
         tokenFamilyId,
+        ownerKeyId,
       };
       sessions.set(session.id, session);
       return session;
     },
 
-    get(id) {
+    get(id, callerKeyId) {
       const session = sessions.get(id);
-      if (!session) {
-        throw new AppError('SESSION_EXPIRED', '无效的 session_id', { hint: EXPIRED_HINT });
-      }
+      // 归属不符必须在刷新 lastActiveAt 之前拒绝，否则别人猜 id 就能让我的会话一直不过期。
+      if (!session || session.ownerKeyId !== callerKeyId) throw unknownSession();
       const timestamp = now();
       if (timestamp - session.lastActiveAt > options.ttlMs) {
         sessions.delete(id);
@@ -127,8 +155,19 @@ export function createSessionStore(options: SessionStoreOptions): SessionStore {
       return session;
     },
 
-    destroy(id) {
+    async destroy(id, callerKeyId) {
+      const session = sessions.get(id);
+      if (!session || session.ownerKeyId !== callerKeyId) return false;
       return destroyById(id);
+    },
+
+    async destroyMatching(predicate) {
+      const matches = [...sessions.values()].filter(predicate);
+      let count = 0;
+      for (const session of matches) {
+        if (await destroyById(session.id)) count += 1;
+      }
+      return count;
     },
 
     async destroyByToken(tokenFamilyId) {

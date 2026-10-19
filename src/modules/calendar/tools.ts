@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { wrapTool } from '../../server/wrap.js';
-import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
-import type { Session } from '../../core/session.js';
+import type { ToolDeps, ToolExtra, ToolRegistrar } from '../../server/types.js';
+import { accessKeyIdFrom, type Session } from '../../core/session.js';
 import type { CalendarService } from './service.js';
 
 export interface CalendarToolDeps extends ToolDeps {
@@ -50,7 +50,7 @@ const patchSchema = z.object(eventShape).partial();
 
 export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolDeps): void {
   const { sessions, logger, calendarFor } = deps;
-  const serviceOf = (sessionId_: string): CalendarService => calendarFor(sessions.get(sessionId_));
+  const serviceOf = (sessionId_: string, extra?: ToolExtra): CalendarService => calendarFor(sessions.get(sessionId_, accessKeyIdFrom(extra)));
 
   server.registerTool(
     'calendar_list',
@@ -60,8 +60,8 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
       inputSchema: { session_id: sessionId },
       annotations: { readOnlyHint: true },
     },
-    wrapTool(logger, 'calendar_list', async (args: { session_id: string }) =>
-      serviceOf(args.session_id).listCalendars(),
+    wrapTool(logger, 'calendar_list', async (args: { session_id: string }, extra) =>
+      serviceOf(args.session_id, extra).listCalendars(),
     ),
   );
 
@@ -91,8 +91,8 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
         end: string;
         calendar_ids?: string[];
         expand_recurring?: boolean;
-      }) =>
-        serviceOf(args.session_id).listEvents({
+      }, extra) =>
+        serviceOf(args.session_id, extra).listEvents({
           start: args.start,
           end: args.end,
           calendar_ids: args.calendar_ids,
@@ -119,8 +119,8 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
     wrapTool(
       logger,
       'calendar_create_event',
-      async (args: { session_id: string; calendar_id?: string; event: z.infer<typeof eventSchema> }) =>
-        serviceOf(args.session_id).createEvent(args.event, args.calendar_id),
+      async (args: { session_id: string; calendar_id?: string; event: z.infer<typeof eventSchema> }, extra) =>
+        serviceOf(args.session_id, extra).createEvent(args.event, args.calendar_id),
     ),
   );
 
@@ -150,8 +150,8 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
         scope?: 'this' | 'all';
         recurrence_id?: string;
         expected_etag?: string;
-      }) =>
-        serviceOf(args.session_id).updateEvent(args.event_id, args.patch, {
+      }, extra) =>
+        serviceOf(args.session_id, extra).updateEvent(args.event_id, args.patch, {
           expected_etag: args.expected_etag,
           scope: args.scope,
           recurrence_id: args.recurrence_id,
@@ -183,8 +183,8 @@ export function registerCalendarTools(server: ToolRegistrar, deps: CalendarToolD
         scope?: 'this' | 'all';
         recurrence_id?: string;
         expected_etag?: string;
-      }) =>
-        serviceOf(args.session_id).deleteEvent(args.event_id, {
+      }, extra) =>
+        serviceOf(args.session_id, extra).deleteEvent(args.event_id, {
           expected_etag: args.expected_etag,
           scope: args.scope,
           recurrence_id: args.recurrence_id,

@@ -132,7 +132,7 @@ describe('apple_login', () => {
     const result = await tools.get('apple_login')!.handler({});
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content[0]!.text).error.code).toBe('AUTH_FAILED');
-    expect(destroy).toHaveBeenCalledWith('session-abc');
+    expect(destroy).toHaveBeenCalledWith('session-abc', undefined);
   });
 
   // core/config.ts 对一个非 iCloud 发信地址（典型：Gmail 版 Apple ID）关掉 mailRead/mailWrite，
@@ -237,7 +237,7 @@ describe('work_done', () => {
     registerSessionTools(server, { sessions: store, logger: silentLogger, config });
 
     const result = await tools.get('work_done')!.handler({ session_id: 'session-abc' });
-    expect(destroy).toHaveBeenCalledWith('session-abc');
+    expect(destroy).toHaveBeenCalledWith('session-abc', undefined);
     expect(JSON.parse(result.content[0]!.text)).toEqual({ success: true });
   });
 });
