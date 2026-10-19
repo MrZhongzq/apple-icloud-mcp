@@ -195,8 +195,8 @@ export function createAdminRouter(deps: AdminRouterDeps): express.Router {
       found = await store.setAccessKeyEnabled(id, false);
     } catch (err) {
       // setAccessKeyEnabled 只会在找到密钥、改完内存之后，于落盘时失败：此刻内存里它已经停用，
-      // 再点一次「停用」也只会走同一条路。所以切断必须现在就做，不能跟着这个错误一起被跳过；
-      // 做完再把原错误抛出去，让主人看到 500、知道没存上。
+      // 可它建立的会话和 transport 还活着，而主人看到报错未必会再点一次。所以切断必须现在就做，
+      // 不能跟着这个错误一起被跳过；做完再把原错误抛出去，让主人看到 500、知道没存上。
       await deps.cutOffAccessKey(id);
       throw err;
     }
