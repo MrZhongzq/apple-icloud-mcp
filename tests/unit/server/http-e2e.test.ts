@@ -708,6 +708,40 @@ describe('multi-person isolation', () => {
     }
   });
 
+  // 规格 §6：B 拿到 A 的 session_id（日志、截图、共享的调试输出），用自己的令牌、自己的 transport
+  // 去调工具。表现必须与这个 id 根本不存在时一样：SESSION_EXPIRED、work_done 回 success:false，
+  // 而且 A 的会话毫发无损——B 既不能用它，也不能借 work_done 把它关掉。
+  it("B cannot use or end A's session_id through its own transport", async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const tokenA = a.body.access_token as string;
+      const tokenB = b.body.access_token as string;
+
+      const loginA = await loginThroughMcpWithTransport(srv.base, tokenA);
+      const mcpSessionB = await openMcp(srv.base, tokenB);
+      expect(srv.sessions.size(), '只有 A 的一条会话').toBe(1);
+
+      const stolen = await callTool(srv.base, tokenB, mcpSessionB, 'calendar_list', { session_id: loginA.sessionId });
+      expect(stolen.isError, `B 用 A 的 session_id 调工具必须失败：${stolen.raw}`).toBe(true);
+      const error = stolen.payload.error as { code?: string; message?: string };
+      expect(error.code).toBe('SESSION_EXPIRED');
+      expect(error.message, '与 id 不存在时逐字相同').toBe('无效的 session_id');
+
+      const ended = await callTool(srv.base, tokenB, mcpSessionB, 'work_done', { session_id: loginA.sessionId });
+      expect(ended.payload, 'B 的 work_done 关不掉 A 的会话').toEqual({ success: false });
+
+      expect(srv.sessions.size(), 'A 的会话仍在 store 里').toBe(1);
+      expect(srv.sessions.get(loginA.sessionId, a.accessKeyId).id).toBe(loginA.sessionId);
+      expect(srv.closedProviders, 'A 的连接一条都没关').toEqual([]);
+      const own = await callTool(srv.base, tokenA, loginA.mcpSessionId, 'calendar_list', { session_id: loginA.sessionId });
+      expect(own.isError, `A 自己照常可用：${own.raw}`).toBe(false);
+    } finally {
+      await srv.close();
+    }
+  });
+
   // 断言的是会话从 SessionStore 里消失了，不是"之后 /mcp 返回 401"：后者在令牌记录一删时
   // 就自然成立，哪怕一条会话都没销毁。也不能拿"get(sessionA) 抛错"当证据——归属检查本来就
   // 会让 B（或不带密钥的调用方）取 A 的会话时抛错，什么都没销毁时它也是绿的。
