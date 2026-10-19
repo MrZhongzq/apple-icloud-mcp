@@ -8,6 +8,8 @@ import { createProviders } from '../providers/icloud/index.js';
 import { createAuthStore } from '../auth/store.js';
 import { createOAuthProvider } from '../auth/provider.js';
 import { createPendingStore } from '../auth/login.js';
+import { loadOrCreateEnvelopeKeyring } from '../auth/keyring.js';
+import { createEnvelopeOpener } from '../auth/envelope.js';
 import { createHttpApp } from '../server/httpApp.js';
 import { AppError } from '../core/errors.js';
 
@@ -36,6 +38,15 @@ async function main(): Promise<void> {
   // 解密失败（密钥变了/文件损坏）必须在这里就退出，而不是带着一个打不开的令牌存储去监听端口。
   await store.load();
 
+  // 信封私钥同理：文件解不开（TOKEN_ENCRYPTION_KEY 变了）就在 listen 之前退出，而不是带着一个
+  // 谁的信封都拆不开的服务器上线。文件不存在时生成一对新的。
+  const keyring = await loadOrCreateEnvelopeKeyring({
+    path: httpConfig.envelopeKeyPath,
+    encryptionKey: httpConfig.encryptionKey,
+    logger,
+  });
+  const opener = createEnvelopeOpener({ keyring, logger });
+
   // provider.authorize() 与 /access-login 路由必须共享同一个 pending store，否则登录页
   // 永远找不到 authorize() 暂存的待授权请求——这里显式建一个，两处都传。
   // 访问密钥也一样：/access-login 查密钥、provider 兑换/校验令牌时回看密钥状态，用的必须
@@ -51,6 +62,7 @@ async function main(): Promise<void> {
     logger,
     store,
     pending,
+    envelope: { publicKeyText: keyring.publicKeyText, open: opener.open },
   });
 
   const server = createNodeServer(app);
@@ -78,13 +90,16 @@ async function main(): Promise<void> {
   const sweeper = setInterval(() => {
     // transport 表也必须在这里扫：它只在客户端正常关闭（DELETE 或连接自然结束）时才会
     // 自己收缩，一个直接断线重连的客户端每重连一次就漏掉一个 transport 加一个 McpServer。
+    // 用过的信封 nonce 也一样：窗口过了就没必要再记着（那个信封本身已经过期，会以"过期"被拒）。
+    const removedNonces = opener.sweep();
     void Promise.all([sessions.sweep(), provider.sweep(), sweepIdleTransports()])
       .then(([removedSessions, removedAuth, removedTransports]) => {
-        if (removedSessions > 0 || removedAuth > 0 || removedTransports > 0) {
+        if (removedSessions > 0 || removedAuth > 0 || removedTransports > 0 || removedNonces > 0) {
           logger.debug('swept expired sessions and auth records', {
             removedSessions,
             removedAuth,
             removedTransports,
+            removedNonces,
           });
         }
       })

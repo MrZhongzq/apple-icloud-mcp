@@ -10,6 +10,9 @@ import { createAuthStore } from '../../../src/auth/store.js';
 import { createPendingStore } from '../../../src/auth/login.js';
 import { hashPassword } from '../../../src/auth/crypto.js';
 import { createLogger } from '../../../src/core/logger.js';
+import { loadOrCreateEnvelopeKeyring, type EnvelopeKeyring } from '../../../src/auth/keyring.js';
+import { createEnvelopeOpener } from '../../../src/auth/envelope.js';
+import { sealEnvelope } from '../../../scripts/make-envelope.mjs';
 import type { AppConfig } from '../../../src/core/config.js';
 import { createSessionStore, type SessionStore } from '../../../src/core/session.js';
 
@@ -82,6 +85,8 @@ interface TestServer {
   cutOffAccessKey: (keyId: string) => Promise<void>;
   /** 关掉 env 账号开关之后调用：销毁所有用 env 账号建立的会话。 */
   onEnvAccountsDisabled: () => Promise<void>;
+  /** 只有 `withEnvelope: true` 时才有：服务端的信封密钥对，测试拿它的公钥封信封。 */
+  keyring?: EnvelopeKeyring;
   close: () => Promise<void>;
 }
 
@@ -90,6 +95,8 @@ interface StartServerOptions {
   envAccountsEnabled?: boolean;
   /** 覆盖 config.accounts；远程入口允许零个 env 账号。 */
   accounts?: AppConfig['accounts'];
+  /** 像 bin/http.ts 那样加载一个信封密钥对（临时路径），并把 opener 与公钥交给 createHttpApp。 */
+  withEnvelope?: boolean;
 }
 
 /** 建一个绑在端口 0 上的真实 http server，用完必须在 finally 里 close，不占端口。 */
@@ -130,7 +137,7 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
             closedProviders.push('smtp');
           },
         },
-        caldav: { verify: async (): Promise<void> => {} },
+        caldav: { verify: async (): Promise<void> => {}, listCalendars: async (): Promise<never[]> => [] },
         carddav: { verify: async (): Promise<void> => {} },
       }) as never,
   });
@@ -145,8 +152,20 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
     tokenStorePath: join(dir, 'tokens.json.enc'),
     encryptionKey: randomBytes(32),
     trustProxy: false,
-    envelopeKeyPath: '/tmp/envelope-key.json.enc',
+    envelopeKeyPath: join(dir, 'envelope-key.json.enc'),
   };
+
+  let keyring: EnvelopeKeyring | undefined;
+  let envelope: { publicKeyText: string; open: ReturnType<typeof createEnvelopeOpener>['open'] } | undefined;
+  if (options.withEnvelope) {
+    keyring = await loadOrCreateEnvelopeKeyring({
+      path: httpConfig.envelopeKeyPath,
+      encryptionKey: httpConfig.encryptionKey,
+      logger,
+    });
+    const opener = createEnvelopeOpener({ keyring, logger });
+    envelope = { publicKeyText: keyring.publicKeyText, open: opener.open };
+  }
 
   const { app, closeAll, sweepIdleTransports, cutOffAccessKey, onEnvAccountsDisabled } = createHttpApp({
     config,
@@ -156,6 +175,7 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
     logger,
     store,
     pending,
+    envelope,
   });
   const server = createNodeServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -171,6 +191,7 @@ async function startServer(options: StartServerOptions = {}): Promise<TestServer
     accessKeyB,
     cutOffAccessKey,
     onEnvAccountsDisabled,
+    keyring,
     async close() {
       await closeAll();
       await sessions.destroyAll();
@@ -776,6 +797,111 @@ describe('multi-person isolation', () => {
       expect(listed.names).toContain('apple_login');
       expect(listed.names).toContain('mail_send');
       expect(listed.names).toContain('contacts_search');
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+const FRIEND_ENV = { ICLOUD_ACCOUNT_1: 'friend@icloud.com', ICLOUD_APP_PASSWORD_1: 'friend-app-password' };
+
+describe('envelope login', () => {
+  // 远程入口的目标场景：主人的 env 账号开关关着，朋友用自己的访问密钥 B 加自己封的信封登录。
+  it('a friend logs in with an envelope, uses a tool, and work_done ends it', async () => {
+    const srv = await startServer({ envAccountsEnabled: false, withEnvelope: true });
+    try {
+      const keyring = srv.keyring as EnvelopeKeyring;
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const token = b.body.access_token as string;
+      const mcpSessionId = await openMcp(srv.base, token);
+
+      const login = await callTool(srv.base, token, mcpSessionId, 'apple_login', {
+        envelope: sealEnvelope(keyring.publicKeyText, FRIEND_ENV),
+      });
+      expect(login.isError, `信封登录失败：${login.raw}`).toBe(false);
+      expect(login.payload.account).toBe('friend@icloud.com');
+      expect(login.payload, '没有降级说明时不出现 notices').not.toHaveProperty('notices');
+      expect(login.raw, '响应里绝不能回显 App 专用密码').not.toContain(FRIEND_ENV.ICLOUD_APP_PASSWORD_1);
+      const sessionId = login.payload.session_id as string;
+      expect(srv.sessions.size()).toBe(1);
+      expect(srv.sessions.get(sessionId, b.accessKeyId).account.origin).toBe('envelope');
+
+      const calendars = await callTool(srv.base, token, mcpSessionId, 'calendar_list', { session_id: sessionId });
+      expect(calendars.isError, `calendar_list 失败：${calendars.raw}`).toBe(false);
+      expect(calendars.payload).toEqual([]);
+
+      const done = await callTool(srv.base, token, mcpSessionId, 'work_done', { session_id: sessionId });
+      expect(done.payload).toEqual({ success: true });
+      expect(srv.sessions.size()).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('replaying the same envelope through /mcp is refused', async () => {
+    const srv = await startServer({ envAccountsEnabled: false, withEnvelope: true });
+    try {
+      const keyring = srv.keyring as EnvelopeKeyring;
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const token = b.body.access_token as string;
+      const mcpSessionId = await openMcp(srv.base, token);
+      const envelope = sealEnvelope(keyring.publicKeyText, FRIEND_ENV);
+
+      const first = await callTool(srv.base, token, mcpSessionId, 'apple_login', { envelope });
+      expect(first.isError).toBe(false);
+
+      const replay = await callTool(srv.base, token, mcpSessionId, 'apple_login', { envelope });
+      expect(replay.isError).toBe(true);
+      const error = replay.payload.error as { code?: string; message?: string };
+      expect(error.code).toBe('INVALID_INPUT');
+      expect(error.message).toBe('这个信封已经用过');
+      expect(srv.sessions.size(), '重放不能多建一条会话').toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('the admin dashboard shows the envelope public key', async () => {
+    const srv = await startServer({ envAccountsEnabled: false, withEnvelope: true });
+    try {
+      const keyring = srv.keyring as EnvelopeKeyring;
+      const loginRes = await fetch(`${srv.base}/admin/login`, {
+        method: 'POST',
+        // 管理页的 POST 要求 Origin 恰好是 PUBLIC_URL 的 origin（startServer 里的 publicUrl）。
+        headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'http://127.0.0.1:19999' },
+        redirect: 'manual',
+        body: new URLSearchParams({ password: ADMIN_PASSWORD }).toString(),
+      });
+      expect(loginRes.status, '管理员登录').toBe(303);
+      const cookie = (loginRes.headers.get('set-cookie') ?? '').split(';')[0] as string;
+      expect(cookie).toMatch(/^amcp_admin=/);
+
+      const dashboard = await fetch(`${srv.base}/admin`, { headers: { cookie }, redirect: 'manual' });
+      expect(dashboard.status).toBe(200);
+      expect(await dashboard.text()).toContain(keyring.publicKeyText);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tools/list advertises envelope on apple_login', async () => {
+    const srv = await startServer({ envAccountsEnabled: false, withEnvelope: true });
+    try {
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const token = b.body.access_token as string;
+      const mcpSessionId = await openMcp(srv.base, token);
+      const res = await mcpPost(srv.base, token, { jsonrpc: '2.0', id: 3, method: 'tools/list' }, mcpSessionId);
+      expect(res.status).toBe(200);
+      const tools =
+        (res.messages.find((m) => m.id === 3)?.result as
+          | { tools?: Array<{ name: string; inputSchema?: { properties?: Record<string, { description?: string }> } }> }
+          | undefined)?.tools ?? [];
+      const login = tools.find((t) => t.name === 'apple_login');
+      const envelopeProp = login?.inputSchema?.properties?.envelope;
+      expect(envelopeProp, 'apple_login 的 schema 里必须有 envelope').toBeDefined();
+      expect(envelopeProp?.description).toBe(
+        '远程入口的登录凭据：运行 node scripts/make-envelope.mjs 得到的一整行，原样传入。与 account 二选一。',
+      );
     } finally {
       await srv.close();
     }

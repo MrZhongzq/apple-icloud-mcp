@@ -118,6 +118,7 @@ describe('apple_login', () => {
     expect(payload.capabilities.mailWrite).toBe(true);
     expect(payload.capabilities).toHaveProperty('contactsRead');
     expect(payload.capabilities).toHaveProperty('contactsWrite');
+    expect(payload, '没有降级说明时不带 notices 字段').not.toHaveProperty('notices');
   });
 
   it('destroys the session and reports AUTH_FAILED when verification fails', async () => {
@@ -161,6 +162,28 @@ describe('apple_login', () => {
     expect(providers.caldav.verify).toHaveBeenCalled();
     expect(providers.carddav.verify).toHaveBeenCalled();
     expect(destroy).not.toHaveBeenCalled();
+    // 降级说明原本只在启动时写进 stderr，调用方看不见；登录响应里要把属于这个账号的那条带上。
+    expect(payload.notices).toEqual(mailless.notices);
+    expect(payload.notices).toHaveLength(1);
+  });
+
+  it("surfaces only this account's notice when several env accounts were downgraded", async () => {
+    const two = loadConfig({
+      ICLOUD_ACCOUNT_1: 'one@gmail.com',
+      ICLOUD_APP_PASSWORD_1: 'abcd-efgh-ijkl-mnop',
+      ICLOUD_ACCOUNT_2: 'two@gmail.com',
+      ICLOUD_APP_PASSWORD_2: 'abcd-efgh-ijkl-mnop',
+    });
+    expect(two.notices).toHaveLength(2);
+
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers, two);
+    (store.create as ReturnType<typeof vi.fn>).mockReturnValue({ id: 'session-two', account: two.accounts[1], providers });
+    registerSessionTools(server, { sessions: store, logger: silentLogger, config: two });
+
+    const payload = JSON.parse((await tools.get('apple_login')!.handler({ account: 'two@gmail.com' })).content[0]!.text);
+    expect(payload.notices).toEqual([two.notices[1]]);
   });
 
   it('verifies only CalDAV for a calendar-and-reminders-only account', async () => {
@@ -350,6 +373,23 @@ describe('apple_login / apple_accounts in remote mode', () => {
     expect(openEnvelope).toHaveBeenCalledWith('ame1.sealed');
     expect(store.create).toHaveBeenCalledWith(envelopeAccount, undefined, undefined);
     expect(JSON.parse(result.content[0]!.text).account).toBe('friend@icloud.com');
+  });
+
+  it('an envelope login carries the notices the opener produced', async () => {
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers);
+    const envelopeAccount = { ...config.accounts[0]!, email: 'friend@gmail.com', origin: 'envelope' as const };
+    const openEnvelope = vi.fn().mockReturnValue({ account: envelopeAccount, notices: ['邮件工具已禁用'] });
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => false, openEnvelope },
+    });
+
+    const result = await tools.get('apple_login')!.handler({ envelope: 'ame1.sealed' });
+    expect(JSON.parse(result.content[0]!.text).notices).toEqual(['邮件工具已禁用']);
   });
 });
 

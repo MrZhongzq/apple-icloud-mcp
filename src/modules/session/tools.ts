@@ -40,24 +40,39 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
         envelope: z
           .string()
           .optional()
-          .describe('make-envelope.mjs 输出的那一整行加密信封，原样传入；与 account 互斥'),
+          .describe('远程入口的登录凭据：运行 node scripts/make-envelope.mjs 得到的一整行，原样传入。与 account 二选一。'),
       }
     : { account: accountArg };
 
-  function resolveAccount(args: { account?: string; envelope?: string }): AccountConfig {
+  /** 返回要登录的账号，以及它被自动降级时的说明（例如 Gmail 版 Apple ID 的邮件工具被关掉）。 */
+  function resolveAccount(args: { account?: string; envelope?: string }): {
+    account: AccountConfig;
+    notices: string[];
+  } {
     if (openEnvelope && args.envelope !== undefined) {
       if (args.account !== undefined) {
         throw new AppError('INVALID_INPUT', 'account 与 envelope 只能给一个', {
           hint: '用信封登录时只传 envelope；信封里已经带着账号',
         });
       }
-      return openEnvelope(args.envelope).account;
+      return openEnvelope(args.envelope);
     }
     // 先看开关、后找账号：开关关着时连"这个邮箱有没有配置"都不该透露。
     if (!envAccountsUsable()) {
       throw new AppError('INVALID_INPUT', '这台服务器只接受加密信封登录', { hint: ENVELOPE_ONLY_HINT });
     }
-    return findAccount(config, args.account);
+    const account = findAccount(config, args.account);
+    return { account, notices: envNoticesFor(account) };
+  }
+
+  /**
+   * config.notices 是启动时为所有 env 账号攒下的一张扁平列表，不按账号分组；这里挑出属于这个
+   * 账号的那条。core/config.ts::parseAccount 写的每条说明都以"账号 <label>：发信地址 <sender> "开头，
+   * label 与 sender 合在一起足以分清不同账号。
+   */
+  function envNoticesFor(account: AccountConfig): string[] {
+    const prefix = `账号 ${account.label}：发信地址 ${account.sender} `;
+    return config.notices.filter((notice) => notice.startsWith(prefix));
   }
 
   server.registerTool(
@@ -93,7 +108,7 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
     wrapTool(logger, 'apple_login', async (args: { account?: string; envelope?: string }, extra) => {
-      const account = resolveAccount(args);
+      const { account, notices } = resolveAccount(args);
 
       // 每个协议只在它服务的能力真的开着时才验证。无条件验证 IMAP 会把
       // core/config.ts 的 iCloud 发信域名保护整个反过来用：那条保护对一个
@@ -132,6 +147,8 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
         account: account.email,
         label: account.label,
         capabilities: account.capabilities,
+        // 降级说明以前只写进服务端 stderr，调用方看不见，只会困惑于邮件工具为什么报权限不足。
+        ...(notices.length > 0 ? { notices } : {}),
       };
     }),
   );
