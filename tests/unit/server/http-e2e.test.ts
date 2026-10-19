@@ -74,20 +74,38 @@ interface TestServer {
   sessions: SessionStore;
   /** 被销毁的会话关掉了哪些底层连接。 */
   closedProviders: string[];
-  /** startServer 建的那把访问密钥的明文，授权页上要提交的就是它。 */
+  /** startServer 建的那把访问密钥的明文，授权页上要提交的就是它。（即密钥 A。） */
   accessKey: string;
+  /** 第二个人的密钥 B：多人隔离那几条用例要两把互不相干的密钥。 */
+  accessKeyB: string;
+  /** 切断一把密钥：吊销令牌、销毁它名下的会话、关掉它名下的 transport。 */
+  cutOffAccessKey: (keyId: string) => Promise<void>;
+  /** 关掉 env 账号开关之后调用：销毁所有用 env 账号建立的会话。 */
+  onEnvAccountsDisabled: () => Promise<void>;
   close: () => Promise<void>;
 }
 
+interface StartServerOptions {
+  /** env 账号开关。默认 true：现有用例都用 `.env` 账号登录，不该因为默认值变了而变红。 */
+  envAccountsEnabled?: boolean;
+  /** 覆盖 config.accounts；远程入口允许零个 env 账号。 */
+  accounts?: AppConfig['accounts'];
+}
+
 /** 建一个绑在端口 0 上的真实 http server，用完必须在 finally 里 close，不占端口。 */
-async function startServer(): Promise<TestServer> {
+async function startServer(options: StartServerOptions = {}): Promise<TestServer> {
   const dir = mkdtempSync(join(tmpdir(), 'http-e2e-'));
   dirs.push(dir);
 
   const store = createAuthStore({ path: join(dir, 'tokens.json.enc'), key: randomBytes(32), logger });
   await store.load();
+  await store.setEnvAccountsEnabled(options.envAccountsEnabled ?? true);
   const { record: keyRecord, plaintext: accessKey } = await store.createAccessKey('e2e');
   keyIdsByPlaintext.set(accessKey, keyRecord.id);
+  const { record: keyRecordB, plaintext: accessKeyB } = await store.createAccessKey('e2e-b');
+  keyIdsByPlaintext.set(accessKeyB, keyRecordB.id);
+
+  const config: AppConfig = options.accounts === undefined ? appConfig : { ...appConfig, accounts: options.accounts };
 
   const pending = createPendingStore();
 
@@ -130,8 +148,8 @@ async function startServer(): Promise<TestServer> {
     envelopeKeyPath: '/tmp/envelope-key.json.enc',
   };
 
-  const { app, closeAll, sweepIdleTransports } = createHttpApp({
-    config: appConfig,
+  const { app, closeAll, sweepIdleTransports, cutOffAccessKey, onEnvAccountsDisabled } = createHttpApp({
+    config,
     httpConfig,
     sessions,
     provider,
@@ -150,6 +168,9 @@ async function startServer(): Promise<TestServer> {
     sessions,
     closedProviders,
     accessKey,
+    accessKeyB,
+    cutOffAccessKey,
+    onEnvAccountsDisabled,
     async close() {
       await closeAll();
       await sessions.destroyAll();
@@ -284,6 +305,26 @@ async function mcpPost(
  *  刻意走完整的 MCP 握手而不是直接调服务层函数：令牌家族正是在这条路上被 SDK 从
  *  requireBearerAuth 一路传到工具回调第二个参数的，绕过它就等于没测。 */
 async function loginThroughMcp(base: string, accessToken: string): Promise<string> {
+  return (await loginThroughMcpWithTransport(base, accessToken)).sessionId;
+}
+
+/** 同 loginThroughMcp，但把这次握手拿到的 mcp-session-id 也交回来：
+ *  多人隔离那几条用例之后还要在同一条 transport 上发请求。 */
+async function loginThroughMcpWithTransport(
+  base: string,
+  accessToken: string,
+): Promise<{ sessionId: string; mcpSessionId: string }> {
+  const mcpSessionId = await openMcp(base, accessToken);
+  const { isError, payload, raw } = await callTool(base, accessToken, mcpSessionId, 'apple_login', {});
+  const sessionId = (payload as { session_id?: unknown }).session_id;
+  if (isError || typeof sessionId !== 'string') {
+    throw new Error(`apple_login did not return a session_id: ${raw}`);
+  }
+  return { sessionId, mcpSessionId };
+}
+
+/** initialize -> notifications/initialized，返回 mcp-session-id。 */
+async function openMcp(base: string, accessToken: string): Promise<string> {
   const init = await mcpPost(base, accessToken, {
     jsonrpc: '2.0',
     id: 1,
@@ -297,26 +338,56 @@ async function loginThroughMcp(base: string, accessToken: string): Promise<strin
   expect(init.status, `initialize 失败 —— body: ${init.raw}`).toBe(200);
   const mcpSessionId = init.mcpSessionId;
   if (mcpSessionId === undefined) throw new Error('initialize did not return an mcp-session-id header');
-
   await mcpPost(base, accessToken, { jsonrpc: '2.0', method: 'notifications/initialized' }, mcpSessionId);
+  return mcpSessionId;
+}
 
+/** tools/call 一个工具，返回它的 isError 与解析过的文本载荷。 */
+async function callTool(
+  base: string,
+  accessToken: string,
+  mcpSessionId: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ isError: boolean; payload: Record<string, unknown>; raw: string }> {
   const call = await mcpPost(
     base,
     accessToken,
-    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'apple_login', arguments: {} } },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } },
     mcpSessionId,
   );
-  expect(call.status, `tools/call apple_login 失败 —— body: ${call.raw}`).toBe(200);
-
+  expect(call.status, `tools/call ${name} 失败 —— body: ${call.raw}`).toBe(200);
   const message = call.messages.find((m) => m.id === 2);
   const result = message?.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined;
   const text = result?.content?.[0]?.text;
-  if (typeof text !== 'string') throw new Error(`apple_login returned no text content: ${call.raw}`);
-  const payload = JSON.parse(text) as { session_id?: string };
-  if (typeof payload.session_id !== 'string') {
-    throw new Error(`apple_login did not return a session_id: ${text}`);
-  }
-  return payload.session_id;
+  if (typeof text !== 'string') throw new Error(`${name} returned no text content: ${call.raw}`);
+  return { isError: result?.isError === true, payload: JSON.parse(text) as Record<string, unknown>, raw: call.raw };
+}
+
+/** tools/list，返回 HTTP 状态码与工具名列表（非 200 时列表为空）。 */
+async function listTools(
+  base: string,
+  accessToken: string,
+  mcpSessionId: string,
+): Promise<{ status: number; names: string[] }> {
+  const res = await mcpPost(base, accessToken, { jsonrpc: '2.0', id: 3, method: 'tools/list' }, mcpSessionId);
+  const message = res.messages.find((m) => m.id === 3);
+  const tools = (message?.result as { tools?: Array<{ name: string }> } | undefined)?.tools ?? [];
+  return { status: res.status, names: tools.map((t) => t.name) };
+}
+
+/** DELETE /mcp：客户端正常结束一条 MCP 会话的方式，也是 B 想关掉 A 的连接时会用的方式。 */
+async function mcpDelete(base: string, accessToken: string, mcpSessionId: string): Promise<number> {
+  const res = await fetch(`${base}/mcp`, {
+    method: 'DELETE',
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      'mcp-session-id': mcpSessionId,
+      'mcp-protocol-version': PROTOCOL_VERSION,
+    },
+  });
+  await res.text();
+  return res.status;
 }
 
 describe('oauth chain end to end (real provider, real store, real port)', () => {
@@ -582,6 +653,129 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
       expect(parsed, '响应必须是可解析的 JSON，不是 HTML 错误页').not.toBeNull();
       expect((parsed as Record<string, unknown>).jsonrpc).toBe('2.0');
       expect((parsed as Record<string, unknown>).error).toBeTruthy();
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe('multi-person isolation', () => {
+  // B 拿到 A 的 mcp-session-id（日志、截图、共享的调试输出里都可能露出来）之后，不能用自己的
+  // 令牌在 A 的 transport 上发请求，也不能 DELETE 掉它。表现必须和"这个 id 不存在"一模一样。
+  it("B cannot use A's mcp-session-id", async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const tokenA = a.body.access_token as string;
+      const tokenB = b.body.access_token as string;
+
+      const mcpSessionA = await openMcp(srv.base, tokenA);
+      expect((await listTools(srv.base, tokenA, mcpSessionA)).status, 'A 在自己的 transport 上可用').toBe(200);
+
+      const stolen = await listTools(srv.base, tokenB, mcpSessionA);
+      expect(stolen.status, "B 带 A 的 mcp-session-id 发请求，必须与 id 不存在时一样是 400").toBe(400);
+      expect(stolen.names).toEqual([]);
+
+      expect(await mcpDelete(srv.base, tokenB, mcpSessionA), 'B 不能关掉 A 的 transport').toBe(400);
+      expect(
+        (await listTools(srv.base, tokenA, mcpSessionA)).status,
+        'B 的 DELETE 之后 A 的 transport 必须仍然活着',
+      ).toBe(200);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // 断言的是会话从 SessionStore 里消失了，不是"之后 /mcp 返回 401"：后者在令牌记录一删时
+  // 就自然成立，哪怕一条会话都没销毁。也不能拿"get(sessionA) 抛错"当证据——归属检查本来就
+  // 会让 B（或不带密钥的调用方）取 A 的会话时抛错，什么都没销毁时它也是绿的。
+  it("cutting off A destroys A's sessions and transports but not B's", async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const b = await runFullAuthFlow(srv.base, srv.accessKeyB);
+      const tokenA = a.body.access_token as string;
+      const tokenB = b.body.access_token as string;
+
+      const loginA = await loginThroughMcpWithTransport(srv.base, tokenA);
+      const loginB = await loginThroughMcpWithTransport(srv.base, tokenB);
+      expect(srv.sessions.size(), 'A、B 各一条会话').toBe(2);
+      expect(srv.sessions.get(loginA.sessionId, a.accessKeyId).id).toBe(loginA.sessionId);
+      expect(srv.closedProviders, '切断之前什么连接都还没关').toEqual([]);
+
+      await srv.cutOffAccessKey(a.accessKeyId);
+
+      expect(srv.sessions.size(), "只剩 B 的那一条会话：A 的必须从 store 里消失").toBe(1);
+      expect(srv.sessions.get(loginB.sessionId, b.accessKeyId).id, 'B 的会话不受影响').toBe(loginB.sessionId);
+      expect(() => srv.sessions.get(loginA.sessionId, a.accessKeyId), '带着 A 自己的密钥 id 也取不到了').toThrow();
+      expect(srv.closedProviders, 'A 的 IMAP 连接必须真的关掉').toContain('imap');
+
+      const afterA = await mcpPost(srv.base, tokenA, { jsonrpc: '2.0', id: 9, method: 'tools/list' }, loginA.mcpSessionId);
+      expect(afterA.status, 'A 的令牌已被吊销').toBe(401);
+
+      expect((await listTools(srv.base, tokenB, loginB.mcpSessionId)).status, 'B 照常可用').toBe(200);
+
+      // A 的 transport 也必须已经从表里摘掉：此时让所有 transport 都"过期"，清理器只能找到 B 那一条。
+      expect(
+        await srv.sweepIdleTransports(Date.now() + appConfig.sessionTtlMs + 1_000),
+        "A 的 transport 应当在切断时就已关闭摘除，表里只剩 B 的",
+      ).toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('turning env accounts off destroys sessions built on env accounts', async () => {
+    const srv = await startServer();
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      await loginThroughMcp(srv.base, a.body.access_token as string);
+      expect(srv.sessions.size()).toBe(1);
+
+      await srv.onEnvAccountsDisabled();
+
+      expect(srv.sessions.size(), 'env 账号建立的会话必须当场消失').toBe(0);
+      expect(srv.closedProviders).toContain('imap');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // "朋友登进主人 iCloud"那个反目标的直接测试：`.env` 里有账号，但开关关着。
+  it('env accounts disabled: apple_login without envelope fails through /mcp', async () => {
+    const srv = await startServer({ envAccountsEnabled: false });
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const token = a.body.access_token as string;
+      const mcpSessionId = await openMcp(srv.base, token);
+
+      const login = await callTool(srv.base, token, mcpSessionId, 'apple_login', {});
+      expect(login.isError).toBe(true);
+      expect((login.payload.error as { code?: string }).code).toBe('INVALID_INPUT');
+      expect(srv.sessions.size(), '一条会话都不能建').toBe(0);
+
+      const accounts = await callTool(srv.base, token, mcpSessionId, 'apple_accounts', {});
+      expect(accounts.payload, '开关关着时 apple_accounts 不列出 env 账号').toEqual([]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // 远程入口的账号在登录时才出现（信封），注册阶段看不到任何能力：按 env 账号的能力决定注册
+  // 哪些模块的话，零个 env 账号的服务器就只剩三个会话工具，信封登录进来什么也做不了。
+  it('remote entry registers all 25 tools even with zero env accounts', async () => {
+    const srv = await startServer({ accounts: [] });
+    try {
+      const a = await runFullAuthFlow(srv.base, srv.accessKey);
+      const token = a.body.access_token as string;
+      const mcpSessionId = await openMcp(srv.base, token);
+      const listed = await listTools(srv.base, token, mcpSessionId);
+      expect(listed.status).toBe(200);
+      expect(listed.names).toHaveLength(25);
+      expect(listed.names).toContain('apple_login');
+      expect(listed.names).toContain('mail_send');
+      expect(listed.names).toContain('contacts_search');
     } finally {
       await srv.close();
     }

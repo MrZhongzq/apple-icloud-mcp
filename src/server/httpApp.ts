@@ -8,9 +8,9 @@ import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.
 import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createServer } from './createServer.js';
-import type { AppConfig, HttpConfig } from '../core/config.js';
+import type { AccountConfig, AppConfig, HttpConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
-import type { SessionStore } from '../core/session.js';
+import { accessKeyIdFrom, type SessionStore } from '../core/session.js';
 import type { AppleOAuthProvider } from '../auth/provider.js';
 import type { AuthStore } from '../auth/store.js';
 import {
@@ -28,8 +28,13 @@ export interface CreateHttpAppDeps {
   sessions: SessionStore;
   provider: AppleOAuthProvider;
   logger: Logger;
-  /** `/access-login` 凭它按明文查访问密钥。生产环境传的就是构建 `provider` 用的同一个 store。 */
-  store: Pick<AuthStore, 'findAccessKeyByPlaintext'>;
+  /**
+   * `/access-login` 凭它按明文查访问密钥；`apple_login` 每次现读它的 env 账号开关；切断一把
+   * 密钥时用它吊销该密钥名下的令牌。生产环境传的就是构建 `provider` 用的同一个 store。
+   */
+  store: AuthStore;
+  /** 信封登录：服务端公钥文本与解信封的函数。没有配置信封私钥时不传，`apple_login` 也就没有 `envelope` 参数。 */
+  envelope?: { publicKeyText: string; open: (text: string) => { account: AccountConfig; notices: string[] } };
   /**
    * `authorize()`（provider.ts，任务四）把待授权请求暂存在这里，`/access-login` 提交时凭
    * requestId 取回并消费。这个 store 必须与构建 `provider` 时传给 `createOAuthProvider`
@@ -47,6 +52,14 @@ export interface HttpApp {
    *  `now` 只为测试留的注入点（与 SessionStore 的 `now`、AuthStore 的 `sweep(now)` 同一路数），
    *  生产调用方不传。 */
   sweepIdleTransports: (now?: number) => Promise<number>;
+  /**
+   * 切断一把访问密钥（管理页停用或删除它时调用）：吊销它名下全部令牌 → 销毁它建立的全部
+   * iCloud 会话（关闭底层连接）→ 关掉它名下的 MCP transport。三步缺一不可：只吊销令牌，
+   * 会话要等 TTL 才过期；只销毁会话，令牌还能再登录；不关 transport，表里留着一条没人能用的连接。
+   */
+  cutOffAccessKey: (keyId: string) => Promise<void>;
+  /** 管理页关掉 env 账号开关之后调用：销毁所有用 env 账号（不是信封）建立的会话。 */
+  onEnvAccountsDisabled: () => Promise<void>;
 }
 
 const ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60_000;
@@ -110,11 +123,19 @@ interface McpEntry {
   server: McpServer;
   /** 最后一次经过这条 transport 的请求时刻；空闲清理按它判断。 */
   lastActiveAt: number;
+  /** 发起 initialize 的访问密钥 id。之后的请求只要不是这把密钥发来的，就当这条 transport 不存在。 */
+  ownerKeyId?: string;
 }
 
 /** v1 的头号缺陷：一个模块级 transport 变量，第二个客户端接入直接顶掉第一个。
  *  这里以 MCP 会话 ID 为键维护每个客户端各自的 transport + McpServer。 */
-function createMcpRouteHandler(deps: { config: AppConfig; sessions: SessionStore; logger: Logger }) {
+function createMcpRouteHandler(deps: {
+  config: AppConfig;
+  sessions: SessionStore;
+  logger: Logger;
+  store: AuthStore;
+  envelope?: CreateHttpAppDeps['envelope'];
+}) {
   const entries = new Map<string, McpEntry>();
   /** 复用会话 TTL，不另立一个旋钮：这张表里的每一项本来就对应"一个还在用的客户端"，
    *  判断它是否还在用的标准与 SessionStore 判断会话是否还活着的标准应当是同一个。 */
@@ -142,6 +163,22 @@ function createMcpRouteHandler(deps: { config: AppConfig; sessions: SessionStore
     return stale.length;
   }
 
+  /** 关掉某把密钥名下的全部 transport 并从表里摘掉，返回关闭条数。 */
+  async function closeTransportsOwnedBy(keyId: string): Promise<number> {
+    const owned = [...entries.entries()].filter(([, entry]) => entry.ownerKeyId === keyId);
+    for (const [id] of owned) entries.delete(id);
+    await Promise.all(
+      owned.map(([, entry]) =>
+        entry.transport.close().catch((err: unknown) => {
+          deps.logger.warn('failed to close a cut-off mcp transport', {
+            detail: err instanceof Error ? err.name : typeof err,
+          });
+        }),
+      ),
+    );
+    return owned.length;
+  }
+
   async function closeAll(): Promise<void> {
     const all = [...entries.values()];
     entries.clear();
@@ -160,11 +197,28 @@ function createMcpRouteHandler(deps: { config: AppConfig; sessions: SessionStore
     const rawSessionId = req.headers['mcp-session-id'];
     const sessionId = typeof rawSessionId === 'string' ? rawSessionId : undefined;
 
+    const callerKeyId = accessKeyIdFrom({ authInfo: req.auth });
+
     let entry = sessionId !== undefined ? entries.get(sessionId) : undefined;
+    // 别人的 transport 按"找不到"处理，走下面同一个 400 分支：B 拿到 A 的 mcp-session-id 之后，
+    // 既不能在上面发请求、挂 SSE 流，也不能 DELETE 掉它；响应与 id 不存在时逐字相同，
+    // 不让 B 借此确认这个 id 是活的。iCloud 会话的归属仍然只在 SessionStore 里检查，这是另一层资源。
+    if (entry && entry.ownerKeyId !== callerKeyId) entry = undefined;
 
     if (!entry) {
       if (req.method === 'POST' && isInitializeRequest(req.body)) {
-        const mcpServer = createServer({ config: deps.config, sessions: deps.sessions, logger: deps.logger });
+        const mcpServer = createServer({
+          config: deps.config,
+          sessions: deps.sessions,
+          logger: deps.logger,
+          // 远程入口的账号在登录时才出现（信封），注册阶段看不到能力，四个模块一律注册。
+          registerAllModules: true,
+          remote: {
+            // 每次调用现读：管理页切换开关后不必重建任何 transport 就立刻生效。
+            envAccountsEnabled: () => deps.store.getSettings().envAccountsEnabled,
+            openEnvelope: deps.envelope?.open,
+          },
+        });
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           // 存进 Map 的必须是下面那个 newEntry 本身，不能另建一个同形状的对象字面量：
@@ -179,7 +233,12 @@ function createMcpRouteHandler(deps: { config: AppConfig; sessions: SessionStore
           const currentId = transport.sessionId;
           if (currentId !== undefined) entries.delete(currentId);
         };
-        const newEntry: McpEntry = { transport, server: mcpServer, lastActiveAt: Date.now() };
+        const newEntry: McpEntry = {
+          transport,
+          server: mcpServer,
+          lastActiveAt: Date.now(),
+          ownerKeyId: callerKeyId,
+        };
         await mcpServer.connect(transport);
         entry = newEntry;
       } else {
@@ -196,7 +255,27 @@ function createMcpRouteHandler(deps: { config: AppConfig; sessions: SessionStore
     await entry.transport.handleRequest(req, res, req.body);
   }
 
-  return { handler, closeAll, sweepIdleTransports };
+  async function cutOffAccessKey(keyId: string): Promise<void> {
+    // 顺序有讲究：先吊销令牌，已签发的令牌就再也建不出新会话和新 transport；然后才清掉已有的，
+    // 免得刚清完又被一个还没吊销的令牌建出一条。（调用方此前已停用或删除这把密钥，
+    // 它也换不到新令牌——那一半由 verifyAccessToken / /access-login 保证，不在这里。）
+    const families = await deps.store.revokeFamiliesByAccessKey(keyId);
+    const destroyedSessions = await deps.sessions.destroyMatching((s) => s.ownerKeyId === keyId);
+    const closedTransports = await closeTransportsOwnedBy(keyId);
+    deps.logger.info('access key cut off', {
+      revokedFamilies: families.length,
+      destroyedSessions,
+      closedTransports,
+    });
+  }
+
+  async function onEnvAccountsDisabled(): Promise<void> {
+    // origin 为 undefined 的是今天的 env 账号（loadConfig 建的），也要一起销毁：只放过明确来自信封的。
+    const destroyed = await deps.sessions.destroyMatching((s) => s.account.origin !== 'envelope');
+    deps.logger.info('env accounts disabled', { destroyedSessions: destroyed });
+  }
+
+  return { handler, closeAll, sweepIdleTransports, cutOffAccessKey, onEnvAccountsDisabled };
 }
 
 /** 把 provider.verifyAccessToken 包一层：任何失败都归一化成 InvalidTokenError（401）。
@@ -307,10 +386,18 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
   // 认证之前：谁都能问，所以什么都不说
   app.get('/health', createHealthHandler());
 
-  const { handler: mcpHandler, closeAll, sweepIdleTransports } = createMcpRouteHandler({
+  const {
+    handler: mcpHandler,
+    closeAll,
+    sweepIdleTransports,
+    cutOffAccessKey,
+    onEnvAccountsDisabled,
+  } = createMcpRouteHandler({
     config,
     sessions,
     logger,
+    store,
+    envelope: deps.envelope,
   });
   const verifier = createVerifier(provider);
 
@@ -359,5 +446,11 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
     });
   });
 
-  return { app, closeAll, sweepIdleTransports: (now?: number) => sweepIdleTransports(now) };
+  return {
+    app,
+    closeAll,
+    sweepIdleTransports: (now?: number) => sweepIdleTransports(now),
+    cutOffAccessKey,
+    onEnvAccountsDisabled,
+  };
 }

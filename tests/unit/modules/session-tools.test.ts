@@ -218,6 +218,141 @@ describe('apple_login', () => {
   });
 });
 
+// 远程 HTTP 入口：几个人共用一台服务器。env 账号开关关着的时候，`.env` 里那个账号是主人的，
+// 任何一把有效密钥都不能拿 `account`（或什么都不给）登进去——这正是"朋友登进主人 iCloud"
+// 那个反目标的直接测试。stdio / CLI 不传 remote，行为与 schema 必须与今天逐字相同。
+describe('apple_login / apple_accounts in remote mode', () => {
+  it('remote mode with env accounts disabled refuses login without an envelope', async () => {
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers);
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => false },
+    });
+
+    for (const args of [{}, { account: 'me@icloud.com' }]) {
+      const result = await tools.get('apple_login')!.handler(args);
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0]!.text);
+      expect(payload.error.code).toBe('INVALID_INPUT');
+      expect(payload.error.message).toBe('这台服务器只接受加密信封登录');
+      expect(payload.error.hint).toContain('make-envelope.mjs');
+    }
+    expect(store.create).not.toHaveBeenCalled();
+    expect(providers.imap.verify).not.toHaveBeenCalled();
+  });
+
+  it('remote mode with env accounts disabled lists no accounts', async () => {
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => false },
+    });
+    const result = await tools.get('apple_accounts')!.handler({});
+    expect(JSON.parse(result.content[0]!.text)).toEqual([]);
+  });
+
+  it('remote mode with env accounts enabled logs in as today', async () => {
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers);
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => true },
+    });
+
+    const result = await tools.get('apple_login')!.handler({});
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0]!.text).session_id).toBe('session-abc');
+    expect(store.create).toHaveBeenCalledWith(config.accounts[0], undefined, undefined);
+
+    const listed = await tools.get('apple_accounts')!.handler({});
+    expect(JSON.parse(listed.content[0]!.text)).toHaveLength(1);
+  });
+
+  it('reads the switch on every call, not once at registration', async () => {
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    let enabled = true;
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => enabled },
+    });
+    expect((await tools.get('apple_login')!.handler({})).isError).toBeUndefined();
+    enabled = false;
+    const refused = await tools.get('apple_login')!.handler({});
+    expect(JSON.parse(refused.content[0]!.text).error.code).toBe('INVALID_INPUT');
+  });
+
+  it('without remote the schema has no envelope field', () => {
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, { sessions: store, logger: silentLogger, config });
+    expect(Object.keys(tools.get('apple_login')!.config.inputSchema)).toEqual(['account']);
+  });
+
+  it('remote without an envelope opener still has no envelope field', () => {
+    const { server, tools } = collect();
+    const { store } = makeSessions(healthyProviders());
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => true },
+    });
+    expect(Object.keys(tools.get('apple_login')!.config.inputSchema)).toEqual(['account']);
+  });
+
+  it('with an envelope opener the schema gains envelope, and giving both is INVALID_INPUT', async () => {
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers);
+    const openEnvelope = vi.fn();
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => true, openEnvelope },
+    });
+    expect(Object.keys(tools.get('apple_login')!.config.inputSchema).sort()).toEqual(['account', 'envelope']);
+
+    const result = await tools.get('apple_login')!.handler({ account: 'me@icloud.com', envelope: 'ame1.x' });
+    expect(JSON.parse(result.content[0]!.text).error.code).toBe('INVALID_INPUT');
+    expect(openEnvelope).not.toHaveBeenCalled();
+    expect(store.create).not.toHaveBeenCalled();
+  });
+
+  it('an envelope logs in with the account it opened, even with env accounts disabled', async () => {
+    const { server, tools } = collect();
+    const providers = healthyProviders();
+    const { store } = makeSessions(providers);
+    const envelopeAccount = { ...config.accounts[0]!, email: 'friend@icloud.com', origin: 'envelope' as const };
+    const openEnvelope = vi.fn().mockReturnValue({ account: envelopeAccount, notices: [] });
+    registerSessionTools(server, {
+      sessions: store,
+      logger: silentLogger,
+      config,
+      remote: { envAccountsEnabled: () => false, openEnvelope },
+    });
+
+    const result = await tools.get('apple_login')!.handler({ envelope: 'ame1.sealed' });
+    expect(result.isError).toBeUndefined();
+    expect(openEnvelope).toHaveBeenCalledWith('ame1.sealed');
+    expect(store.create).toHaveBeenCalledWith(envelopeAccount, undefined, undefined);
+    expect(JSON.parse(result.content[0]!.text).account).toBe('friend@icloud.com');
+  });
+});
+
 describe('work_done', () => {
   it('does not claim to clear credentials from memory -- the App password lives in config for the process lifetime (I9)', async () => {
     const { server, tools } = collect();

@@ -8,7 +8,7 @@ import { registerMailTools } from '../modules/mail/tools.js';
 import { registerCalendarTools } from '../modules/calendar/tools.js';
 import { registerReminderTools } from '../modules/reminders/tools.js';
 import { registerContactTools } from '../modules/contacts/tools.js';
-import { registerSessionTools } from '../modules/session/tools.js';
+import { registerSessionTools, type RemoteLoginDeps } from '../modules/session/tools.js';
 import type { AppConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
 import type { Session, SessionStore } from '../core/session.js';
@@ -20,12 +20,14 @@ export interface ServerDeps {
   logger: Logger;
   /** 远程入口：账号在登录时才出现，注册阶段看不到能力，所以四个模块一律注册，权限留给每次调用时按会话判断。 */
   registerAllModules?: boolean;
+  /** 远程入口的登录规则（env 账号开关、信封）；stdio / CLI 不传，会话工具与以前逐字相同。 */
+  remote?: RemoteLoginDeps;
 }
 
 export function registerAllTools(server: ToolRegistrar, deps: ServerDeps): void {
-  const { config, sessions, logger, registerAllModules } = deps;
+  const { config, sessions, logger, registerAllModules, remote } = deps;
 
-  registerSessionTools(server, { sessions, logger, config });
+  registerSessionTools(server, { sessions, logger, config, remote });
 
   const anyMail = registerAllModules === true || config.accounts.some(
     (a) => a.capabilities.mailRead || a.capabilities.mailWrite,

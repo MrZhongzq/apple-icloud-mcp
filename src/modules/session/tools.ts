@@ -1,32 +1,84 @@
-import { z } from 'zod';
-import { findAccount, type AppConfig } from '../../core/config.js';
+import { z, type ZodRawShape } from 'zod';
+import { findAccount, type AccountConfig, type AppConfig } from '../../core/config.js';
 import { AppError } from '../../core/errors.js';
 import { accessKeyIdFrom, tokenFamilyIdFrom } from '../../core/session.js';
 import { wrapTool } from '../../server/wrap.js';
 import type { ToolDeps, ToolRegistrar } from '../../server/types.js';
 
-export interface SessionToolDeps extends ToolDeps {
-  config: AppConfig;
+/**
+ * 远程 HTTP 入口才有的登录规则。stdio / CLI 不传，两个工具的 schema 与行为与以前逐字相同。
+ *
+ * 远程入口是几个人共用一台服务器：`.env` 里的账号属于服务器主人，任何一把有效的访问密钥都能
+ * 调 `apple_login`，所以 env 账号能不能用必须是主人在管理页上明确打开的开关，而不是默认可用。
+ */
+export interface RemoteLoginDeps {
+  /** 每次调用都现读，不在注册时读一次：管理页随时可能切换它。 */
+  envAccountsEnabled(): boolean;
+  /** 解开一个加密信封，得到只活在这次会话里的账号。没有配置信封私钥时不传，`envelope` 参数也就不出现。 */
+  openEnvelope?: (text: string) => { account: AccountConfig; notices: string[] };
 }
 
+export interface SessionToolDeps extends ToolDeps {
+  config: AppConfig;
+  remote?: RemoteLoginDeps;
+}
+
+const ENVELOPE_ONLY_HINT = '运行 node scripts/make-envelope.mjs，把它输出的一整行原样作为 envelope 参数传给 apple_login';
+
 export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDeps): void {
-  const { sessions, logger, config } = deps;
+  const { sessions, logger, config, remote } = deps;
+  const openEnvelope = remote?.openEnvelope;
+
+  /** env 账号此刻是否可用：stdio / CLI 永远可用；远程入口看开关。 */
+  const envAccountsUsable = (): boolean => remote === undefined || remote.envAccountsEnabled();
+
+  const accountArg = z.string().optional().describe('要登录的 iCloud 邮箱，单账号时可省略');
+  // 只有真的能解信封时才把 envelope 放进 schema：一个永远报错的参数只会误导模型去用它。
+  const loginSchema: ZodRawShape = openEnvelope
+    ? {
+        account: accountArg,
+        envelope: z
+          .string()
+          .optional()
+          .describe('make-envelope.mjs 输出的那一整行加密信封，原样传入；与 account 互斥'),
+      }
+    : { account: accountArg };
+
+  function resolveAccount(args: { account?: string; envelope?: string }): AccountConfig {
+    if (openEnvelope && args.envelope !== undefined) {
+      if (args.account !== undefined) {
+        throw new AppError('INVALID_INPUT', 'account 与 envelope 只能给一个', {
+          hint: '用信封登录时只传 envelope；信封里已经带着账号',
+        });
+      }
+      return openEnvelope(args.envelope).account;
+    }
+    // 先看开关、后找账号：开关关着时连"这个邮箱有没有配置"都不该透露。
+    if (!envAccountsUsable()) {
+      throw new AppError('INVALID_INPUT', '这台服务器只接受加密信封登录', { hint: ENVELOPE_ONLY_HINT });
+    }
+    return findAccount(config, args.account);
+  }
 
   server.registerTool(
     'apple_accounts',
     {
       title: '列出已配置的 iCloud 账号',
       description:
-        '返回服务端配置的账号及其读写权限。无需登录即可调用，用于在多账号时确认当前有哪些账号可用（MCP 客户端据此决定 apple_login 的 account 参数）。',
+        '返回服务端配置的账号及其读写权限。无需登录即可调用，用于在多账号时确认当前有哪些账号可用（MCP 客户端据此决定 apple_login 的 account 参数）。' +
+        (remote ? '远程服务器只接受加密信封登录时这里返回空数组，这是正常的。' : ''),
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
     wrapTool(logger, 'apple_accounts', async () =>
-      config.accounts.map((account) => ({
-        email: account.email,
-        label: account.label,
-        capabilities: account.capabilities,
-      })),
+      // 开关关着时 env 账号对调用方而言不存在：列出来只会诱导模型拿 account 去登录然后被拒。
+      envAccountsUsable()
+        ? config.accounts.map((account) => ({
+            email: account.email,
+            label: account.label,
+            capabilities: account.capabilities,
+          }))
+        : [],
     ),
   );
 
@@ -37,13 +89,11 @@ export function registerSessionTools(server: ToolRegistrar, deps: SessionToolDep
       description:
         '建立会话并返回 session_id，后续所有工具都需要它。会真正连接一次该账号已开启能力所需的协议' +
         '（邮件走 IMAP、日历/提醒事项走 CalDAV、通讯录走 CardDAV）验证凭据，因此凭据错误会在这一步立即暴露。单账号时 account 可省略。',
-      inputSchema: {
-        account: z.string().optional().describe('要登录的 iCloud 邮箱，单账号时可省略'),
-      },
+      inputSchema: loginSchema,
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    wrapTool(logger, 'apple_login', async (args: { account?: string }, extra) => {
-      const account = findAccount(config, args.account);
+    wrapTool(logger, 'apple_login', async (args: { account?: string; envelope?: string }, extra) => {
+      const account = resolveAccount(args);
 
       // 每个协议只在它服务的能力真的开着时才验证。无条件验证 IMAP 会把
       // core/config.ts 的 iCloud 发信域名保护整个反过来用：那条保护对一个

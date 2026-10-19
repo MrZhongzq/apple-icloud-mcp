@@ -3,6 +3,7 @@ import { createHttpApp } from '../../../src/server/httpApp.js';
 import { createLogger } from '../../../src/core/logger.js';
 import type { AppConfig } from '../../../src/core/config.js';
 import type { SessionStore } from '../../../src/core/session.js';
+import type { AuthStore } from '../../../src/auth/store.js';
 
 const logger = createLogger('error', () => {});
 
@@ -68,7 +69,12 @@ function build(httpConfigOverrides: Partial<typeof httpConfig> = {}) {
     sessions: { create: vi.fn(), get: vi.fn(), destroyByToken: vi.fn() } as unknown as SessionStore,
     provider: makeProvider(),
     logger,
-    store: { findAccessKeyByPlaintext: () => undefined },
+    // 这些单测只碰 /access-login 与认证边界；getSettings 给出来是因为 /mcp 的 initialize
+    // 会用它构造 apple_login 的远程登录规则（只在工具被调用时才真的读）。
+    store: {
+      findAccessKeyByPlaintext: () => undefined,
+      getSettings: () => ({ envAccountsEnabled: true }),
+    } as unknown as AuthStore,
   });
 }
 
