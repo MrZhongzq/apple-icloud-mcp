@@ -22,6 +22,8 @@ const client = {
 
 let dir: string;
 let destroyByToken: ReturnType<typeof vi.fn>;
+/** makeProvider 建的那把访问密钥的 id；签发授权码时都凭它。 */
+let keyId: string;
 
 function makeSessions(): SessionStore {
   destroyByToken = vi.fn().mockResolvedValue(0);
@@ -37,7 +39,8 @@ async function makeProvider(
   const store = createAuthStore({ path, key, logger });
   await store.load();
   await store.registerClient({ client_id: 'client-1', redirect_uris: [REDIRECT] });
-  const provider = createOAuthProvider({ store, sessions: makeSessions(), logger, ...opts });
+  keyId = (await store.createAccessKey('tester')).record.id;
+  const provider = createOAuthProvider({ store, sessions: makeSessions(), logger, accessKeys: store, ...opts });
   return { provider, store, path, key };
 }
 
@@ -53,6 +56,7 @@ async function authorizeOnce(provider: Awaited<ReturnType<typeof makeProvider>>[
     redirectUri: REDIRECT,
     codeChallenge: 'challenge-abc',
     scopes: ['mcp'],
+    accessKeyId: keyId,
   });
   const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
   return { code, tokens };
@@ -86,6 +90,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     await expect(
       provider.exchangeAuthorizationCode(client, code, undefined, 'https://evil.example/cb'),
@@ -99,6 +104,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     await expect(provider.exchangeAuthorizationCode(client, code, undefined, REDIRECT)).rejects.toThrow();
   });
@@ -110,6 +116,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     await expect(
       provider.exchangeAuthorizationCode(client, code, undefined, 'https://evil.example/cb'),
@@ -127,6 +134,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     // SDK 的 token schema 把 redirect_uri 标为 optional，所以「不发」是客户端能做到的事，
     // 而签发时总是记录了具体的 redirect_uri —— RFC 6749 §4.1.3 要求必须回比。
@@ -140,6 +148,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     await new Promise((r) => setTimeout(r, 20));
     await expect(provider.exchangeAuthorizationCode(client, code, undefined, REDIRECT)).rejects.toThrow();
@@ -152,6 +161,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     expect(await provider.challengeForAuthorizationCode(client, code)).toBe('challenge-abc');
   });
@@ -171,6 +181,7 @@ describe('authorization codes', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp'],
+      accessKeyId: keyId,
     });
     const { tokens } = await authorizeOnce(provider);
 
@@ -254,6 +265,7 @@ describe('refresh rotation', () => {
       redirectUri: REDIRECT,
       codeChallenge: 'challenge-abc',
       scopes: ['mcp', 'extra'],
+      accessKeyId: keyId,
     });
     const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, REDIRECT);
 

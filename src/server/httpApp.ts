@@ -12,10 +12,12 @@ import type { AppConfig, HttpConfig } from '../core/config.js';
 import type { Logger } from '../core/logger.js';
 import type { SessionStore } from '../core/session.js';
 import type { AppleOAuthProvider } from '../auth/provider.js';
+import type { AuthStore } from '../auth/store.js';
 import {
   applyLoginPageHeaders,
   createPendingStore,
   handleLoginSubmit,
+  renderAlreadyCompletedPage,
   renderLoginPage,
   type PendingStore,
 } from '../auth/login.js';
@@ -26,8 +28,10 @@ export interface CreateHttpAppDeps {
   sessions: SessionStore;
   provider: AppleOAuthProvider;
   logger: Logger;
+  /** `/access-login` 凭它按明文查访问密钥。生产环境传的就是构建 `provider` 用的同一个 store。 */
+  store: Pick<AuthStore, 'findAccessKeyByPlaintext'>;
   /**
-   * `authorize()`（provider.ts，任务四）把待授权请求暂存在这里，`/admin-login` 提交时凭
+   * `authorize()`（provider.ts，任务四）把待授权请求暂存在这里，`/access-login` 提交时凭
    * requestId 取回并消费。这个 store 必须与构建 `provider` 时传给 `createOAuthProvider`
    * 的是同一个实例——否则登录页永远找不到 authorize() 存下的请求。不传时本地新建一个，
    * 只是为了让单测不必关心登录页这条链路；生产环境（`bin/http.ts`）必须显式传入同一份。
@@ -48,7 +52,7 @@ export interface HttpApp {
 const ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60_000;
 const ADMIN_LOGIN_RATE_LIMIT_MAX = 20;
 
-/** 极简滑动窗口限流：单进程内存足够——管理员登录只有一个人在用。
+/** 极简滑动窗口限流：单进程内存足够——授权页只有寥寥几个持有访问密钥的人在用。
  *  周期性清掉早已过期的桶，避免不同源 IP 造成 Map 无限增长。 */
 function createSimpleRateLimit(opts: { windowMs: number; max: number }) {
   const buckets = new Map<string, { count: number; resetAt: number }>();
@@ -225,22 +229,35 @@ function createHealthHandler() {
   };
 }
 
-function createAdminLoginHandler(deps: {
-  adminPasswordHash: string;
+function createAccessLoginHandler(deps: {
+  store: Pick<AuthStore, 'findAccessKeyByPlaintext'>;
   provider: AppleOAuthProvider;
   logger: Logger;
   pending: PendingStore;
 }) {
+  const { store, provider, logger, pending } = deps;
+  const loginDeps = {
+    findAccessKey: (plaintext: string) => store.findAccessKeyByPlaintext(plaintext),
+    provider,
+    logger,
+    pending,
+  };
   return (req: Request, res: Response): void => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const requestId = typeof body.request_id === 'string' ? body.request_id : '';
-    const password = typeof body.password === 'string' ? body.password : '';
+    const accessKey = typeof body.access_key === 'string' ? body.access_key : '';
 
-    const result = handleLoginSubmit(deps, { requestId, password });
+    const result = handleLoginSubmit(loginDeps, { requestId, accessKey });
 
     applyLoginPageHeaders(res);
     if ('redirectTo' in result) {
       res.redirect(303, result.redirectTo);
+      return;
+    }
+    if ('alreadyCompleted' in result) {
+      // 同一张登录页又提交了一次（刷新、双击、回退重发）：授权其实已经成功，
+      // 回 200 告诉人可以关掉，而不是一个让人以为失败了的 401。
+      res.status(200).send(renderAlreadyCompletedPage());
       return;
     }
     res.status(401).send(renderLoginPage({ requestId, error: result.error }));
@@ -249,17 +266,17 @@ function createAdminLoginHandler(deps: {
 
 /** 建好但未监听的 express 应用，便于单测直接打请求而不占端口。 */
 export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
-  const { config, httpConfig, sessions, provider, logger } = deps;
+  const { config, httpConfig, sessions, provider, logger, store } = deps;
   const pending = deps.pending ?? createPendingStore();
 
   const app = express();
   // 限流按 req.ip 分桶，而 req.ip 是什么取决于这一行。
   //
   // 直接暴露端口时（TRUST_PROXY 未设，默认 false）不能信 X-Forwarded-For：那个头由调用方
-  // 自己写，信它等于让任何人自选限流桶，一个客户端就能不限次数地猜管理员口令。
+  // 自己写，信它等于让任何人自选限流桶，一个客户端就能不限次数地猜访问密钥。
   //
   // 但本仓库自带的 docker-compose.yml 在前面放了 Caddy，那时每个请求的 socket 远端地址都是
-  // 同一个容器 IP：不开这一行，全世界共用一个桶，任何未认证的访客都能把 /admin-login 与
+  // 同一个容器 IP：不开这一行，全世界共用一个桶，任何未认证的访客都能把 /access-login 与
   // /token 的额度替所有人耗光，把整条授权流程锁死。所以 compose 里 TRUST_PROXY 是开着的。
   //
   // 两种部署都真实存在，谁在前面只有部署方知道，因此这件事由配置声明，不由代码猜。
@@ -271,13 +288,17 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
 
   // 必须挂在 mcpAuthRouter 之前：express 的 router.use(path) 按前缀匹配、先注册者先命中。
   // 登录表单曾经误投到 /authorize——那正是 mcpAuthRouter 自己的授权端点，POST 到那里会被
-  // 当成一个缺 client_id/code_challenge 的授权请求直接拒绝。/admin-login 是独立路径，
+  // 当成一个缺 client_id/code_challenge 的授权请求直接拒绝。/access-login 是独立路径，
   // 不会撞车，但仍然按"先注册"的顺序放在最前面，不给以后的路由改动留下误伤的机会。
+  //
+  // 这里收的是每人一把的访问密钥，不再是管理员口令：管理员口令只用于 /admin（管理页），
+  // 授权页上提交它一律按「密钥不正确」处理。限流照旧——访问密钥是 32 字节随机数，猜不中，
+  // 但限流防的不只是猜，也防有人拿这个端点刷请求。
   app.post(
-    '/admin-login',
+    '/access-login',
     createSimpleRateLimit({ windowMs: ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS, max: ADMIN_LOGIN_RATE_LIMIT_MAX }),
     express.urlencoded({ extended: false }),
-    createAdminLoginHandler({ adminPasswordHash: httpConfig.adminPasswordHash, provider, logger, pending }),
+    createAccessLoginHandler({ store, provider, logger, pending }),
   );
 
   // /.well-known/*、/authorize、/token、/register、/revoke

@@ -1,10 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import type { Logger } from '../core/logger.js';
-import { verifyPassword } from './crypto.js';
 import type { AppleOAuthProvider } from './provider.js';
+import type { AccessKeyRecord } from './store.js';
 
 /**
- * 一次待授权请求：`authorize()` 把客户端带来的参数原样存进这里，等管理员通过登录页确认。
+ * 一次待授权请求：`authorize()` 把客户端带来的参数原样存进这里，等使用者在登录页输入访问密钥确认。
  * `expires_at` 由存入方（`authorize()`）算好传入——store 本身不重新计算，只按这个字段判断
  * 是否已经过期。
  */
@@ -19,7 +19,7 @@ export interface PendingAuthorization {
 
 /**
  * `createPendingStore()` 的返回类型。`peek` 只读取、不消费——过期的一律当作不存在；
- * `take` 消费掉一条记录，只在口令通过、即将签发授权码的那一刻调用。分开这两个方法是为了让
+ * `take` 消费掉一条记录，只在访问密钥通过、即将签发授权码的那一刻调用。分开这两个方法是为了让
  * `handleLoginSubmit` 不需要「先取出、失败了再放回去」：那种取了再撤销的写法，在两步之间
  * 一旦抛异常就会把一条本该还能重试的待授权请求永久丢掉。
  */
@@ -27,8 +27,15 @@ export type PendingStore = {
   put(p: PendingAuthorization): string;
   /** 只读取，不消费；过期的一律当作不存在。 */
   peek(requestId: string): PendingAuthorization | undefined;
-  /** 消费掉，用于口令通过、即将签发授权码的那一刻。 */
+  /** 消费掉，用于访问密钥通过、即将签发授权码的那一刻。 */
   take(requestId: string): PendingAuthorization | undefined;
+  /**
+   * 这个 requestId 是否已经被 `take()` 成功消费过（且原请求还没到 `expires_at`）。
+   * 用来把「同一张登录页又提交了一次」（刷新、双击、浏览器回退重发）和「请求不存在或已过期」
+   * 区分开：前者授权其实已经完成，告诉人「请重新发起授权」只会让他去做一件多余、
+   * 还可能把刚拿到的那次授权弄乱的事。
+   */
+  wasCompleted(requestId: string): boolean;
   sweep(now?: number): number;
 };
 
@@ -43,6 +50,9 @@ const REQUEST_ID_BYTES = 32;
  */
 export function createPendingStore(): PendingStore {
   const pending = new Map<string, PendingAuthorization>();
+  /** 已完成的 requestId → 原请求的 expires_at。只记到那一刻为止：过了原请求的有效期，
+   *  「已完成」与「已过期」对使用者来说是同一个答复，没必要再记。 */
+  const completed = new Map<string, number>();
 
   function isLive(entry: PendingAuthorization, now: number): boolean {
     return entry.expires_at > now;
@@ -65,7 +75,12 @@ export function createPendingStore(): PendingStore {
       if (entry === undefined) return undefined;
       pending.delete(requestId);
       if (!isLive(entry, Date.now())) return undefined;
+      completed.set(requestId, entry.expires_at);
       return entry;
+    },
+    wasCompleted(requestId: string): boolean {
+      const expiresAt = completed.get(requestId);
+      return expiresAt !== undefined && expiresAt > Date.now();
     },
     sweep(now: number = Date.now()): number {
       let removed = 0;
@@ -75,6 +90,9 @@ export function createPendingStore(): PendingStore {
           removed += 1;
         }
       }
+      for (const [id, expiresAt] of completed) {
+        if (expiresAt <= now) completed.delete(id);
+      }
       return removed;
     },
   };
@@ -83,12 +101,12 @@ export function createPendingStore(): PendingStore {
 /**
  * 登录页（以及同一路由上的授权错误页）必须带的响应头。
  *
- * `no-store` 之外还有两条防点击劫持的：这是整套服务里唯一一个有真人往里输管理员口令的页面，
+ * `no-store` 之外还有两条防点击劫持的：这是有真人往里输访问密钥的页面，
  * 一旦能被第三方站点嵌进 iframe，攻击者就可以把它盖在自己的页面下面骗一次提交。
  * `X-Frame-Options: DENY` 管住老浏览器，CSP 的 `frame-ancestors 'none'` 是现代等价物，
  * 两条都给，因为它们的覆盖面不完全重合。集中成一个常量，是为了让登录页的三个发送点
- * （authorize() 渲染登录页、渲染错误页，以及 /admin-login 提交失败后重新渲染）不会各写
- * 一份、日后只改其中一处。
+ * （authorize() 渲染登录页、渲染错误页，以及 /access-login 提交失败后重新渲染、
+ * 重复提交时的「已完成」页）不会各写一份、日后只改其中一处。
  */
 export const LOGIN_PAGE_HEADERS: ReadonlyArray<readonly [string, string]> = [
   ['Cache-Control', 'no-store'],
@@ -102,7 +120,8 @@ export function applyLoginPageHeaders(res: { set(name: string, value: string): u
   for (const [name, value] of LOGIN_PAGE_HEADERS) res.set(name, value);
 }
 
-function escapeHtml(input: string): string {
+/** 导出给管理页（Task 6）复用：同一套转义规则只写一份。 */
+export function escapeHtml(input: string): string {
   const map: Record<string, string> = {
     '&': '&amp;',
     '<': '&lt;',
@@ -128,7 +147,7 @@ export function renderLoginPage(params: { requestId: string; error?: string }): 
     '<head>' +
     '<meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-    '<title>管理员登录</title>' +
+    '<title>输入访问密钥</title>' +
     '<style>' +
     'body{font-family:system-ui,-apple-system,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem;color:#111}' +
     'h1{font-size:1.25rem}' +
@@ -139,13 +158,15 @@ export function renderLoginPage(params: { requestId: string; error?: string }): 
     '</style>' +
     '</head>' +
     '<body>' +
-    '<h1>管理员登录</h1>' +
+    '<h1>输入访问密钥</h1>' +
     errorHtml +
-    '<form method="post" action="/admin-login">' +
+    '<form method="post" action="/access-login">' +
     '<input type="hidden" name="request_id" value="' + requestId + '">' +
-    '<label for="password">口令</label>' +
-    '<input type="password" id="password" name="password" autocomplete="current-password" required autofocus>' +
-    '<button type="submit">登录</button>' +
+    '<label for="access_key">访问密钥</label>' +
+    // autocomplete="off"：访问密钥是服务器发给某个人的一段随机串，不是这个人自己的口令，
+    // 不该被浏览器当成「这个站点的密码」记下来、再自动填给别人用这台电脑时的同一页。
+    '<input type="password" id="access_key" name="access_key" autocomplete="off" required autofocus>' +
+    '<button type="submit">授权</button>' +
     '</form>' +
     '</body>' +
     '</html>'
@@ -165,52 +186,79 @@ export function renderAuthorizeErrorPage(message: string): string {
   );
 }
 
+/** 重复提交一个已经完成的授权请求时显示的终态页：授权已经成功，不需要也不应该再做什么。 */
+export function renderAlreadyCompletedPage(): string {
+  return (
+    '<!doctype html>' +
+    '<html lang="zh">' +
+    '<head><meta charset="utf-8"><title>授权已完成</title></head>' +
+    '<body><h1>授权已完成</h1><p>这次授权已经完成，可以关闭此页，回到 Claude 继续。</p></body></html>'
+  );
+}
+
 export interface LoginDeps {
-  adminPasswordHash: string;
+  /** 按明文查访问密钥（生产环境是 `store.findAccessKeyByPlaintext`）。停用的也会返回，
+   *  是否放行由 handleLoginSubmit 看 `enabled` 决定。 */
+  findAccessKey(plaintext: string): AccessKeyRecord | undefined;
   provider: AppleOAuthProvider;
   logger: Logger;
   /** authorize() 暂存待授权请求的地方，登录表单凭 requestId 从这里取回。 */
   pending: PendingStore;
 }
 
-/** 处理登录表单提交。成功时返回要跳转到的完整 URL（含 code 与 state），失败时返回错误信息。
- *  口令校验完全委托给 crypto.ts 的 verifyPassword（内部走 timingSafeEqual）——这里不重新
- *  实现比较逻辑。 */
+/** 处理登录表单提交。成功时返回要跳转到的完整 URL（含 code 与 state），失败时返回错误信息；
+ *  同一个请求已经成功提交过时返回 `{ alreadyCompleted: true }`。
+ *  密钥比对不在这里做：store 里只存哈希，`findAccessKey` 按哈希查表，明文从不和任何东西
+ *  逐字节比较。 */
 export function handleLoginSubmit(
   deps: LoginDeps,
-  params: { requestId: string; password: string },
-): { redirectTo: string } | { error: string } {
-  const { adminPasswordHash, provider, logger, pending } = deps;
+  params: { requestId: string; accessKey: string },
+): { redirectTo: string } | { error: string } | { alreadyCompleted: true } {
+  const { findAccessKey, provider, logger, pending } = deps;
 
   const entry = pending.peek(params.requestId);
   if (entry === undefined) {
+    if (pending.wasCompleted(params.requestId)) return { alreadyCompleted: true };
     return { error: '登录请求不存在或已过期，请重新发起授权' };
   }
 
-  if (!verifyPassword(params.password, adminPasswordHash)) {
-    // 口令错，但这次授权请求本身还没过期——只 peek 过，从没消费掉它，requestId 原样有效，
-    // 管理员可以用同一张已经打开的登录页再试一次。没有「取出再放回」的窗口可丢。
-    logger.warn('admin login rejected: wrong password', { requestId: params.requestId });
-    return { error: '口令不正确，请重试' };
+  const key = findAccessKey(params.accessKey);
+  if (key === undefined || !key.enabled) {
+    // 错误的密钥与停用的密钥给同一句提示：手里拿着一把停用密钥的人，不该能从提示上确认
+    // 「这串字符曾经是一把真密钥」。这次授权请求本身还没过期——只 peek 过，从没消费掉它，
+    // requestId 原样有效，可以用同一张已经打开的登录页再试一次。
+    // 日志里只记 requestId，绝不记提交上来的字符串：输错的那一串很可能只差一个字符。
+    logger.warn('access key login rejected: unknown or disabled key', { requestId: params.requestId });
+    return { error: '访问密钥不正确或已停用，请重试' };
   }
 
-  // 口令通过，这是唯一一次真正消费这条待授权请求的地方——用 take() 而不是 peek()，
+  // 密钥通过，这是唯一一次真正消费这条待授权请求的地方——用 take() 而不是 peek()，
   // 保证同一个 requestId 不能被并发/重放来签发出两个授权码。
-  pending.take(params.requestId);
+  const taken = pending.take(params.requestId);
+  if (taken === undefined) {
+    // peek 与 take 之间请求恰好到期：按过期处理，不签发任何东西。
+    return { error: '登录请求不存在或已过期，请重新发起授权' };
+  }
 
+  // 密钥 id 从这里进入令牌链：授权码 → 令牌记录 → AuthInfo.extra → 工具层的会话归属。
+  // 漏掉这一环，后面每一层拿到的都是 undefined，按密钥隔离会话就整个落空。
   const code = provider.issueAuthorizationCode({
-    clientId: entry.client_id,
-    redirectUri: entry.redirect_uri,
-    codeChallenge: entry.code_challenge,
-    scopes: entry.scopes,
+    clientId: taken.client_id,
+    redirectUri: taken.redirect_uri,
+    codeChallenge: taken.code_challenge,
+    scopes: taken.scopes,
+    accessKeyId: key.id,
   });
 
-  const redirectUrl = new URL(entry.redirect_uri);
+  const redirectUrl = new URL(taken.redirect_uri);
   redirectUrl.searchParams.set('code', code);
-  if (entry.state !== undefined) {
-    redirectUrl.searchParams.set('state', entry.state);
+  if (taken.state !== undefined) {
+    redirectUrl.searchParams.set('state', taken.state);
   }
 
-  logger.info('admin login succeeded, authorization code issued', { clientId: entry.client_id });
+  logger.info('access key login succeeded, authorization code issued', {
+    clientId: taken.client_id,
+    accessKeyId: key.id,
+  });
   return { redirectTo: redirectUrl.toString() };
 }

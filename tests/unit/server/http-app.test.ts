@@ -41,7 +41,7 @@ const httpConfig = {
   envelopeKeyPath: '/tmp/envelope-key.json.enc',
 };
 
-/** /admin-login 的窗口上限是 20，多打一次就该看到 429。 */
+/** /access-login 的窗口上限是 20，多打一次就该看到 429。 */
 const ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT = 21;
 
 let verifyAccessToken: ReturnType<typeof vi.fn>;
@@ -68,6 +68,7 @@ function build(httpConfigOverrides: Partial<typeof httpConfig> = {}) {
     sessions: { create: vi.fn(), get: vi.fn(), destroyByToken: vi.fn() } as unknown as SessionStore,
     provider: makeProvider(),
     logger,
+    store: { findAccessKeyByPlaintext: () => undefined },
   });
 }
 
@@ -202,19 +203,19 @@ describe('cors', () => {
  * 限流按 `req.ip` 分桶，而 `req.ip` 是什么取决于 express 的 `trust proxy`。
  * 两种部署都真实存在——直接暴露端口时不能信 X-Forwarded-For（调用方自己写的，信它等于让
  * 任何人自选限流桶）；本仓库自带的 compose 在前面放了 Caddy，不信它则全世界共用一个桶，
- * 任何未认证的访客都能替所有人耗光 /admin-login 与 /token 的额度。所以这里两个方向都测。
+ * 任何未认证的访客都能替所有人耗光 /access-login 与 /token 的额度。所以这里两个方向都测。
  */
 describe('TRUST_PROXY', () => {
-  /** 连打 count 次 /admin-login，每次带一个不同的 X-Forwarded-For，返回最后一次的状态码。 */
+  /** 连打 count 次 /access-login，每次带一个不同的 X-Forwarded-For，返回最后一次的状态码。 */
   async function floodAdminLogin(app: import('express').Express, count: number): Promise<number> {
     let status = 0;
     for (let i = 0; i < count; i += 1) {
       const res = await request(
         app,
         'POST',
-        '/admin-login',
+        '/access-login',
         { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': `203.0.113.${i}` },
-        'request_id=nope&password=nope',
+        'request_id=nope&access_key=nope',
       );
       status = res.status;
     }
@@ -235,10 +236,10 @@ describe('TRUST_PROXY', () => {
     // 一次请求实际拿到 500、404，还是路由整个消失，只要不是恰好 429 就会通过——
     // "没有被限流"和"什么正经响应都没有"在这个断言里长得一样。改成正向断言：
     // 每个来源各占一个桶，意味着最后这一次请求应该走到正常的登录校验逻辑，
-    // 拿到密码错误的 401，而不是被限流的 429。
+    // 拿到密钥错误的 401，而不是被限流的 429。
     expect(
       await floodAdminLogin(app, ADMIN_LOGIN_ATTEMPTS_BEYOND_LIMIT),
-      '信任代理时不同的转发来源各占一个桶，一个访客锁不死所有人；最后一次请求应该正常校验到密码错误（401），而不是被限流（429）',
+      '信任代理时不同的转发来源各占一个桶，一个访客锁不死所有人；最后一次请求应该正常校验到密钥错误（401），而不是被限流（429）',
     ).toBe(401);
   });
 });

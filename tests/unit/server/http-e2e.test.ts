@@ -15,7 +15,7 @@ import { createSessionStore, type SessionStore } from '../../../src/core/session
 
 /**
  * 端到端：真实 AuthStore + 真实 AppleOAuthProvider（不 mock），真的绑到 127.0.0.1:0 打
- * 请求，走 register -> authorize -> admin-login -> token -> /mcp 整条链路。
+ * 请求，走 register -> authorize -> access-login -> token -> /mcp 整条链路。
  *
  * 这条测试存在的理由是 http-app.test.ts 那七个单测全都 mock 掉了 provider——`verifyAccessToken`
  * 从没真正抛过 provider.ts 里那些带中文文案的 InvalidTokenError/InvalidGrantError，所以那七个
@@ -24,6 +24,7 @@ import { createSessionStore, type SessionStore } from '../../../src/core/session
  */
 
 const logger = createLogger('error', () => {});
+/** 管理员口令仍然在 HttpConfig 里（管理页要用），但授权页不再认它。 */
 const ADMIN_PASSWORD = 'e2e-admin-password';
 const REDIRECT_URI = 'http://127.0.0.1:9/callback';
 
@@ -55,10 +56,14 @@ const appConfig = {
 } as AppConfig;
 
 let dirs: string[] = [];
+/** startServer 建的每一把密钥：明文 → id。`runFullAuthFlow` 只拿得到明文（和真实用户一样），
+ *  返回值里的 accessKeyId 从这里查——测试要拿它去比对会话归属。 */
+const keyIdsByPlaintext = new Map<string, string>();
 
 afterEach(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   dirs = [];
+  keyIdsByPlaintext.clear();
 });
 
 interface TestServer {
@@ -69,6 +74,8 @@ interface TestServer {
   sessions: SessionStore;
   /** 被销毁的会话关掉了哪些底层连接。 */
   closedProviders: string[];
+  /** startServer 建的那把访问密钥的明文，授权页上要提交的就是它。 */
+  accessKey: string;
   close: () => Promise<void>;
 }
 
@@ -79,6 +86,8 @@ async function startServer(): Promise<TestServer> {
 
   const store = createAuthStore({ path: join(dir, 'tokens.json.enc'), key: randomBytes(32), logger });
   await store.load();
+  const { record: keyRecord, plaintext: accessKey } = await store.createAccessKey('e2e');
+  keyIdsByPlaintext.set(accessKey, keyRecord.id);
 
   const pending = createPendingStore();
 
@@ -108,7 +117,7 @@ async function startServer(): Promise<TestServer> {
       }) as never,
   });
 
-  const provider = createOAuthProvider({ store, sessions, logger, pending });
+  const provider = createOAuthProvider({ store, sessions, logger, pending, accessKeys: store });
 
   const httpConfig = {
     port: 0,
@@ -127,6 +136,7 @@ async function startServer(): Promise<TestServer> {
     sessions,
     provider,
     logger,
+    store,
     pending,
   });
   const server = createNodeServer(app);
@@ -139,6 +149,7 @@ async function startServer(): Promise<TestServer> {
     sweepIdleTransports,
     sessions,
     closedProviders,
+    accessKey,
     async close() {
       await closeAll();
       await sessions.destroyAll();
@@ -147,11 +158,10 @@ async function startServer(): Promise<TestServer> {
   };
 }
 
-/** register -> authorize -> admin-login -> token，返回 /token 的原始 status、已解析的 body
- *  与这次动态注册拿到的 client_id（`/revoke` 需要它做客户端认证）。 */
-async function runFullAuthFlow(
+/** register -> GET /authorize，返回登录页里的 request_id 以及之后兑换授权码要用的东西。 */
+async function openAuthorizePage(
   base: string,
-): Promise<{ status: number; body: Record<string, unknown>; clientId: string }> {
+): Promise<{ clientId: string; codeVerifier: string; requestId: string }> {
   const codeVerifier = b64url(randomBytes(32));
   const codeChallenge = b64url(createHash('sha256').update(codeVerifier).digest());
 
@@ -183,20 +193,37 @@ async function runFullAuthFlow(
   const match = /name="request_id" value="([^"]+)"/.exec(html);
   if (!match) throw new Error('login page did not contain a request_id field');
   const requestId = match[1] as string;
+  return { clientId, codeVerifier, requestId };
+}
 
-  const loginRes = await fetch(`${base}/admin-login`, {
+function submitAccessKey(base: string, requestId: string, accessKey: string): Promise<Response> {
+  return fetch(`${base}/access-login`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     redirect: 'manual',
-    body: new URLSearchParams({ request_id: requestId, password: ADMIN_PASSWORD }).toString(),
+    body: new URLSearchParams({ request_id: requestId, access_key: accessKey }).toString(),
   });
-  expect(loginRes.status, 'POST /admin-login 跳回并带 code').toBe(303);
+}
+
+/** register -> authorize -> access-login -> token，返回 /token 的原始 status、已解析的 body、
+ *  这次动态注册拿到的 client_id（`/revoke` 需要它做客户端认证），以及提交的那把密钥的 id。 */
+async function runFullAuthFlow(
+  base: string,
+  accessKey: string,
+): Promise<{ status: number; body: Record<string, unknown>; clientId: string; accessKeyId: string }> {
+  const accessKeyId = keyIdsByPlaintext.get(accessKey);
+  if (accessKeyId === undefined) throw new Error('runFullAuthFlow was given a key startServer did not create');
+
+  const { clientId, codeVerifier, requestId } = await openAuthorizePage(base);
+
+  const loginRes = await submitAccessKey(base, requestId, accessKey);
+  expect(loginRes.status, 'POST /access-login 跳回并带 code').toBe(303);
   const location = loginRes.headers.get('location');
-  if (!location) throw new Error('admin-login did not redirect');
+  if (!location) throw new Error('access-login did not redirect');
   const callback = new URL(location);
   expect(callback.searchParams.get('state')).toBe('e2e-state');
   const code = callback.searchParams.get('code');
-  if (!code) throw new Error('no code in the admin-login redirect');
+  if (!code) throw new Error('no code in the access-login redirect');
 
   const tokenRes = await fetch(`${base}/token`, {
     method: 'POST',
@@ -210,7 +237,7 @@ async function runFullAuthFlow(
     }).toString(),
   });
   const body = (await tokenRes.json()) as Record<string, unknown>;
-  return { status: tokenRes.status, body, clientId };
+  return { status: tokenRes.status, body, clientId, accessKeyId };
 }
 
 const NEWLINE = String.fromCharCode(10);
@@ -293,10 +320,10 @@ async function loginThroughMcp(base: string, accessToken: string): Promise<strin
 }
 
 describe('oauth chain end to end (real provider, real store, real port)', () => {
-  it('walks register -> authorize -> admin-login -> token and yields an access_token', async () => {
+  it('walks register -> authorize -> access-login -> token and yields an access_token', async () => {
     const srv = await startServer();
     try {
-      const { status, body } = await runFullAuthFlow(srv.base);
+      const { status, body } = await runFullAuthFlow(srv.base, srv.accessKey);
       expect(status, `POST /token 换到访问令牌 —— 收到的 body: ${JSON.stringify(body)}`).toBe(200);
       expect(typeof body.access_token).toBe('string');
       expect((body.access_token as string).length).toBeGreaterThan(0);
@@ -308,7 +335,7 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
   it('lets a real access token past requireBearerAuth', async () => {
     const srv = await startServer();
     try {
-      const { body } = await runFullAuthFlow(srv.base);
+      const { body } = await runFullAuthFlow(srv.base, srv.accessKey);
       const accessToken = body.access_token as string;
 
       const res = await fetch(`${srv.base}/mcp`, {
@@ -364,12 +391,13 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
   it('destroys the live MCP session the revoked token had authorized', async () => {
     const srv = await startServer();
     try {
-      const { body, clientId } = await runFullAuthFlow(srv.base);
+      const { body, clientId, accessKeyId } = await runFullAuthFlow(srv.base, srv.accessKey);
       const accessToken = body.access_token as string;
 
       const sessionId = await loginThroughMcp(srv.base, accessToken);
       expect(srv.sessions.size(), 'apple_login 应当建立了一条会话').toBe(1);
-      expect(srv.sessions.get(sessionId).id, 'session_id 在吊销前必须可用').toBe(sessionId);
+      // 带上密钥 id 才取得到：这一句同时证明了密钥 id 从授权页一路传到了会话归属上。
+      expect(srv.sessions.get(sessionId, accessKeyId).id, 'session_id 在吊销前必须可用').toBe(sessionId);
 
       const revokeRes = await fetch(`${srv.base}/revoke`, {
         method: 'POST',
@@ -382,7 +410,8 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
         srv.sessions.size(),
         '令牌已吊销，它授权建立的会话必须当场消失，而不是等 30 分钟空闲 TTL',
       ).toBe(0);
-      expect(() => srv.sessions.get(sessionId), '被吊销的 session_id 必须立刻失效').toThrow();
+      // 必须带属主的密钥 id 去取：不带的话归属不符本身就会抛，这条断言就什么也证明不了。
+      expect(() => srv.sessions.get(sessionId, accessKeyId), '被吊销的 session_id 必须立刻失效').toThrow();
       expect(
         srv.closedProviders,
         '只从 Map 里删掉会留下一条还连着用户 iCloud 邮箱的 IMAP 连接',
@@ -398,7 +427,7 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
   it('sweeps an idle mcp transport, and leaves an active one alone', async () => {
     const srv = await startServer();
     try {
-      const { body } = await runFullAuthFlow(srv.base);
+      const { body } = await runFullAuthFlow(srv.base, srv.accessKey);
       const accessToken = body.access_token as string;
 
       const init = await mcpPost(srv.base, accessToken, {
@@ -446,10 +475,10 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
     }
   });
 
-  // 整套服务里唯一一个有真人往里输管理员口令的页面。能被第三方站点嵌进 iframe，
+  // 有真人往里输访问密钥的页面。能被第三方站点嵌进 iframe，
   // 就能被盖在别的页面下面骗一次提交。X-Frame-Options 管老浏览器，CSP 的
   // frame-ancestors 是现代等价物，两条都要，覆盖面不完全重合。
-  it('serves the admin login page with anti-clickjacking headers', async () => {
+  it('serves the access key login page with anti-clickjacking headers', async () => {
     const srv = await startServer();
     try {
       const regRes = await fetch(`${srv.base}/register`, {
@@ -477,16 +506,41 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
       expect(page.headers.get('x-frame-options')).toBe('DENY');
       expect(page.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
 
-      // 口令错时重新渲染的那一份也是同一个页面，必须带同样的头。
-      const retry = await fetch(`${srv.base}/admin-login`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        redirect: 'manual',
-        body: new URLSearchParams({ request_id: 'nope', password: 'wrong' }).toString(),
-      });
+      // 密钥错时重新渲染的那一份也是同一个页面，必须带同样的头。
+      const retry = await submitAccessKey(srv.base, 'nope', 'wrong');
       expect(retry.status).toBe(401);
       expect(retry.headers.get('x-frame-options')).toBe('DENY');
       expect(retry.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('refuses the admin password on the authorization page', async () => {
+    const srv = await startServer();
+    try {
+      const { requestId } = await openAuthorizePage(srv.base);
+      const res = await submitAccessKey(srv.base, requestId, ADMIN_PASSWORD);
+      expect(res.status, '管理员口令只管 /admin，授权页上不能再换出授权码').toBe(401);
+      expect(res.headers.get('location')).toBeNull();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('answers a repeated submit of a completed authorization with 200 and the completed page', async () => {
+    const srv = await startServer();
+    try {
+      const { requestId } = await openAuthorizePage(srv.base);
+      const first = await submitAccessKey(srv.base, requestId, srv.accessKey);
+      expect(first.status).toBe(303);
+
+      const again = await submitAccessKey(srv.base, requestId, srv.accessKey);
+      expect(again.status, '授权已经成功，重复提交不该看起来像失败').toBe(200);
+      expect(await again.text()).toContain('授权已完成');
+      expect(again.headers.get('location'), '不能再签发第二个授权码').toBeNull();
+      expect(again.headers.get('cache-control')).toBe('no-store');
+      expect(again.headers.get('x-frame-options')).toBe('DENY');
     } finally {
       await srv.close();
     }
@@ -498,7 +552,7 @@ describe('oauth chain end to end (real provider, real store, real port)', () => 
   it('normalizes a malformed body from an authenticated caller instead of leaking a stack trace', async () => {
     const srv = await startServer();
     try {
-      const { body: tokenBody } = await runFullAuthFlow(srv.base);
+      const { body: tokenBody } = await runFullAuthFlow(srv.base, srv.accessKey);
       const accessToken = tokenBody.access_token as string;
 
       const res = await fetch(`${srv.base}/mcp`, {

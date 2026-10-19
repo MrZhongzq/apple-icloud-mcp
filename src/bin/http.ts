@@ -36,10 +36,12 @@ async function main(): Promise<void> {
   // 解密失败（密钥变了/文件损坏）必须在这里就退出，而不是带着一个打不开的令牌存储去监听端口。
   await store.load();
 
-  // provider.authorize()（任务四）与 /admin-login 路由（本任务）必须共享同一个 pending
-  // store，否则登录页永远找不到 authorize() 暂存的待授权请求——这里显式建一个，两处都传。
+  // provider.authorize() 与 /access-login 路由必须共享同一个 pending store，否则登录页
+  // 永远找不到 authorize() 暂存的待授权请求——这里显式建一个，两处都传。
+  // 访问密钥也一样：/access-login 查密钥、provider 兑换/校验令牌时回看密钥状态，用的必须
+  // 是同一个 store，否则在管理页停用一把密钥，只有一半的地方知道。
   const pending = createPendingStore();
-  const provider = createOAuthProvider({ store, sessions, logger, pending });
+  const provider = createOAuthProvider({ store, sessions, logger, pending, accessKeys: store });
 
   const { app, closeAll, sweepIdleTransports } = createHttpApp({
     config,
@@ -47,6 +49,7 @@ async function main(): Promise<void> {
     sessions,
     provider,
     logger,
+    store,
     pending,
   });
 

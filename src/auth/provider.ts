@@ -22,13 +22,13 @@ import {
 } from './login.js';
 import type { PendingStore } from './login.js';
 import type { Logger } from '../core/logger.js';
-import { TOKEN_FAMILY_KEY, type SessionStore } from '../core/session.js';
+import { ACCESS_KEY_ID_KEY, TOKEN_FAMILY_KEY, type SessionStore } from '../core/session.js';
 
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 3600_000;
 const DEFAULT_REFRESH_TOKEN_TTL_MS = 30 * 24 * 3600_000;
 const DEFAULT_AUTH_CODE_TTL_MS = 60_000;
-/** 一次待授权请求（等管理员在登录页确认）的存活时间——比授权码本身（60s）宽松得多，
- *  因为这段时间里有一个真人在输密码，不是机器瞬时兑换。 */
+/** 一次待授权请求（等使用者在登录页输入访问密钥）的存活时间——比授权码本身（60s）宽松得多，
+ *  因为这段时间里有一个真人在找、在粘贴密钥，不是机器瞬时兑换。 */
 const DEFAULT_PENDING_AUTH_TTL_MS = 10 * 60_000;
 
 /**
@@ -48,16 +48,23 @@ export interface PendingCode {
   redirect_uri: string;
   code_challenge: string;
   scopes: string[];
+  /** 这个码是凭哪把访问密钥签发的；兑换出的每一个令牌都继承它。 */
+  access_key_id: string;
   expires_at: number;
 }
 
+/** 访问密钥被停用或删除后，凭它签发的授权码、刷新令牌、访问令牌一律作废时用的消息。
+ *  必须是 ASCII：InvalidTokenError 的消息会进 WWW-Authenticate 头（见 verifyAccessToken 上方的注释）。 */
+const ACCESS_KEY_GONE = 'access key disabled or removed; re-authorize';
+
 export interface AppleOAuthProvider extends OAuthServerProvider {
-  /** 由 Task 4 的登录流程调用：管理员通过校验后签发一次性授权码，返回原始码。 */
+  /** 由登录流程调用：访问密钥通过校验后签发一次性授权码，返回原始码。 */
   issueAuthorizationCode(params: {
     clientId: string;
     redirectUri: string;
     codeChallenge: string;
     scopes: string[];
+    accessKeyId: string;
   }): string;
   /** 定期清理过期授权码与令牌，返回清理条数。 */
   sweep(): Promise<number>;
@@ -67,6 +74,12 @@ export function createOAuthProvider(deps: {
   store: AuthStore;
   sessions: SessionStore;
   logger: Logger;
+  /**
+   * 兑换授权码、刷新、校验访问令牌时都要回头看一眼签发它的那把密钥还在不在、还启用着没有。
+   * 只要这两个方法，生产环境直接传 store。单独列一个依赖而不是复用 `store`，是为了让
+   * 「令牌是否有效取决于密钥的当前状态」这件事在签名上看得见。
+   */
+  accessKeys: Pick<AuthStore, 'getAccessKey' | 'touchAccessKey'>;
   /** Task 4：authorize() 把待授权请求暂存在这里。不传时内部自建一份——
    *  这个依赖是新加的，老调用方（如既有的令牌测试）不必跟着改。 */
   pending?: PendingStore;
@@ -74,7 +87,7 @@ export function createOAuthProvider(deps: {
   refreshTokenTtlMs?: number;
   authCodeTtlMs?: number;
 }): AppleOAuthProvider {
-  const { store, logger } = deps;
+  const { store, logger, accessKeys } = deps;
   const sessions = deps.sessions as SessionStoreWithTokenDestroy;
   const pending = deps.pending ?? createPendingStore();
   const accessTokenTtlMs = deps.accessTokenTtlMs ?? DEFAULT_ACCESS_TOKEN_TTL_MS;
@@ -127,6 +140,7 @@ export function createOAuthProvider(deps: {
     redirectUri: string;
     codeChallenge: string;
     scopes: string[];
+    accessKeyId: string;
   }): string {
     const code = generateToken();
     const codeHash = hashToken(code);
@@ -136,9 +150,17 @@ export function createOAuthProvider(deps: {
       redirect_uri: params.redirectUri,
       code_challenge: params.codeChallenge,
       scopes: params.scopes,
+      access_key_id: params.accessKeyId,
       expires_at: Date.now() + authCodeTtlMs,
     });
     return code;
+  }
+
+  /** 这把密钥现在还能不能用来换/续/用令牌。删除与停用一视同仁：两种情况下签发出去的
+   *  令牌都必须立刻失效，不能等它自己过期。 */
+  function accessKeyUsable(id: string): boolean {
+    const key = accessKeys.getAccessKey(id);
+    return key !== undefined && key.enabled;
   }
 
   /**
@@ -153,6 +175,7 @@ export function createOAuthProvider(deps: {
     clientId: string,
     scopes: string[],
     familyId: string,
+    accessKeyId: string,
   ): { tokens: OAuthTokens; record: StoredToken } {
     const accessToken = generateToken();
     const refreshToken = generateToken();
@@ -166,6 +189,7 @@ export function createOAuthProvider(deps: {
       access_expires_at: now + accessTokenTtlMs,
       refresh_expires_at: now + refreshTokenTtlMs,
       rotated: false,
+      access_key_id: accessKeyId,
     };
     const tokens: OAuthTokens = {
       access_token: accessToken,
@@ -229,8 +253,17 @@ export function createOAuthProvider(deps: {
     if (pending.redirect_uri !== redirectUri) {
       throw new InvalidGrantError('redirect_uri does not match the value used when the code was issued');
     }
+    // 授权码能活 60 秒，这期间管理员完全可能刚好停用了这把密钥：码已经签出去不等于还该兑现。
+    if (!accessKeyUsable(pending.access_key_id)) {
+      throw new InvalidGrantError(ACCESS_KEY_GONE);
+    }
 
-    const { tokens, record } = buildTokenPair(pending.client_id, pending.scopes, randomUUID());
+    const { tokens, record } = buildTokenPair(
+      pending.client_id,
+      pending.scopes,
+      randomUUID(),
+      pending.access_key_id,
+    );
     await store.saveTokens(record);
     return tokens;
   }
@@ -256,6 +289,16 @@ export function createOAuthProvider(deps: {
       throw new InvalidGrantError('refresh token replay detected; the token family has been revoked, re-authorize');
     }
 
+    // 放在重放检测之后：一个已轮换的刷新令牌再次出现，不管密钥现在是什么状态，都要先当成
+    // 泄露信号把整族断掉。没有 access_key_id 的是引入访问密钥之前签发的令牌——它不属于任何
+    // 一个人，续出来的新令牌也一样不属于任何人，verify 那一步照样会拒，不如在这里就拒。
+    if (record.access_key_id === undefined) {
+      throw new InvalidGrantError('refresh token predates access keys; re-authorize');
+    }
+    if (!accessKeyUsable(record.access_key_id)) {
+      throw new InvalidGrantError(ACCESS_KEY_GONE);
+    }
+
     // RFC 6749 §6：刷新时请求的 scope 必须是原始授权的子集，绝不能借刷新扩权。
     // 今天这条检查在本服务上"没有实际后果"，因为 requireBearerAuth 是不带 requiredScopes
     // 调的，没有任何地方按 scope 做决策——但那正是不能用来免检的理由：它成立与否取决于
@@ -271,7 +314,12 @@ export function createOAuthProvider(deps: {
       }
     }
     const nextScopes = scopes ?? record.scopes;
-    const { tokens, record: nextRecord } = buildTokenPair(record.client_id, nextScopes, record.family_id);
+    const { tokens, record: nextRecord } = buildTokenPair(
+      record.client_id,
+      nextScopes,
+      record.family_id,
+      record.access_key_id,
+    );
     // 只写这一次：rotateRefresh 既标记旧记录、又写入新记录，前面 buildTokenPair 不落盘。
     await store.rotateRefresh(refreshToken, nextRecord);
     return tokens;
@@ -282,6 +330,19 @@ export function createOAuthProvider(deps: {
     if (!record) {
       throw new InvalidTokenError('access token not found, expired, or revoked');
     }
+    // 旧快照里的令牌没有 access_key_id：那是管理员口令时代签发的，不属于任何一把密钥。
+    // 放行它，工具层拿到的密钥 id 就是 undefined，按密钥隔离会话的那一层便形同虚设。
+    // 拒掉的代价只是让老用户重新授权一次。
+    const keyId = record.access_key_id;
+    if (keyId === undefined) {
+      throw new InvalidTokenError('access token predates access keys; re-authorize');
+    }
+    // 删除密钥本身不吊销令牌记录（那由切断流程负责），所以这里每次都要看密钥的当前状态，
+    // 而不是只信令牌记录还在。
+    if (!accessKeyUsable(keyId)) {
+      throw new InvalidTokenError(ACCESS_KEY_GONE);
+    }
+    accessKeys.touchAccessKey(keyId);
     return {
       token,
       clientId: record.client_id,
@@ -290,8 +351,10 @@ export function createOAuthProvider(deps: {
       // 令牌家族必须一路带到工具层：`apple_login` 靠它把新建的会话登记到这个家族名下，
       // 否则 `revokeToken`/重放检测调用的 `sessions.destroyByToken(familyId)` 永远匹配不到
       // 任何会话——令牌作废了，可拿着 session_id 的一方仍然连着用户的 IMAP/SMTP。
+      // 访问密钥 id 走同一条路：工具层靠它把会话归到这个人名下，别人的令牌拿着同一个
+      // session_id 也用不了。
       // `AuthInfo.extra` 是 SDK 给这类附加数据留的正式位置，不是断言出来的字段。
-      extra: { [TOKEN_FAMILY_KEY]: record.family_id },
+      extra: { [TOKEN_FAMILY_KEY]: record.family_id, [ACCESS_KEY_ID_KEY]: keyId },
     };
   }
 
@@ -313,10 +376,13 @@ export function createOAuthProvider(deps: {
         expiredCodes += 1;
       }
     }
+    // 待授权请求（以及它记下的「已完成」标记）也在这里一并清：bin/http.ts 的定时器只调
+    // provider.sweep()，不另外认识 pending store；不清的话两张表只增不减。
+    const expiredPending = pending.sweep(now);
     const expiredTokens = await store.sweep(now);
-    const total = expiredCodes + expiredTokens;
+    const total = expiredCodes + expiredPending + expiredTokens;
     if (total > 0) {
-      logger.debug('swept expired auth codes and tokens', { expiredCodes, expiredTokens });
+      logger.debug('swept expired auth codes and tokens', { expiredCodes, expiredPending, expiredTokens });
     }
     return total;
   }
@@ -328,7 +394,7 @@ export function createOAuthProvider(deps: {
     // 第三个参数是真正的 express Response（@types/express 已装，见 Task 4 报告）——
     // res.set()/res.status()/res.send() 在这里是类型检查过的，不是 any。这个方法本身只渲染
     // 登录页或错误页，从不跳转：真正的 302（把 code/state 带回 redirect_uri，或早退时的
-    // res.redirect()）发生在管理员提交登录表单之后，由消费 handleLoginSubmit() 结果的路由完成。
+    // res.redirect()）发生在使用者提交访问密钥之后，由消费 handleLoginSubmit() 结果的路由完成。
     async authorize(client, params, res): Promise<void> {
       // redirect_uri 必须与客户端注册时的完全一致：不做前缀匹配、不做通配。
       // 不匹配就不跳转——跳到一个未注册的地址正是开放重定向，这里是唯一会把用户
