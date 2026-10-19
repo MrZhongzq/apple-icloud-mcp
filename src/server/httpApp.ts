@@ -21,6 +21,12 @@ import {
   renderLoginPage,
   type PendingStore,
 } from '../auth/login.js';
+import { createAdminRouter } from './admin.js';
+import {
+  ACCESS_LOGIN_RATE_LIMIT_MAX,
+  ACCESS_LOGIN_RATE_LIMIT_WINDOW_MS,
+  createSimpleRateLimit,
+} from './rateLimit.js';
 
 export interface CreateHttpAppDeps {
   config: AppConfig;
@@ -60,38 +66,6 @@ export interface HttpApp {
   cutOffAccessKey: (keyId: string) => Promise<void>;
   /** 管理页关掉 env 账号开关之后调用：销毁所有用 env 账号（不是信封）建立的会话。 */
   onEnvAccountsDisabled: () => Promise<void>;
-}
-
-const ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60_000;
-const ADMIN_LOGIN_RATE_LIMIT_MAX = 20;
-
-/** 极简滑动窗口限流：单进程内存足够——授权页只有寥寥几个持有访问密钥的人在用。
- *  周期性清掉早已过期的桶，避免不同源 IP 造成 Map 无限增长。 */
-function createSimpleRateLimit(opts: { windowMs: number; max: number }) {
-  const buckets = new Map<string, { count: number; resetAt: number }>();
-
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const now = Date.now();
-    // 顺手清理过期桶，管理员登录场景请求量极低，这里的开销可以忽略
-    for (const [key, bucket] of buckets) {
-      if (bucket.resetAt <= now) buckets.delete(key);
-    }
-
-    const key = req.ip ?? 'unknown';
-    const bucket = buckets.get(key);
-    if (!bucket) {
-      buckets.set(key, { count: 1, resetAt: now + opts.windowMs });
-      next();
-      return;
-    }
-    if (bucket.count >= opts.max) {
-      res.set('Cache-Control', 'no-store');
-      res.status(429).send('登录尝试过于频繁，请稍后再试');
-      return;
-    }
-    bucket.count += 1;
-    next();
-  };
 }
 
 /** 只放行 PUBLIC_URL 的来源与 https://claude.ai——绝不用 `origin: true` 反射任意来源。 */
@@ -375,16 +349,10 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
   // 但限流防的不只是猜，也防有人拿这个端点刷请求。
   app.post(
     '/access-login',
-    createSimpleRateLimit({ windowMs: ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS, max: ADMIN_LOGIN_RATE_LIMIT_MAX }),
+    createSimpleRateLimit({ windowMs: ACCESS_LOGIN_RATE_LIMIT_WINDOW_MS, max: ACCESS_LOGIN_RATE_LIMIT_MAX }),
     express.urlencoded({ extended: false }),
     createAccessLoginHandler({ store, provider, logger, pending }),
   );
-
-  // /.well-known/*、/authorize、/token、/register、/revoke
-  app.use(mcpAuthRouter({ provider, issuerUrl: httpConfig.publicUrl }));
-
-  // 认证之前：谁都能问，所以什么都不说
-  app.get('/health', createHealthHandler());
 
   const {
     handler: mcpHandler,
@@ -399,6 +367,28 @@ export function createHttpApp(deps: CreateHttpAppDeps): HttpApp {
     store,
     envelope: deps.envelope,
   });
+
+  // 管理页 /admin：同样挂在 mcpAuthRouter 之前，理由同上面 /access-login 那段。
+  // 停用/删除密钥、关 env 开关要清掉的会话和 transport 都在上面这个闭包里，所以从这里传进去。
+  app.use(
+    createAdminRouter({
+      adminPasswordHash: httpConfig.adminPasswordHash,
+      store,
+      publicUrl: httpConfig.publicUrl,
+      logger,
+      cutOffAccessKey,
+      onEnvAccountsDisabled,
+      envAccountCount: config.accounts.length,
+      envelopePublicKey: deps.envelope?.publicKeyText,
+    }),
+  );
+
+  // /.well-known/*、/authorize、/token、/register、/revoke
+  app.use(mcpAuthRouter({ provider, issuerUrl: httpConfig.publicUrl }));
+
+  // 认证之前：谁都能问，所以什么都不说
+  app.get('/health', createHealthHandler());
+
   const verifier = createVerifier(provider);
 
   // 这一行是整个文件最重要的一行：requireBearerAuth 必须在 express.json() 之前，也在
