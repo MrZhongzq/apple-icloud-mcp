@@ -6,8 +6,10 @@
 #
 # This Dockerfile builds the HTTP entrypoint (src/bin/http.ts -> dist/bin/http.js).
 # The stdio entrypoint (dist/bin/stdio.js) needs none of the environment this
-# image requires -- see README.md "Remote deployment" for which five variables
-# are HTTP-only.
+# image requires. Seven variables are HTTP-only (read by loadHttpConfig in
+# src/core/config.ts): PUBLIC_URL, ADMIN_PASSWORD_HASH and TOKEN_ENCRYPTION_KEY
+# (required), plus PORT, TOKEN_STORE_PATH, ENVELOPE_KEY_PATH and TRUST_PROXY
+# (optional) -- see README.md "Remote HTTP transport only" for each one.
 
 # ---- deps: production dependencies only, cached separately from source changes ----
 FROM node:22-alpine AS deps
