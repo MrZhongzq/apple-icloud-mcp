@@ -272,6 +272,8 @@ docker compose up -d
    2. 正常调用工具；
    3. 最后 `work_done`。
 
+   Routine 如果在**别的仓库**里、不想带上整个本仓库：只复制 `scripts/make-envelope.mjs` 这一个文件，再把几行规则贴进 Routine 的指令，就够了。做法见 [`远程连接-单脚本接入.md`](远程连接-单脚本接入.md)。
+
 关于那个脚本：
 
 - 不需要 `npm ci`，也不需要 `npm run build`。它零依赖，只要 Node 20 以上。
