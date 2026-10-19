@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseVCard, readContactMeta } from '../../../src/parsers/vcard.js';
+import { isGroupVCard, parseVCard, readContactMeta } from '../../../src/parsers/vcard.js';
 import { AppError } from '../../../src/core/errors.js';
 
 const ref = {
@@ -190,5 +190,39 @@ describe('readContactMeta', () => {
 
   it('returns an empty object for a card carrying neither', () => {
     expect(readContactMeta(card('FN:x'))).toEqual({});
+  });
+});
+
+// iCloud 把通讯录「分组」也存成一张 vCard（X-ADDRESSBOOKSERVER-KIND:group，成员写在
+// X-ADDRESSBOOKSERVER-MEMBER 里），和真联系人混在同一本通讯簿里返回。实测
+// contacts_search 曾把 Coworkers / Family / Friends / ICE 当成联系人列了出来。
+describe('isGroupVCard', () => {
+  it('recognizes an iCloud group card', () => {
+    const group = card(
+      'FN:Coworkers',
+      'N:Coworkers;;;;',
+      'X-ADDRESSBOOKSERVER-KIND:group',
+      'X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:1F2E3D4C-0000-0000-0000-000000000001',
+      'UID:G1',
+    );
+    expect(isGroupVCard(group)).toBe(true);
+  });
+
+  it('matches the kind value case-insensitively', () => {
+    expect(isGroupVCard(card('FN:ICE', 'X-ADDRESSBOOKSERVER-KIND:GROUP'))).toBe(true);
+  });
+
+  it('recognizes the vCard 4 KIND:group form', () => {
+    expect(isGroupVCard(['BEGIN:VCARD', 'VERSION:4.0', 'FN:Friends', 'KIND:group', 'END:VCARD'].join(String.fromCharCode(13, 10)))).toBe(true);
+  });
+
+  it('keeps ordinary people and company cards', () => {
+    expect(isGroupVCard(card('FN:张三', 'N:张;三;;;'))).toBe(false);
+    expect(isGroupVCard(card('FN:', 'N:;;;;', 'ORG:Apple (中国大陆);', 'X-ABShowAs:COMPANY'))).toBe(false);
+    expect(isGroupVCard(card('FN:李四', 'KIND:individual'))).toBe(false);
+  });
+
+  it('does not mistake a note mentioning a group for a group card', () => {
+    expect(isGroupVCard(card('FN:王五', 'NOTE:KIND:group'))).toBe(false);
   });
 });

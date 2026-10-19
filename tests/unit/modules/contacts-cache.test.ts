@@ -207,6 +207,42 @@ describe('createContactsCache', () => {
     expect(cache.size()).toBe(2);
   });
 
+  // 分组卡片不是联系人：iCloud 把 Coworkers 之类的分组和真联系人放在同一本通讯簿里，
+  // 不在缓存这一层拦下，contacts_search 就会把分组名当成人返回。
+  it('leaves group cards out of the cache', async () => {
+    const group = ['BEGIN:VCARD', 'VERSION:3.0', 'FN:Coworkers', 'N:Coworkers;;;;', 'X-ADDRESSBOOKSERVER-KIND:group', 'UID:G1', 'END:VCARD'].join(String.fromCharCode(13, 10));
+    const provider = makeProvider({
+      fetchAll: vi.fn().mockResolvedValue({
+        objects: [
+          { url: 'https://c/1/card/a.vcf', etag: 'e1', data: card('张三', 'U1') },
+          { url: 'https://c/1/card/g.vcf', etag: 'e2', data: group },
+        ],
+        syncToken: 'tok-1',
+      }),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    const book = cache.snapshot()[0]!;
+    expect([...book.cards.keys()]).toEqual(['https://c/1/card/a.vcf']);
+  });
+
+  it('drops a cached card that an incremental sync turns into a group card', async () => {
+    const asGroup = ['BEGIN:VCARD', 'VERSION:3.0', 'FN:张三', 'N:张三;;;;', 'X-ADDRESSBOOKSERVER-KIND:group', 'UID:U1', 'END:VCARD'].join(String.fromCharCode(13, 10));
+    const provider = makeProvider({
+      syncSince: vi.fn().mockResolvedValue({
+        syncToken: 'tok-2',
+        created: [],
+        updated: [{ url: 'https://c/1/card/a.vcf', etag: 'e1b', data: asGroup }],
+        deleted: [],
+      }),
+    });
+    const cache = createContactsCache({ carddav: provider, logger: silentLogger });
+    await cache.refresh();
+    expect(cache.size()).toBe(1);
+    await cache.refresh();
+    expect(cache.size(), 'a stale person entry must not survive once the card is a group').toBe(0);
+  });
+
   it('re-syncs a book after invalidate', async () => {
     const provider = makeProvider();
     const cache = createContactsCache({ carddav: provider, logger: silentLogger });

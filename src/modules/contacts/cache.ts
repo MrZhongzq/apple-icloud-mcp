@@ -1,5 +1,5 @@
 import type { Logger } from '../../core/logger.js';
-import { parseVCard, type Contact } from '../../parsers/vcard.js';
+import { isGroupVCard, parseVCard, type Contact } from '../../parsers/vcard.js';
 import type { CardDavProvider, CardObject } from '../../providers/icloud/carddav.js';
 
 export interface CachedBook {
@@ -35,7 +35,11 @@ export interface ContactsCache {
   size(): number;
 }
 
-/** 把一批 CardObject 逐张解析进 cards；单张解析失败就地吞掉计数，绝不拖累同批其它卡片。 */
+/**
+ * 把一批 CardObject 逐张解析进 cards；单张解析失败就地吞掉计数，绝不拖累同批其它卡片。
+ * 分组卡片不是联系人，不进缓存——缓存是 contacts_search 唯一的数据来源，在这里拦下就不会有
+ * 任何搜索结果把分组名当成一个人。已在缓存里的同一 url 也要删掉：增量同步时一张卡可能被改成分组。
+ */
 function parseCardsInto(
   cards: Map<string, Contact>,
   objects: CardObject[],
@@ -44,6 +48,10 @@ function parseCardsInto(
 ): void {
   for (const object of objects) {
     try {
+      if (isGroupVCard(object.data)) {
+        cards.delete(object.url);
+        continue;
+      }
       const contact = parseVCard(object.data, { collectionUrl: bookUrl, resourceUrl: object.url });
       cards.set(object.url, contact);
     } catch (err) {

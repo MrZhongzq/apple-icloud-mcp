@@ -418,6 +418,21 @@ export function parseVCard(text: string, ref: ResourceRef): Contact {
   return contact;
 }
 
+/**
+ * 这张卡片是不是一个「分组」而不是一个人。iCloud 把通讯录分组（Coworkers、Family、ICE……）也存成
+ * vCard 3.0，用 `X-ADDRESSBOOKSERVER-KIND:group` 标记、成员写在 `X-ADDRESSBOOKSERVER-MEMBER` 里，
+ * 和真联系人混在同一本通讯簿返回；vCard 4.0 的等价写法是 `KIND:group`。按属性读而不是对原文做正则，
+ * 是为了不把 NOTE 里恰好写着 "KIND:group" 的普通联系人误判成分组。
+ */
+export function isGroupVCard(text: string): boolean {
+  const root = parseRoot(text);
+  for (const name of ['x-addressbookserver-kind', 'kind']) {
+    const value = root.getFirstPropertyValue(name);
+    if (typeof value === 'string' && value.trim().toLowerCase() === 'group') return true;
+  }
+  return false;
+}
+
 /** 只读 UID 和 REV，不构建完整的 Contact 模型——供同步/条件写入等只关心元数据的调用方使用。 */
 export function readContactMeta(text: string): { uid?: string; rev?: string } {
   const root = parseRoot(text);
