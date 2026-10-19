@@ -1,11 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import * as fsp from 'node:fs/promises';
 import { createAuthStore, type StoredToken } from '../../../src/auth/store.js';
 import { createLogger } from '../../../src/core/logger.js';
 import { decryptJson, encryptJson, generateToken, hashToken } from '../../../src/auth/crypto.js';
+
+// 只为数写入次数：rename 仍然是真的，行为一点不变。
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
 
 const logger = createLogger('error', () => {});
 const key = randomBytes(32);
@@ -112,19 +119,30 @@ describe('access keys in AuthStore', () => {
     const onDisk = () =>
       decryptJson<{ access_keys: { last_used_at?: number }[] }>(readFileSync(path, 'utf8'), key).access_keys[0]!
         .last_used_at;
-    const settle = () => new Promise((r) => setTimeout(r, 50));
+    /** 落到目标文件上的写入次数：每次落盘恰好一次 rename(tmp, path)。 */
+    const writes = () => vi.mocked(fsp.rename).mock.calls.filter(([, to]) => to === path).length;
+    // touch 的落盘是 fire-and-forget，没有 promise 可等。写入是串行排队的，所以在它之后再排一次
+    // 落盘、等这一次完成，前面那次必然已经写完——不靠固定的 sleep 去赌磁盘够不够快。
+    // 但任何一次落盘写的都是当时的整份内存快照，所以「这次 touch 有没有落盘」只能数写入次数，
+    // 不能看文件内容：那个排在后面的落盘本身就会把内存里的 last_used_at 写下去。
+    const flush = () => store.setEnvAccountsEnabled(false);
 
+    let mark = writes();
     store.touchAccessKey(record.id, 0);
-    await settle();
+    await flush();
+    expect(writes() - mark, '第一次 touch 落盘 + flush').toBe(2);
     expect(onDisk()).toBe(0);
 
+    mark = writes();
     store.touchAccessKey(record.id, 30_000);
-    await settle();
+    await flush();
     expect(store.getAccessKey(record.id)?.last_used_at).toBe(30_000);
-    expect(onDisk()).toBe(0);
+    expect(writes() - mark, '60 秒内的 touch 不落盘，只有 flush 那一次').toBe(1);
 
+    mark = writes();
     store.touchAccessKey(record.id, 61_000);
-    await settle();
+    await flush();
+    expect(writes() - mark, '隔了 60 秒以上，touch 再次落盘').toBe(2);
     expect(onDisk()).toBe(61_000);
   });
 
