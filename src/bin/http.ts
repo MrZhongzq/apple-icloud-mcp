@@ -20,7 +20,7 @@ const SWEEP_INTERVAL_MS = 60_000;
 
 async function main(): Promise<void> {
   // 绝不带着半套配置开始监听：这两步任一失败都必须在 listen 之前退出。
-  const config = loadConfig(process.env);
+  const config = loadConfig(process.env, { allowNoAccounts: true });
   const httpConfig = loadHttpConfig(process.env);
   const logger = createLogger(config.logLevel);
 
@@ -68,6 +68,12 @@ async function main(): Promise<void> {
     port: httpConfig.port,
     accounts: config.accounts.length,
   });
+
+  if (config.accounts.length > 0 && !store.getSettings().envAccountsEnabled) {
+    logger.warn('env accounts are configured but disabled; enable them on /admin or remove them from .env', {
+      accounts: config.accounts.length,
+    });
+  }
 
   const sweeper = setInterval(() => {
     // transport 表也必须在这里扫：它只在客户端正常关闭（DELETE 或连接自然结束）时才会
