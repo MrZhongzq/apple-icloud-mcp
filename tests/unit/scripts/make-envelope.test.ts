@@ -85,6 +85,17 @@ describe('parseDotenv', () => {
     const parsed = parseDotenv("\n\nA='x # y'\nB = plain value \nC=\n  # indented comment\nD=a#b\n");
     expect(parsed).toEqual({ A: 'x # y', B: 'plain value', C: '', D: 'a#b' });
   });
+
+  // dotenv 与 Node 的 --env-file 对 `KEY=   # note` 都给空串：等号后面只有注释，就是没写值。
+  it('an unquoted value that is only a comment is empty', () => {
+    const parsed = parseDotenv('A=   # note\nB=# note\nC=\t# note\n');
+    expect(parsed).toEqual({ A: '', B: '', C: '' });
+  });
+
+  it('a tab before # starts an inline comment, the same as a space', () => {
+    const parsed = parseDotenv('A=value\t# note\nB=value \t # note\n');
+    expect(parsed).toEqual({ A: 'value', B: 'value' });
+  });
 });
 
 describe('collectEnvelopeEnv', () => {

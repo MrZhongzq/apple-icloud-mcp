@@ -71,7 +71,8 @@ function clean(raw) {
 
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** 解析一个值：一对 "…" / '…' 会被去掉（其中的 # 保留）；未加引号的值在 " #" 处截断为行内注释，再去首尾空白。 */
+/** 解析一个值：一对 "…" / '…' 会被去掉（其中的 # 保留）；未加引号的值在空白（空格或 tab）后的 # 处
+ *  截断为行内注释，再去首尾空白。 */
 function parseValue(raw) {
   const value = raw.trim();
   const quote = value[0];
@@ -80,7 +81,10 @@ function parseValue(raw) {
     // 只有闭合引号之后是空的或是行内注释时才算一对引号；否则按未加引号处理。
     if (close > 0 && /^(\s+#.*)?\s*$/.test(value.slice(close + 1))) return value.slice(1, close);
   }
-  const hash = value.indexOf(' #');
+  // `KEY=   # note`：等号后面只有注释，就是没写值。dotenv 与 Node 的 --env-file 都给空串，
+  // 这里要是给出 "# note"，它就会被当成一个真的值封进信封。
+  if (value.startsWith('#')) return '';
+  const hash = value.search(/\s#/);
   return (hash >= 0 ? value.slice(0, hash) : value).trim();
 }
 
