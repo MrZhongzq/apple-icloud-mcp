@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { kidOf, loadOrCreateEnvelopeKeyring } from '../../../src/auth/keyring.js';
 import type { EnvelopeKeyring } from '../../../src/auth/keyring.js';
+import { createEnvelopeOpener } from '../../../src/auth/envelope.js';
 import { ENVELOPE_ENV_KEYS } from '../../../src/core/config.js';
 import type { Logger } from '../../../src/core/logger.js';
 import { collectEnvelopeEnv, parseDotenv, sealEnvelope } from '../../../scripts/make-envelope.mjs';
@@ -242,6 +243,33 @@ describe('make-envelope as a child process', () => {
       ICLOUD_APP_PASSWORD_1: FAKE_PASSWORD,
       ALLOW_MAIL_WRITE_1: 'true',
     });
+  });
+
+  // 上面那条用测试自己写的 openForTest 拆，envelope.test.ts 用 import 进来的 sealEnvelope 封；
+  // 这条把两端真正的样子接在一起：真的脚本作为子进程跑（参数解析、.env 读取、stdout 那一行），
+  // 输出原样交给服务端真正的 createEnvelopeOpener，账号要原样回来。
+  it('what the script prints opens with the real server-side opener', async () => {
+    await writeEnv([
+      `MCP_ENVELOPE_PUBKEY=${ring.publicKeyText}`,
+      'ICLOUD_ACCOUNT_1=a@icloud.com',
+      `ICLOUD_APP_PASSWORD_1=${FAKE_PASSWORD}`,
+      'ICLOUD_LABEL_1=routine',
+      'ALLOW_CALENDAR_WRITE_1=true',
+    ]);
+    const r = runScript(['--env-file', envFile], childEnv());
+    expect(r.status, r.stderr).toBe(0);
+
+    const opener = createEnvelopeOpener({ keyring: ring, logger: makeLogger() });
+    const { account, notices } = opener.open(r.stdout);
+    expect(account).toMatchObject({
+      email: 'a@icloud.com',
+      sender: 'a@icloud.com',
+      label: 'routine',
+      appPassword: FAKE_PASSWORD,
+      origin: 'envelope',
+    });
+    expect(account.capabilities).toMatchObject({ calendarWrite: true, mailWrite: false });
+    expect(notices).toEqual([]);
   });
 
   it('the script never echoes the password, on success or failure', async () => {
