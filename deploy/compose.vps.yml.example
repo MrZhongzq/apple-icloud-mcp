@@ -1,0 +1,37 @@
+# 给 80/443 已被宝塔（BT-Panel）或别的 nginx 占用的机器用的 compose 文件。
+#
+# 用法：复制到仓库根目录再用（下面的 build、env_file 都按仓库根目录解析）：
+#   cp deploy/compose.vps.yml.example compose.vps.yml
+#   docker compose -f compose.vps.yml up -d --build
+# 站点配置见 deploy/nginx-site.conf.example，说明见 docs/部署与-Routine-接入.md「放在宝塔或已有的 nginx 后面」。
+#
+# 80/443 已经被现有的 nginx 占用，所以不用仓库自带的 caddy 服务：
+# 只跑 app，端口只绑 127.0.0.1，由那台 nginx 反代进来。
+#
+# TRUST_PROXY=true 在这里安全，前提有两个，缺一不可：
+#   1. 端口只绑 127.0.0.1——公网到不了 17733，能进来的只有本机的 nginx；
+#   2. nginx 用 `proxy_set_header X-Forwarded-For $remote_addr` **覆盖**这个头，而不是
+#      `$proxy_add_x_forwarded_for` 追加——追加时调用方自己写的值留在最左端，express 取的正是最左端。
+services:
+  app:
+    build: .
+    # 镜像在本机构建并打上这个标签。小内存机器上构建要几分钟、会吃 swap，属正常。
+    image: apple-icloud-mcp:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 与 Dockerfile 的默认值一致；显式写出，让下面的卷挂载和程序自己认为的写入位置
+      # 即使以后有一边被单独改动也仍然对得上。信封私钥 envelope-key.json.enc 默认就在
+      # 这个文件旁边，也就是同一个卷里。
+      TOKEN_STORE_PATH: /app/data/tokens.json.enc
+      TRUST_PROXY: "true"
+    ports:
+      - "127.0.0.1:17733:17733"
+    volumes:
+      - token_store:/app/data
+    # 小内存机器上往往还跑着数据库、宝塔面板等；给它一个上限，免得一次异常把整机拖进 swap。
+    mem_limit: 256m
+
+volumes:
+  token_store:

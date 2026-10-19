@@ -45,16 +45,19 @@ Copy `.env.example` to `.env` and fill in real values, or set these directly in 
 
 ### Remote HTTP transport only
 
-**These six variables are read only by `dist/bin/http.js` (`loadHttpConfig`).** The stdio entrypoint (`dist/bin/stdio.js`, everything above) never reads them and never requires them — running this server locally for Claude Code/Desktop does not need a domain, a certificate, or any of this. They matter only if you're doing the [remote deployment](#remote-deployment-http--oauth) below.
+**These seven variables are read only by `dist/bin/http.js` (`loadHttpConfig`).** The stdio entrypoint (`dist/bin/stdio.js`, everything above) never reads them and never requires them — running this server locally for Claude Code/Desktop does not need a domain, a certificate, or any of this. They matter only if you're doing the [remote deployment](#remote-deployment-http--oauth) below.
+
+The reverse also holds: the HTTP entrypoint does **not** require `ICLOUD_ACCOUNT_1`. It starts with zero accounts configured, because on a shared server each person logs in with an envelope carrying their own account (see [Sharing one server](#sharing-one-server-access-keys-and-envelope-login)). Accounts you do put in its `.env` stay unusable until you switch on ".env 账号" on the `/admin` page.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `PUBLIC_URL` | yes | — | Full base URL this server is reachable at, e.g. `https://mcp.example.com` (no trailing slash). Doubles as the OAuth issuer and the callback base. Must be `https://` except for `localhost`/`127.0.0.1`, which are exempted for local testing. |
-| `ADMIN_PASSWORD_HASH` | yes | — | The scrypt hash of the admin login password (`scrypt$32768$8$1$<salt>$<hash>`), **not the password itself**. Generate with the stdin command below. |
-| `TOKEN_ENCRYPTION_KEY` | yes | — | Base64 encoding of a 32-byte key, used to encrypt the OAuth client/token store at rest (AES-256-GCM). Generate with the command below. Losing or rotating this key makes the existing store undecryptable — see Troubleshooting. |
+| `ADMIN_PASSWORD_HASH` | yes | — | The scrypt hash of the admin password (`scrypt$32768$8$1$<salt>$<hash>`), **not the password itself**. Generate with the stdin command below. The admin password logs in to the `/admin` management page only; it is not accepted on the OAuth authorization page, which takes access keys. |
+| `TOKEN_ENCRYPTION_KEY` | yes | — | Base64 encoding of a 32-byte key, used to encrypt both the store (OAuth clients, tokens, access keys, settings) and the envelope key file at rest (AES-256-GCM). Generate with the command below. Losing or rotating this key makes both files undecryptable — see Troubleshooting. |
 | `PORT` | no | `17733` | Port the HTTP server listens on. |
-| `TOKEN_STORE_PATH` | no | `./data/tokens.json.enc` | Where the encrypted OAuth client/token database lives. In Docker this is set to `/app/data/tokens.json.enc`, backed by the `token_store` named volume. |
-| `TRUST_PROXY` | no | `false` | Whether to trust `X-Forwarded-For` when deciding a request's client address. Rate limits (admin login, `/token`, `/register`, `/revoke`) are keyed on that address, so this is not cosmetic in either direction. **Leave it off if the server's port is exposed directly** — the header is written by the caller, and trusting it lets anyone pick their own rate-limit bucket and retry the admin password without limit. **Turn it on if anything terminates TLS in front of it** — including the `docker-compose.yml` in this repo, which puts Caddy in front: without it every request arrives from one container IP, so per-IP limiting distinguishes nobody and a single unauthenticated visitor can exhaust the admin-login and `/token` budgets for everyone, locking the whole authorization flow. The shipped compose file sets it to `true` for exactly this reason. |
+| `TOKEN_STORE_PATH` | no | `./data/tokens.json.enc` | Where the encrypted store of OAuth clients, tokens, access keys and settings lives. In Docker this is set to `/app/data/tokens.json.enc`, backed by the `token_store` named volume. |
+| `ENVELOPE_KEY_PATH` | no | `envelope-key.json.enc` next to `TOKEN_STORE_PATH` | Where the server's X25519 envelope key pair lives (encrypted with `TOKEN_ENCRYPTION_KEY`, mode 0600). Generated on first start if missing. Kept in its own file so it can be rebuilt without touching access keys or tokens: delete it and restart, and everyone using envelope login needs the new public key. In Docker the default lands in the same `token_store` volume. |
+| `TRUST_PROXY` | no | `false` | Whether to trust `X-Forwarded-For` when deciding a request's client address. Rate limits (`/access-login` and `/admin/login`, plus the SDK's own on `/token`, `/register`, `/revoke`) are keyed on that address, so this is not cosmetic in either direction. **Leave it off if the server's port is exposed directly** — the header is written by the caller, and trusting it lets anyone pick their own rate-limit bucket and retry access keys and the admin password without limit. **Turn it on if anything terminates TLS in front of it** — including the `docker-compose.yml` in this repo, which puts Caddy in front: without it every request arrives from one container IP, so per-IP limiting distinguishes nobody and a single unauthenticated visitor can exhaust the `/access-login` and `/token` budgets for everyone, locking the whole authorization flow. The shipped compose file sets it to `true` for exactly this reason, as does `deploy/compose.vps.yml.example` for an existing nginx in front. |
 
 ## Install
 
@@ -142,8 +145,9 @@ A healthy server answers on stdout with 25 tools (3 session + 7 mail + 5 calenda
 | Client shows the server as failed, with no useful error | Something wrote to stdout and corrupted the JSON-RPC stream | This should not happen — all logging is on stderr by design. If it does, capture stderr and file it as a bug. |
 | Calendar events come back an hour off after a DST change | Recurring events created by this server are UTC-anchored | Known phase-one limitation, documented under Limitations. Events created in the Apple UI are unaffected. |
 | *(remote HTTP transport only)* Every request to `/mcp` returns 401, even with a freshly-issued token | The client dynamically registered against a different `PUBLIC_URL` than the one the server is now configured with, so the `issuer` in the OAuth metadata doesn't match what the client discovered when it registered | Restart the authorization from the client with `PUBLIC_URL` matching the domain it's actually reaching. There's no way to fix an existing registration's issuer after the fact — it has to re-register. |
-| *(remote HTTP transport only)* The admin login page appears, but submitting it doesn't get you back to the client | The pending authorization request expired — it's held in memory for 10 minutes from when `/authorize` was first hit, and the login page re-renders with "登录请求不存在或已过期" | Don't retry the same form — the `request_id` it's bound to is already gone. Start the authorization over from the client (e.g. re-add the connector in claude.ai). |
-| *(remote HTTP transport only)* Server starts fine, but no client can complete authorization / every login attempt errors | The token store (`TOKEN_STORE_PATH`) can't be decrypted — almost always `TOKEN_ENCRYPTION_KEY` changed since the store was written, occasionally file corruption | Deleting the store file is the intended recovery, not a last resort: stop the server, remove the file at `TOKEN_STORE_PATH` (or `docker volume rm` the `token_store` volume), and restart. Every previously-authorized client has to re-authorize — that's the only effect; no iCloud data is touched. |
+| *(remote HTTP transport only)* After upgrading, every existing connector gets 401 | Tokens issued before access keys existed belong to no key and are rejected by design | Log in to `/admin` with the admin password, create an access key for yourself, and reconnect the connector in claude.ai with that key. See "Upgrading from the admin-password version" below. |
+| *(remote HTTP transport only)* The access-key page appears, but submitting it doesn't get you back to the client | The pending authorization request expired — it's held in memory for 10 minutes from when `/authorize` was first hit, and the page re-renders with "登录请求不存在或已过期" | Don't retry the same form — the `request_id` it's bound to is already gone. Start the authorization over from the client (e.g. re-add the connector in claude.ai). "访问密钥不正确或已停用" is different: the request is still valid, so fix the key and submit the same page again. |
+| *(remote HTTP transport only)* The server refuses to start: "令牌存储无法解密" or "信封密钥文件无法解密" | The store (`TOKEN_STORE_PATH`) or the envelope key file (`ENVELOPE_KEY_PATH`) can't be decrypted — almost always `TOKEN_ENCRYPTION_KEY` changed since they were written (then both are affected), occasionally file corruption | Deleting the file is the intended recovery, not a last resort. Deleting the store wipes every access key, OAuth client and the ".env 账号" setting: recreate keys on `/admin` and every client re-authorizes. Deleting the envelope key file gives the server a new key pair: everyone using envelope login needs the new public key. No iCloud data or password is in either file. |
 
 ## Tools
 
@@ -191,6 +195,7 @@ All tools except `apple_accounts` and `apple_login` require a `session_id` obtai
 - **Contact search matches a session-local cache, not a live server-side query** — iCloud's CardDAV has no `addressbook-query` filtering. The first search in a session pays for a full pull of every address book the account can see (about 4.5s observed for 1,429 contacts); subsequent searches in the same session sync incrementally (about 0.4s with no changes). Expect the first call to be noticeably slower — that is not a failure to retry.
 - **Contact birthdays accept only `YYYY-MM-DD` or `--MM-DD`.** Anything else is rejected with `INVALID_INPUT` rather than written — a vCard `BDAY` the parser cannot read makes the whole card unreadable, which would leave the contact unreachable through this server. Reading is tolerant in the other direction: a card written by another client with an unparseable `BDAY` still comes back, just without the `birthday` field, and a no-year birthday (Apple stores those with a placeholder year of 1604) is reported as `--MM-DD`.
 - **Contact photos are reported as a boolean only.** `has_photo` tells you whether a `PHOTO` property exists on the vCard; no tool returns photo bytes or a URL, and no response ever contains base64 image data.
+- **The remote HTTP server holds plaintext App-Specific Passwords in memory for the life of each session.** It has to — it connects to iCloud on the user's behalf. That is as true of envelope login as of accounts in the server's `.env`: the password is never written to the server's disk, but while a session is open, whoever controls the server (or has broken into it) can read it. Anyone using someone else's server is trusting its owner. Two narrower consequences, documented in `docs/部署与-Routine-接入.md`: the server's disk (envelope private key plus `TOKEN_ENCRYPTION_KEY`) together with a captured envelope reveals the password even after the envelope expired; and a restart forgets which envelopes were used, so one used within the previous 5 minutes could be replayed once by someone who also holds a valid access key.
 
 ## Remote deployment (HTTP + OAuth)
 
@@ -201,6 +206,8 @@ This puts the server on the internet as a remote MCP endpoint — for example, s
 You need a domain name (a subdomain is fine, e.g. `mcp.example.com`) with an A/AAAA record pointing at the machine that will run this, and ports 80 and 443 reachable from the internet on it. Caddy (in `docker-compose.yml`) uses port 80 to complete the ACME HTTP challenge and provisions a Let's Encrypt certificate automatically the first time it starts — there's nothing to configure for TLS beyond having the domain resolve correctly before you bring the stack up.
 
 `PUBLIC_URL` is that domain as a full URL, e.g. `https://mcp.example.com` (no trailing slash). It is simultaneously: the OAuth issuer a client verifies against, the base every OAuth callback is built from, and the domain the `Caddyfile` serves (`{$PUBLIC_URL}` — one value, read in both places, so it can't drift out of sync with itself).
+
+If ports 80/443 are already taken by an existing nginx (a BT-Panel / 宝塔 host, for instance), skip Caddy and use the templates in `deploy/` instead — see [Behind an existing nginx](#behind-an-existing-nginx).
 
 ### 2. Generate key material
 
@@ -216,7 +223,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 node -e "const r=require('node:readline').createInterface({input:process.stdin,output:process.stderr});r.question('password: ',p=>{r.close();import('./dist/auth/crypto.js').then(m=>console.log(m.hashPassword(p)))})"
 ```
 
-Put both outputs, plus `PUBLIC_URL`, into `.env` (`cp .env.example .env` first if you haven't) alongside your existing iCloud credentials. The admin password is whatever you type at the `password:` prompt — you use that plaintext password to log in later; only its hash goes in `.env`.
+Put both outputs, plus `PUBLIC_URL`, into `.env` (`cp .env.example .env` first if you haven't). iCloud credentials are optional here: on a server where everyone logs in with an envelope, the server's `.env` holds none. The admin password is whatever you type at the `password:` prompt — you use that plaintext password to log in to `/admin` later; only its hash goes in `.env`.
 
 ### 3. Bring the stack up
 
@@ -224,7 +231,7 @@ Put both outputs, plus `PUBLIC_URL`, into `.env` (`cp .env.example .env` first i
 docker compose up -d --build
 ```
 
-This starts two containers: `caddy` (public-facing, terminates TLS, proxies to `app:17733` over the internal compose network) and `app` (this server; publishes no host port of its own — only `caddy` can reach it). The OAuth client/token database lives in the `token_store` named volume; losing it means every client has to re-authorize (not an iCloud data loss) — see "Revoking a client's authorization" below.
+This starts two containers: `caddy` (public-facing, terminates TLS, proxies to `app:17733` over the internal compose network) and `app` (this server; publishes no host port of its own — only `caddy` can reach it). The `token_store` named volume holds two encrypted files: the store (`tokens.json.enc` — OAuth clients, tokens, access keys, settings) and, generated on first start, the envelope key pair (`envelope-key.json.enc`). Losing the volume means recreating every access key, every client re-authorizing and everyone using envelope login taking a new public key — not an iCloud data loss — see "Revoking access" below.
 
 Confirm it's up without going through the OAuth flow:
 
@@ -232,23 +239,59 @@ Confirm it's up without going through the OAuth flow:
 curl https://mcp.example.com/health   # -> {"status":"ok"} — this route needs no auth
 ```
 
-### 4. Add it as a remote MCP server in claude.ai
+### 4. Create your access key on `/admin`
+
+Open `https://mcp.example.com/admin` and log in with the **plaintext** admin password you chose in step 2 — not the hash. The page (in Chinese) has four parts:
+
+- **访问密钥** — every access key, with its name, creation time, status and last use, plus 停用 / 启用 (disable / enable) and 销毁 (destroy, behind a confirmation page) per row.
+- **新建访问密钥** — give a name (1–64 characters) and the page shows the new key, `amk_…`, **exactly once**; the server stores only its hash. Copy it then. Do not reload that page afterwards: it is the result of the create form, so reloading resubmits it and creates a second key (the browser warns before resubmitting). Reopen `/admin` from the address bar instead, and destroy any accidental duplicate.
+- **.env 账号** — a switch, off by default. While on, **any** valid access key can log in to the accounts configured in the server's `.env`. Turning it off destroys the sessions already built on those accounts.
+- **信封公钥** — the server's envelope public key, `amp1_…`, for the people who log in with envelopes.
+
+The admin session lives in memory only, expires after 30 idle minutes, and does not survive a restart. Create one key for yourself now; the next step uses it.
+
+### 5. Add it as a remote MCP server in claude.ai
 
 1. In claude.ai, add a custom connector / remote MCP server pointing at `https://mcp.example.com/mcp` (your `PUBLIC_URL` plus `/mcp`).
 2. claude.ai discovers this server's OAuth metadata at `/.well-known/oauth-authorization-server`, then dynamically registers itself as a client (`POST /register`) and opens `/authorize` in a browser.
-3. You'll land on this server's own admin login page. Enter the **plaintext** admin password you chose in step 2 above — not the hash.
-4. On success, the browser is redirected back to claude.ai's `redirect_uri` with an authorization code and the original `state` value intact; claude.ai exchanges the code for an access/refresh token pair at `/token`. From then on, its tool calls carry `Authorization: Bearer <access token>` to `/mcp`.
+3. You'll land on this server's own access-key page (输入访问密钥), which submits to `POST /access-login`. Paste your access key from step 4. The admin password is not accepted here.
+4. On success, the browser is redirected back to claude.ai's `redirect_uri` with an authorization code and the original `state` value intact; claude.ai exchanges the code for an access/refresh token pair at `/token`. Every token in that family records which access key it came from. From then on, its tool calls carry `Authorization: Bearer <access token>` to `/mcp`.
 
-This exact chain — dynamic registration, `/authorize`, the login page, the `/token` exchange, a real tool call, and a 401 both for a missing and for a forged token — has been run end to end against a built image on a real port.
+This exact chain — dynamic registration, `/authorize`, the access-key page, the `/token` exchange, a real tool call, and a 401 both for a missing and for a forged token — is exercised end to end on a real port by `tests/unit/server/http-e2e.test.ts`.
 
-### 5. Revoking a client's authorization
+Each person's sessions are bound to their access key: a `session_id` (or MCP session id) obtained under one key is treated as nonexistent under any other.
 
-This phase does not ship an admin page listing every client that has ever authorized and letting you pick one to kick off — there is no such inventory UI. Two things you actually have:
+### 6. Revoking access
 
-- **If you're holding a specific token** (typically because you're testing your own deployment with `curl`), `POST /revoke` (RFC 7009) with that token invalidates it immediately: revoking either the access or the refresh token revokes the whole family (both), and **immediately destroys any live MCP session that token had authorized** — that session's `session_id` stops working on its very next call, and its IMAP/SMTP connections are closed on the spot rather than staying open until the idle TTL expires. The session is matched to the token by the token family recorded on it when `apple_login` ran; `tests/unit/server/http-e2e.test.ts` asserts the session is really gone from the session store after `POST /revoke`, not merely that `/mcp` now answers 401 — that is the token check, and it passes whether or not any session was destroyed.
-- **To cut off every client at once** — e.g. you suspect `TOKEN_ENCRYPTION_KEY` leaked, or you just want a clean slate — stop `app` and delete the token store: remove the file at `TOKEN_STORE_PATH`, or `docker compose down` plus `docker volume rm <project>_token_store`. Every previously-authorized client, claude.ai included, will have to redo the authorization flow the next time it calls a tool. This is the same recovery as a token-store decryption failure (see Troubleshooting) and is not a loss of any iCloud data — only re-authorization is required.
+- **One person** — on `/admin`, disable or destroy their key. Either one immediately revokes every token issued under that key, destroys every session it created (closing the IMAP/SMTP connections on the spot), and closes its MCP transports; nobody else is affected. A disabled key can be re-enabled, after which its holder authorizes again — the old tokens do not come back. Destroying also deletes the record.
+- **A specific token you hold** (typically because you're testing your own deployment with `curl`) — `POST /revoke` (RFC 7009) with that token invalidates it immediately: revoking either the access or the refresh token revokes the whole family (both), and **immediately destroys any live MCP session that token had authorized** — that session's `session_id` stops working on its very next call, and its IMAP/SMTP connections are closed on the spot rather than staying open until the idle TTL expires. The session is matched to the token by the token family recorded on it when `apple_login` ran; `tests/unit/server/http-e2e.test.ts` asserts the session is really gone from the session store after `POST /revoke`, not merely that `/mcp` now answers 401 — that is the token check, and it passes whether or not any session was destroyed.
+- **Everyone at once** — e.g. you suspect `TOKEN_ENCRYPTION_KEY` leaked, or you just want a clean slate — `docker compose down` plus `docker volume rm <project>_token_store`, then bring it back up. That deletes the store (every access key, client, token and setting) and the envelope key pair: recreate keys on `/admin`, redistribute them and the new public key, and every client redoes the authorization flow. No iCloud data is touched.
 
-There is currently no way to revoke one specific already-connected client (e.g. "kick out this one device, leave the others") without holding a token it was issued — that would require an admin inventory of clients/tokens, which this phase does not build. The store file itself is encrypted at rest, so reading it directly isn't a workaround either.
+### Sharing one server: access keys and envelope login
+
+The owner of the server decides **who can connect** (one access key per person); each person decides **which iCloud account and which permissions** — in their own Claude Routine environment, with the same variables as always. The server stores nobody's iCloud password. Instead, the routine's sandbox runs a script that seals the account into an envelope only the server can open, and the model passes it to `apple_login`:
+
+1. **Owner:** on `/admin`, create a key for the person and send it to them privately, together with the envelope public key shown on the same page. Keep ".env 账号" off — with it on, anyone holding a key who calls `apple_login` without an envelope lands in *your* iCloud account.
+2. **Person:** add the connector in claude.ai and authorize with the access key. In the routine's environment set `ICLOUD_ACCOUNT_1`, `ICLOUD_APP_PASSWORD_1` (plus `ICLOUD_SENDER_1` / `ALLOW_*_1` as needed) and `MCP_ENVELOPE_PUBKEY=<the amp1_… line>`, as environment variables or a UTF-8 `.env` at the repo root. Have the routine check out this repo and read `SKILL.md`.
+3. **The model**, per `SKILL.md`: run `node scripts/make-envelope.mjs` (zero dependencies, Node 20+, no build needed), pass its single line of stdout, `ame1.…`, as `apple_login({ envelope })`, work, then `work_done`.
+
+The script reads `.env` in the current directory if present, with process environment variables taking precedence; for another file use `node scripts/make-envelope.mjs -- --env-file <path>` (without the `--`, Node 24+ intercepts `--env-file` itself and exits 9 when the file is missing). It seals only the twelve `_1` account variables, refuses a config with `ICLOUD_ACCOUNT_2`+, writes errors to stderr naming variables but never values, and never touches the network. An envelope is valid for 5 minutes and only once — it is spent the moment the server accepts it, even if the iCloud login that follows fails. The account it carries goes through exactly the same parsing as a `.env` account: writes off unless enabled, the iCloud sender-domain guard, strict booleans. Any adjustment shows up in `apple_login`'s `notices`.
+
+Read the trust caveat under [Limitations](#limitations-to-know-before-you-rely-on-this) before using someone else's server. The full owner and user walkthrough, including what to do if the server is compromised, is in Chinese in [`docs/部署与-Routine-接入.md`](docs/部署与-Routine-接入.md).
+
+### Behind an existing nginx
+
+When ports 80/443 already belong to an nginx (a BT-Panel / 宝塔 host is the case these were written for), use the two templates in `deploy/` instead of Caddy: `deploy/compose.vps.yml.example` runs only `app`, bound to `127.0.0.1:17733` with `TRUST_PROXY` on, and `deploy/nginx-site.conf.example` proxies `https://mcp.example.com` to it. Each override in the nginx template is there for a reason stated next to it: `proxy_cache off` (BT's global config caches proxied responses — OAuth and MCP responses must never be served to someone else), `proxy_next_upstream off` (a retried request replays a `mail_send`), long read/send timeouts and no buffering (the SSE stream on `GET /mcp`), and `X-Forwarded-For $remote_addr` *overwriting* rather than appending (with `TRUST_PROXY` on, express takes the leftmost entry, so appending lets a caller pick their own rate-limit bucket). Step-by-step instructions are in `docs/部署与-Routine-接入.md`.
+
+### Upgrading from the admin-password version
+
+Before access keys, the authorization page took the admin password. After upgrading:
+
+- **Existing connector authorizations stop working.** Their tokens belong to no access key and are rejected. Log in to `/admin`, create a key for yourself, and reconnect the connector in claude.ai with it.
+- **Accounts in the server's `.env` are off by default.** The server logs a warning at startup when it has accounts configured but ".env 账号" is off. Turn it on at `/admin` to keep using them, or move to envelope login and remove them.
+- **The admin password only opens `/admin`** now.
+
+The stdio and sandbox CLI entrypoints are unaffected and need no change.
 
 ### Notes
 

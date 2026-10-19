@@ -9,11 +9,14 @@
 #   2. Point DNS for PUBLIC_URL's host at this machine.
 #   3. docker compose up -d
 #
-# The `token_store` named volume holds the encrypted OAuth client/token
-# database (TOKEN_STORE_PATH inside the container). Losing this volume is not
-# a data-loss event in the usual sense -- iCloud mail/calendar/reminders/
-# contacts data is untouched -- but every previously-authorized client
-# (e.g. claude.ai) will have to go through the authorization flow again.
+# The `token_store` named volume holds the encrypted store of OAuth clients,
+# tokens, access keys and settings (TOKEN_STORE_PATH inside the container),
+# and next to it the encrypted envelope key pair (envelope-key.json.enc).
+# Losing this volume is not a data-loss event in the usual sense -- iCloud
+# mail/calendar/reminders/contacts data is untouched -- but every access key
+# has to be recreated on /admin, every previously-authorized client (e.g.
+# claude.ai) will have to go through the authorization flow again, and
+# everyone using envelope login needs the new public key.
 
 services:
   caddy:
@@ -44,7 +47,8 @@ services:
       # one of the two is ever changed independently.
       TOKEN_STORE_PATH: /app/data/tokens.json.enc
       # Caddy sits in front, so every request reaches `app` from one container
-      # IP. Without this, the per-IP rate limits on /admin-login and /token
+      # IP. Without this, the per-IP rate limits on /access-login (the OAuth
+      # access-key page), /admin/login (the admin page) and /token
       # collapse into a single shared bucket and any unauthenticated visitor
       # can exhaust it for everyone, locking the whole authorization flow.
       # This is safe *because* nothing but caddy can reach `app` (no published

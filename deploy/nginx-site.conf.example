@@ -1,0 +1,65 @@
+# apple-icloud-mcp 远程 HTTP 入口的 nginx 站点模板，配合 deploy/compose.vps.yml.example 使用
+# （app 只监听 127.0.0.1:17733）。把 mcp.example.com 全部换成你自己的域名。
+#
+# 在宝塔上：手写配置，放进 /www/server/panel/vhost/nginx/<你的域名>.conf，不在宝塔面板的站点列表里建站
+# ——在面板里改它会被覆盖或不生效。
+# 证书由 certbot（webroot 方式）签发并自动续期，续期后由 deploy hook 重载这台 nginx。
+#
+# 第一次签证书之前，证书文件还不存在，下面的 443 server 会让 nginx 拒绝加载整份配置。
+# 那时先只保留 80 的 server，并把其中的 `return 301` 临时换成 `return 404`（只服务 ACME 验证文件），
+# 签下证书后再换回这份完整的配置。
+server
+{
+    listen 80;
+    server_name mcp.example.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /www/wwwroot/mcp.example.com;
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+
+    access_log  /www/wwwlogs/mcp.example.com.log;
+    error_log  /www/wwwlogs/mcp.example.com.error.log;
+}
+
+server
+{
+    listen 443 ssl;
+    http2 on;
+    server_name mcp.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/mcp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mcp.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:17733;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # 覆盖，不追加：app 开着 TRUST_PROXY，express 取最左端当客户端地址，追加会让调用方自选限流桶。
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        # 宝塔全局 proxy.conf 打开了 proxy_cache——OAuth 与 MCP 响应绝不能被缓存后交给别人。
+        proxy_cache off;
+        # MCP 的 SSE 流要逐块送达，不能攒在 nginx 里。
+        proxy_buffering off;
+        proxy_request_buffering off;
+        # 全局是 60 秒，会把 GET /mcp 的长连接掐断。
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        # 全局对 500/503/404 会换上游重试；只有一个上游，且重放一个 mail_send 就是发两封信。
+        proxy_next_upstream off;
+    }
+
+    access_log  /www/wwwlogs/mcp.example.com.log;
+    error_log  /www/wwwlogs/mcp.example.com.error.log;
+}
